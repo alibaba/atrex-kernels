@@ -72,6 +72,10 @@ flash_attn_varlen_func = _lazy_import_and_call(
     "atrex.api.flash_attn",
 )
 
+# Keep the concrete signature visible to serving frameworks.  This module is
+# lightweight: Torch and the selected hardware backend are imported on call.
+from atrex.api.flash_attn import flash_attn_varlen_func
+
 __all__ = (
     "can_use_flash_attn_varlen_func",
     "can_use_chunk_gdn_fwd_cutedsl",
