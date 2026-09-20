@@ -1131,6 +1131,8 @@ def _flash_attn_fwd(
                 runtime_balanced_grid_size=_runtime_balanced_grid_size,
                 runtime_balanced_batch_size=_runtime_balanced_batch_size,
             )
+            fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
+            fa_fwd.atrex_sm120_prefill_clc_kernel.set_name_prefix("atrex")
         else:
             fa_fwd = FlashAttentionForwardHd256_2CTA_Sm103(
                 head_dim,
@@ -1159,6 +1161,7 @@ def _flash_attn_fwd(
                 dedicated_clc_warp=False,
                 register_config=None,
             )
+            fa_fwd.atrex_sm103_prefill_kernel.set_name_prefix("atrex")
         # TODO: check @can_implement
         if qv is not None:
             with use_filesystem_cutlass_dsl_version_hash():
@@ -1378,6 +1381,7 @@ def _compile_fwd_combine(
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
     )
+    fa_combine.kernel.set_name_prefix("atrex")
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
         num_threads=256,

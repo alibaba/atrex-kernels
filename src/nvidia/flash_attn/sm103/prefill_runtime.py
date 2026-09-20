@@ -637,6 +637,7 @@ def _flash_attn_fwd(
             dedicated_clc_warp=False,
             register_config=None,
         )
+        fa_fwd.atrex_sm103_prefill_kernel.set_name_prefix("atrex")
         # TODO: check @can_implement
         if qv is not None:
             with use_filesystem_cutlass_dsl_version_hash():

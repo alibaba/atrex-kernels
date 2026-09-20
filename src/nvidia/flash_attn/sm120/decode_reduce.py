@@ -204,9 +204,11 @@ def _compile(
         else None
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    reducer = _Sm120Q1Reduce(num_splits, tokens_per_sequence)
+    reducer.atrex_sm120_decode_reduce_kernel.set_name_prefix("atrex")
     with use_filesystem_cutlass_dsl_version_hash():
         return cute.compile(
-            _Sm120Q1Reduce(num_splits, tokens_per_sequence),
+            reducer,
             o_partial,
             lse_partial,
             num_splits_dynamic,

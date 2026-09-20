@@ -240,6 +240,7 @@ def _compile_kernel(
         page_table_factor=page_table_factor,
         p_stages=p_stages,
     )
+    fmha.atrex_sm103_decode_kernel.set_name_prefix("atrex")
     mask = CausalMask()
     sym_splits = cute.sym_int()
     sym_batch = cute.sym_int()

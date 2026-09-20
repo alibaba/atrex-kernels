@@ -332,8 +332,12 @@ def _compile_reducer(
     )
     if use_shared:
         reducer = _Fa4DecodeReduceShared(num_splits, store_lse)
+        reducer.atrex_sm103_decode_reduce_kernel.set_name_prefix("atrex")
     else:
         reducer = _Fa4DecodeReduce(num_splits, store_lse)
+        reducer.atrex_sm103_decode_varlen_reduce_kernel.set_name_prefix(
+            "atrex"
+        )
     with use_filesystem_cutlass_dsl_version_hash():
         return cute.compile(
             reducer,
