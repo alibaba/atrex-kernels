@@ -839,13 +839,13 @@ def test_real_kernel_events(q_lens, fp8):
 
 
 @pytest.mark.parametrize("hq,hkv", [(8, 1), (16, 1), (32, 2)])
-@pytest.mark.parametrize("q_lens", [[4, 2], [65, 3]])
+@pytest.mark.parametrize("q_lens", [[1], [4, 2], [65, 3]])
 @pytest.mark.parametrize("broadcast_scales", [False, True])
 def test_gqa_descale_layout(hq, hkv, q_lens, broadcast_scales):
-    case = build_case(128, q_lens, [257, 513], hq=hq, hkv=hkv)
+    case = build_case(128, q_lens, [257, 513][:len(q_lens)], hq=hq, hkv=hkv)
     if broadcast_scales:
         for name in ("q_descale", "k_descale", "v_descale"):
-            case[name] = case[name][:1, :1].expand(2, hkv)
+            case[name] = case[name][0, 0].expand(len(q_lens), hkv)
     check_case(case)
 
 

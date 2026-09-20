@@ -113,7 +113,28 @@ def _get_device_arch(device_index):
 
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is None:
+        return None
+
+    # PyTorch considers singleton dimensions contiguous regardless of their
+    # stride.  In particular, vLLM expands scalar FP8 descales to [batch,
+    # kv_heads], which produces a [1, 1] view with strides (0, 0) for a
+    # single-request MQA batch.  ``contiguous()`` is a no-op for that view,
+    # while CuTe requires the marked leading dimension to have unit stride.
+    # Canonicalize singleton strides without allocating before handling a
+    # genuinely non-contiguous final dimension.
+    shape = x.shape
+    strides = list(x.stride())
+    expected_stride = 1
+    changed = False
+    for dim in range(len(shape) - 1, -1, -1):
+        if shape[dim] == 1 and strides[dim] != expected_stride:
+            strides[dim] = expected_stride
+            changed = True
+        expected_stride = strides[dim] * shape[dim]
+    if changed:
+        x = x.as_strided(shape, strides)
+    return x.contiguous() if x.stride(-1) != 1 else x
 
 
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):

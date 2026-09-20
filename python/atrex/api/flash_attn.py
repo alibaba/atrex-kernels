@@ -34,11 +34,15 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     num_splits=0,
+    output_scale=None,
     fa_version=3,
     s_aux=None,
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    mask_mod=None,
+    aux_tensors=None,
+    dynamic_causal=None,
     *,
     qv=None,
     logits_soft_cap=None,
@@ -70,6 +74,12 @@ def flash_attn_varlen_func(
         raise NotImplementedError("Atrex attention does not support ALiBi")
     if q_v is not None or qv is not None:
         raise NotImplementedError("Atrex standard attention does not support auxiliary Q/MLA")
+    if output_scale is not None:
+        raise NotImplementedError("Atrex attention does not support quantized output")
+    if mask_mod is not None or aux_tensors is not None:
+        raise NotImplementedError("Atrex attention does not support custom mask modifiers")
+    if dynamic_causal is not None:
+        raise NotImplementedError("Atrex attention does not support per-sequence causal masks")
     if (cu_seqlens_k is None) == (seqused_k is None):
         raise ValueError("Provide exactly one of cu_seqlens_k and seqused_k")
     if block_table is not None and seqused_k is None:
