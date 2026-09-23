@@ -44,7 +44,7 @@ class build_py(_build_py):
         if missing:
             raise RuntimeError(
                 "CUTLASS headers are required for the NVFP4 fused MoE wheel. "
-                "Run `git submodule update --init --recursive`. Missing: "
+                "Run `git submodule update --init -- third_party/cutlass`. Missing: "
                 + ", ".join(missing)
             )
         if packaged_cutlass.exists():
@@ -68,7 +68,7 @@ class build_py(_build_py):
             raise RuntimeError(
                 "FlashAttention CuTe helpers are required for the NVIDIA "
                 "FlashAttention wheel. Run `git submodule update --init "
-                "--recursive`. Missing: " + ", ".join(missing)
+                "-- third_party/flash-attention`. Missing: " + ", ".join(missing)
             )
 
         packaged_flash_attn = (

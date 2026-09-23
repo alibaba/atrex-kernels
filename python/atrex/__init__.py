@@ -72,9 +72,16 @@ flash_attn_varlen_func = _lazy_import_and_call(
     "atrex.api.flash_attn",
 )
 
-# Keep the concrete signature visible to serving frameworks.  This module is
-# lightweight: Torch and the selected hardware backend are imported on call.
-from atrex.api.flash_attn import flash_attn_varlen_func
+
+def __getattr__(name: str) -> _Any:
+    if name == "flash_attn_varlen_func":
+        implementation = _import_module(
+            "atrex.api.flash_attn"
+        ).flash_attn_varlen_func
+        globals()[name] = implementation
+        return implementation
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = (
     "can_use_flash_attn_varlen_func",

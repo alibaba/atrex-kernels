@@ -7,7 +7,9 @@ cd "$ATREX_REPOSITORY"
 PYTHON_EXECUTABLE="${PYTHON:-python3}"
 DIST_DIRECTORY="$ATREX_REPOSITORY/dist"
 
-git submodule update --init --recursive -- third_party
+git submodule update --init -- \
+    third_party/cutlass \
+    third_party/flash-attention
 
 "$PYTHON_EXECUTABLE" -m build --wheel --no-isolation
 

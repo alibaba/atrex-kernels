@@ -1,4 +1,4 @@
-"""Shared SM100/SM103 launch policy; kernels reside with their SM103 implementation."""
+"""Validated SM103 launch policy."""
 
 from threading import Lock
 
