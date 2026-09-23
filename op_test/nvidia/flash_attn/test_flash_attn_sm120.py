@@ -19,6 +19,8 @@ import math
 import pytest
 import torch
 
+from op_test.utils.flash_attn_contract import build_case, profile_case, reference
+
 
 def _requires_sm120():
     assert torch.cuda.is_available(), "SM120 GPU is required"
@@ -882,6 +884,133 @@ def test_sm120_packgqa_split_matches_nopack(HQ, HKV, kvlens, monkeypatch):
         f"(max {(o_pack - o_nopack).abs().max().item():.2e})")
 
 
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,num_splits,required_helper",
+    [
+        ([65, 3], [257, 513], 1, None),
+        ([1, 1, 1, 1], [4096, 4096, 4096, 4096], 4, "reduce"),
+    ],
+)
+def test_sm120_real_kernel_events(q_lens, kv_lens, num_splits, required_helper):
+    """Profile the public API and reject fallback or unprefixed GPU kernels."""
+    _requires_sm120()
+    case = build_case(64, q_lens, kv_lens, hq=16, hkv=2, fp8=True)
+    case["num_splits"] = num_splits
+    names = profile_case(case)
+    custom = [name for name in names if "atrex_" in name]
+    assert any("atrex_sm120" in name for name in custom), custom
+    if required_helper is not None:
+        assert any(required_helper in name.lower() for name in custom), custom
+
+
+def _benchmark_revision(api_contract, output_path):
+    """Private L20N migration benchmark for same-job ABBA comparison.
+
+    ``legacy`` is the source ``l20n-fa4`` public contract and ``current`` is
+    the unified dev contract. Only their intentional argument/return rename is
+    adapted. Both modes use identical FP8 tensors, descales, graph capture,
+    warmup, measurement order, and production-shaped prefill/decode cases.
+    """
+    import json
+    from pathlib import Path
+    import statistics
+    import time
+    import atrex
+
+    _requires_sm120()
+    workloads = [
+        ("prefill-b1-q256-k4096", [256], [4096]),
+        ("prefill-b1-q2048-k2048", [2048], [2048]),
+        ("prefill-b8-q128-k4096", [128] * 8, [4096] * 8),
+        ("decode-b1-q1-k16384", [1], [16384]),
+        ("decode-b16-q1-k16384", [1] * 16, [16384] * 16),
+        ("mtp-b8-q4-k4096", [4] * 8, [4096] * 8),
+    ]
+    records = []
+    for name, q_lens, kv_lens in workloads:
+        case = build_case(64, q_lens, kv_lens, hq=16, hkv=2, fp8=True)
+        out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+        kwargs = dict(case, out=out, num_splits=0)
+        if api_contract == "legacy":
+            kwargs["page_table"] = kwargs.pop("block_table")
+            kwargs["return_lse"] = False
+        else:
+            kwargs["return_softmax_lse"] = False
+
+        def invoke():
+            result = atrex.flash_attn_varlen_func(**kwargs)
+            return result[0] if api_contract == "legacy" else result
+
+        actual = invoke()
+        expected, _ = reference(case)
+        torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=5e-2)
+        del expected
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(5):
+                invoke()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(20):
+                invoke()
+        for _ in range(5):
+            graph.replay()
+        torch.cuda.synchronize()
+        warm_until = time.monotonic() + 0.5
+        while time.monotonic() < warm_until:
+            graph.replay()
+            torch.cuda.synchronize()
+        samples = []
+        for _ in range(31):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) / 20)
+        record = dict(
+            name=name,
+            batch=len(q_lens),
+            max_q=max(q_lens),
+            max_k=max(kv_lens),
+            page_size=64,
+            median_ms=statistics.median(samples),
+            samples_ms=samples,
+        )
+        records.append(record)
+        print({key: value for key, value in record.items()
+               if key != "samples_ms"}, flush=True)
+    with Path(output_path).open("x") as handle:
+        json.dump(
+            dict(
+                atrex_path=atrex.__file__,
+                contract=api_contract,
+                device=torch.cuda.get_device_name(),
+                capability=torch.cuda.get_device_capability(),
+                torch_version=torch.__version__,
+                cases=records,
+            ),
+            handle,
+            indent=2,
+        )
+
+
 if __name__ == "__main__":
+    import argparse
     import sys
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark-contract", choices=["legacy", "current"]
+    )
+    parser.add_argument("--benchmark-output")
+    args = parser.parse_args()
+    if args.benchmark_contract is None:
+        sys.exit(pytest.main([__file__, "-v", "-s"]))
+    if args.benchmark_output is None:
+        parser.error("--benchmark-output is required with --benchmark-contract")
+    _benchmark_revision(args.benchmark_contract, args.benchmark_output)
