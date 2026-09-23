@@ -806,6 +806,18 @@ def test_p128_prefill_output_lse_and_out_contract(
 
 from op_test.utils.flash_attn_contract import build_case, check_case, profile_case
 
+
+def test_public_eligibility_and_fail_fast():
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+
+    case = build_case(128, [65, 3], [257, 513], hq=16)
+    case["fa_version"] = 4
+    assert can_use_flash_attn_varlen_func(**case)
+    assert not can_use_flash_attn_varlen_func(**dict(case, fa_version=3))
+    with pytest.raises(NotImplementedError, match="fa_version"):
+        flash_attn_varlen_func(**dict(case, fa_version=3))
+
+
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("layout", ["interleaved", "strided"])
 @pytest.mark.parametrize("fp8", [False, True])

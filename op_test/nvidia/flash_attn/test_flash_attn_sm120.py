@@ -35,6 +35,50 @@ def _metrics(o, ref):
     return rel_l1, cos, d.abs().max().item()
 
 
+def test_public_eligibility_and_fail_fast():
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+
+    _requires_sm120()
+    case = build_case(64, [65, 3], [257, 513], hq=16, hkv=2)
+    case["fa_version"] = 3
+    assert can_use_flash_attn_varlen_func(**case)
+
+    for update, match in (
+        ({"deterministic": True}, "deterministic"),
+        ({"scheduler_metadata": torch.empty(1, device="cuda")}, "scheduler"),
+        ({"num_prefill": 2}, "prefill/decode"),
+        ({"fa_version": 4}, "fa_version"),
+    ):
+        kwargs = dict(case, **update)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises(NotImplementedError, match=match):
+            flash_attn_varlen_func(**kwargs)
+
+
+def test_cutlass_cache_version_override_is_context_local():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from cutlass.cutlass_dsl import BaseDSL
+    from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
+        _use_cutlass_dsl_version,
+    )
+
+    _requires_sm120()
+    dsl = BaseDSL._get_dsl()
+    barrier = Barrier(2)
+
+    def read_version(marker):
+        with _use_cutlass_dsl_version(lambda: marker):
+            barrier.wait()
+            return dsl.get_version()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(read_version, ("thread-a", "thread-b")))
+    assert results == ["thread-a", "thread-b"]
+    assert dsl.get_version() not in results
+
+
 def test_sm120_eager_scratch_not_retained_per_layer_or_shape():
     from functools import partial
     from atrex import flash_attn_varlen_func

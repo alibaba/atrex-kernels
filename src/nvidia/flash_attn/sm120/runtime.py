@@ -5,7 +5,7 @@ import math
 import inspect
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple, Callable, NamedTuple, Union
+from typing import Optional, Tuple, Callable, Union
 
 import torch
 
@@ -16,7 +16,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
-from atrex.api.cutlass_dsl_compat import (
+from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
     use_filesystem_cutlass_dsl_version_hash,
 )
 from atrex._vendor.flash_attn.cute.cache_utils import get_jit_cache
@@ -38,9 +38,6 @@ from atrex._vendor.flash_attn.cute.cute_dsl_utils import (
     to_cute_aux_tensor,
     to_cute_tensor,
 )
-from atrex.src.nvidia.flash_attn.sm103.prefill_cutedsl import FlashAttentionForwardHd256_2CTA_Sm103
-# ATREX PORT (sm120 FA4-cute full-attn, q16/kv2 & q24/kv4 hd256 bf16): the SM80-class forward
-# vendored locally (mirrors the sm103 precedent), and the split-KV combine kernel from b20.
 from atrex.src.nvidia.flash_attn.sm120.prefill_cutedsl import FlashAttentionForwardSm120
 from atrex._vendor.flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -88,15 +85,6 @@ _patch_flash_attn_fmax_for_cutlass_dsl_45x()
 _EMPTY_AUX_DATA = AuxData(None, None)
 
 
-class DescaleTensors(NamedTuple):
-    q_descale: Optional[cute.Tensor] = None
-    k_descale: Optional[cute.Tensor] = None
-    v_descale: Optional[cute.Tensor] = None
-
-    def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
-
-
 @dataclass(frozen=True)
 class _PreparedFlashAttnVarlen:
     """Compiled varlen forward with sequence-independent host dispatch."""
@@ -111,12 +99,6 @@ class _PreparedFlashAttnVarlen:
     seqused_q: Optional[torch.Tensor]
     seqused_k: Optional[torch.Tensor]
     page_table: Optional[torch.Tensor]
-    # ATREX PORT: arch selects the trailing positional contract of the compiled kernel. sm120's
-    # SM80-class __call__ has (mNumSplitsDynamic, mWorkMap) right after mPageTable and NO descale
-    # slot; sm103's has (window_l, window_r, sink, descale, blocksparse). Default 103 keeps sm103
-    # callers unchanged.
-    arch: int = 103
-
     def run(
         self,
         q: torch.Tensor,
@@ -164,13 +146,18 @@ class _PreparedFlashAttnVarlen:
             self.seqused_q if seqused_q is None else seqused_q,
             self.seqused_k if seqused_k is None else seqused_k,
             self.page_table if page_table is None else page_table,
-            # SM120 adds dynamic split/work-map/request-order and Q/K/V
-            # descale slots before the common arguments.
-            *(
-                (None, None, None, None, None, None, None, None, None, None)
-                if self.arch // 10 == 12
-                else (None, None, None, None, None)
-            ),
+            # Dynamic split/work-map/request-order, Q/K/V descales, window,
+            # sink, then block-sparse metadata.
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             _EMPTY_AUX_DATA,
         )
         return out
@@ -203,26 +190,6 @@ def _get_device_arch(device_index):
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + int(minor)
-
-
-def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
-    """Validate head dimension constraints based on compute capability."""
-    is_deepseek_shape = head_dim == 192 and head_dim_v == 128
-    is_deepseek_mla_absorbed_shape = (head_dim == 64 or head_dim == head_dim_v) and head_dim_v == 512
-    is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
-    is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
-
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
-    if compute_capability == 9:
-        assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
-            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
-        )
-    elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
-            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256."
-        )
 
 
 @dataclass(frozen=True)
@@ -509,11 +476,11 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch(v.device.index) if _arch is None else _arch
-    assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if arch != 120:
+        raise NotImplementedError(
+            f"the SM120 FlashAttention runtime cannot compile for arch={arch}"
+        )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    alignment = 16 // v.element_size()
-    if arch // 10 not in [8, 12]:
-        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = (
             1.0 / math.sqrt(head_dim) if qv is None or q is None
@@ -529,26 +496,16 @@ def _flash_attn_fwd(
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
-    use_hd256_2cta = (
-        arch == 103
-        and head_dim == 256
-        and head_dim_v == 256
-        and v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
-    )
     # SM120 uses warp-level mma.sync for BF16 and FP8 E4M3/E5M2.
-    use_sm120 = (
-        arch // 10 == 12
-        and head_dim == 256
+    if not (
+        head_dim == 256
         and head_dim_v == 256
-        and v.dtype in (
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
+        and v.dtype
+        in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
+    ):
+        raise NotImplementedError(
+            "Atrex SM120 attention supports BF16/FP8 HD256"
         )
-    )
-    assert use_hd256_2cta or use_sm120, (
-        "Atrex FA4 supports BF16/FP8 HD256 on SM103 or SM120"
-    )
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -591,8 +548,6 @@ def _flash_attn_fwd(
         )
 
     dtype = torch2cute_dtype_map[q_dtype]
-    if is_fp8:
-        assert arch // 10 in (10, 12), "FP8 is only supported on SM100/SM103 or SM120."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -603,52 +558,41 @@ def _flash_attn_fwd(
 
     # SM80/SM120 uses warp MMA. Native page128 Q1 uses a compact M16 tile and
     # only needs two warps; all other paths keep the four-warp configuration.
-    if arch // 10 in [8, 12]:
-        num_threads = 64 if arch // 10 == 12 and tile_mn == (16, 32) else 128
+    num_threads = 64 if tile_mn == (16, 32) else 128
 
     # BF16 hd256 needs a deeper K/V pipeline than tile_n=128 can fit alongside
     # the Q/O buffers (the 64-wide layout has capacity for six stages and uses
     # the tuned five-stage cap, versus three 128-wide stages). On SM103 the
     # 128x64 tile is faster at both short and long causal-varlen shapes. FP8
     # keeps its tuned 128x128 tile.
-    fwd_cfg = FwdConfig(128, 64 if use_hd256_2cta and not is_fp8 else 128, True, True)
-    # ATREX PORT sm120: num_stages / Q_in_regs are ctor params of the SM80-class kernel (unlike the
-    # sm103 2CTA kernel which uses q_stage). Defaults set here, per the validated hd256 policy.
+    fwd_cfg = FwdConfig(128, 128, True, True)
+    # num_stages / Q_in_regs are constructor parameters of the SM120 kernel.
     sm120_num_stages = 1
     sm120_q_in_regs = False
     if tile_mn is None:
-        if use_sm120:
-            # Validated hd256 policy (48-shape sweep): prefill/prefix-cache (causal) = 64x64 stages=1;
-            # decode (packed GQA, non-causal) = 64x32 stages=2. Both fit 99 KB SMEM, Q_in_regs=0.
-            if causal:
-                # A paged tile must not cross a physical page because the
-                # kernel resolves one page-table entry per N tile. Pick the
-                # widest supported divisor; hybrid-cache page sizes such as
-                # 1056 therefore use N=48 instead of an invalid N=64 mapping.
-                causal_tile_n = 32 if is_fp8 else 64
-                if page_size is not None:
-                    causal_tile_n = _sm120_paged_tile_n(
-                        page_size,
-                        (32, 16) if is_fp8 else (64, 48, 32, 16),
-                    )
-                fwd_cfg = FwdConfig(64, causal_tile_n, True, True)
-                sm120_num_stages = 1
-            else:
-                decode_tile_n = 32
-                if page_size is not None:
-                    decode_tile_n = _sm120_paged_tile_n(page_size, (32, 16))
-                fwd_cfg = FwdConfig(64, decode_tile_n, True, True)
-                sm120_num_stages = 2
-        elif arch // 10 == 8:
-            fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
-        elif arch // 10 == 9:
-            sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
-            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
+        # Validated hd256 policy (48-shape sweep): prefill/prefix-cache
+        # (causal) = 64x64 stages=1; decode = 64x32 stages=2.
+        if causal:
+            # A paged tile must not cross a physical page because the kernel
+            # resolves one page-table entry per N tile.
+            causal_tile_n = 32 if is_fp8 else 64
+            if page_size is not None:
+                causal_tile_n = _sm120_paged_tile_n(
+                    page_size,
+                    (32, 16) if is_fp8 else (64, 48, 32, 16),
+                )
+            fwd_cfg = FwdConfig(64, causal_tile_n, True, True)
+            sm120_num_stages = 1
+        else:
+            decode_tile_n = 32
+            if page_size is not None:
+                decode_tile_n = _sm120_paged_tile_n(page_size, (32, 16))
+            fwd_cfg = FwdConfig(64, decode_tile_n, True, True)
+            sm120_num_stages = 2
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
         if (
-            use_sm120
-            and is_fp8
+            is_fp8
             and causal
             and max_seqlen_q == 1
             and page_size == 64
@@ -656,7 +600,7 @@ def _flash_attn_fwd(
         ):
             sm120_num_stages = 2
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    if use_sm120 and page_size is not None and page_size % tile_n != 0:
+    if page_size is not None and page_size % tile_n != 0:
         raise ValueError(
             f"Atrex FA SM120 requires page_size ({page_size}) to be divisible "
             f"by tile_n ({tile_n})"
@@ -666,118 +610,96 @@ def _flash_attn_fwd(
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
-    if use_sm120:
-        # ATREX PORT sm120: prefill is causal varlen; decode is non-causal packed GQA (batched
-        # entry, cu_seqlens_q=None) with SplitKV. Paged or varlen K/V both supported.
-        assert not local, "Atrex FA4 sm120 does not support local/sliding-window attention"
-        assert cu_seqlens_k is not None or page_table is not None, (
-            "Atrex FA4 sm120 requires varlen or paged K/V"
+    # Prefill is causal varlen; decode is non-causal packed GQA with SplitKV.
+    assert not local, "Atrex FA4 sm120 does not support local/sliding-window attention"
+    assert cu_seqlens_k is not None or page_table is not None, (
+        "Atrex FA4 sm120 requires varlen or paged K/V"
+    )
+    assert num_splits <= 256, "num_splits must be <= 256 (combine kernel limit)"
+    if num_splits_dynamic is not None:
+        _validate_tensor(
+            num_splits_dynamic,
+            "num_splits_dynamic",
+            (batch_size,),
+            torch.int32,
+            device,
         )
-        assert num_splits <= 256, "num_splits must be <= 256 (combine kernel limit)"
-        if num_splits_dynamic is not None:
-            _validate_tensor(
-                num_splits_dynamic,
-                "num_splits_dynamic",
-                (batch_size,),
-                torch.int32,
-                device,
-            )
-        if work_map is not None:
-            if (
-                work_map.device != device
-                or work_map.dtype != torch.int32
-                or work_map.ndim != 2
-                or work_map.shape[1] not in (1, 4)
-                or not work_map.is_contiguous()
-            ):
-                raise ValueError(
-                    "SM120 work_map must be contiguous int32 CUDA [rows, 1|4]"
-                )
-            if work_map.shape[1] == 1 and not (
-                num_splits_dynamic is not None
-                and cu_seqlens_q is not None
-                and max_seqlen_q in (1, 4)
-                and total_q == batch_size * max_seqlen_q
-                and num_head_kv == 1
-            ):
-                raise ValueError(
-                    "the compact short-Q work map requires ragged Q1/Q4, one KV head, "
-                    "and dynamic split counts"
-                )
-        if request_order is not None:
-            if (
-                request_order.device != device
-                or request_order.dtype != torch.int32
-                or request_order.shape != (batch_size + 1,)
-                or not request_order.is_contiguous()
-            ):
-                raise ValueError(
-                    "SM120 request_order must be contiguous int32 CUDA [flag, batch]"
-                )
-        # split-KV was historically mutually exclusive with pack_gqa on the SM80-class kernel
-        # (the epilogue lacked an fp32 pointer-scatter O store). With ATREX_FA4_PGSPLIT=1 the
-        # kernel's fp32 packed scatter is enabled, so pack_gqa and split can coexist -- this lets a
-        # varlen call (incl. mixed prefill+decode) keep pack_gqa AND split the long tail in one
-        # launch, instead of the host having to reshape a pure-decode batch. Default off keeps the
-        # validated L1.6 path (host-side packed view) untouched.
-        is_split_kv = num_splits > 1
-        if request_order is not None and not (
-            is_fp8
-            and causal
-            and page_size in (64, 128)
-            and batch_size == 64
-            and cu_seqlens_q is not None
-            and seqused_k is not None
-            and max_seqlen_q is not None
-            and 5 <= max_seqlen_q <= 2048
-            and total_q == batch_size * max_seqlen_q
-            and not is_split_kv
-            and work_map is None
-            and not _runtime_balanced_splits
-            and not _use_clc
+    if work_map is not None:
+        if (
+            work_map.device != device
+            or work_map.dtype != torch.int32
+            or work_map.ndim != 2
+            or work_map.shape[1] not in (1, 4)
+            or not work_map.is_contiguous()
         ):
             raise ValueError(
-                "SM120 request_order requires B64 uniform-Q FP8 causal paged "
-                "prefill with page_size 64/128 and no SplitKV"
+                "SM120 work_map must be contiguous int32 CUDA [rows, 1|4]"
             )
-        _pgsplit = (
-            _allow_pack_gqa_split
-            or os.environ.get("ATREX_FA4_PGSPLIT", "0") == "1"
+        if work_map.shape[1] == 1 and not (
+            num_splits_dynamic is not None
+            and cu_seqlens_q is not None
+            and max_seqlen_q in (1, 4)
+            and total_q == batch_size * max_seqlen_q
+            and num_head_kv == 1
+        ):
+            raise ValueError(
+                "the compact short-Q work map requires ragged Q1/Q4, one KV head, "
+                "and dynamic split counts"
+            )
+    if request_order is not None:
+        if (
+            request_order.device != device
+            or request_order.dtype != torch.int32
+            or request_order.shape != (batch_size + 1,)
+            or not request_order.is_contiguous()
+        ):
+            raise ValueError(
+                "SM120 request_order must be contiguous int32 CUDA [flag, batch]"
+            )
+    # Split-KV and packed GQA can coexist only through the opt-in scatter path.
+    is_split_kv = num_splits > 1
+    if request_order is not None and not (
+        is_fp8
+        and causal
+        and page_size in (64, 128)
+        and batch_size == 64
+        and cu_seqlens_q is not None
+        and seqused_k is not None
+        and max_seqlen_q is not None
+        and 5 <= max_seqlen_q <= 2048
+        and total_q == batch_size * max_seqlen_q
+        and not is_split_kv
+        and work_map is None
+        and not _runtime_balanced_splits
+        and not _use_clc
+    ):
+        raise ValueError(
+            "SM120 request_order requires B64 uniform-Q FP8 causal paged "
+            "prefill with page_size 64/128 and no SplitKV"
         )
-        if is_split_kv and not (_pgsplit and pack_gqa):
-            pack_gqa = False
-        q_stage = 1
-        use_2cta_instrs = False
-        input_variant = "fp8" if is_fp8 else "bf16"
-        fwd_kernel_variant = (
-            f"hd256_{input_variant}_sm120_v1{'_split' if is_split_kv else ''}"
-            f"{'_pg' if (is_split_kv and pack_gqa) else ''}"
-        )
-    else:
-        assert causal and not local, "Atrex FA4 HD256 prefill requires causal attention"
-        assert num_splits == 1, "Atrex FA4 HD256 2CTA prefill does not support split-KV"
-        assert cu_seqlens_q is not None, "Atrex FA4 HD256 prefill requires varlen Q"
-        assert cu_seqlens_k is not None or page_table is not None, (
-            "Atrex FA4 HD256 prefill requires varlen or paged K/V"
-        )
-        input_variant = "fp8" if is_fp8 else "bf16"
-        fwd_kernel_variant = f"hd256_{input_variant}_2cta_sm103_clc_v1_default"
-        q_stage = 1
-        is_split_kv = False
-
-        use_2cta_instrs = True
+    _pgsplit = (
+        _allow_pack_gqa_split
+        or os.environ.get("ATREX_FA4_PGSPLIT", "0") == "1"
+    )
+    if is_split_kv and not (_pgsplit and pack_gqa):
+        pack_gqa = False
+    q_stage = 1
+    use_2cta_instrs = False
+    input_variant = "fp8" if is_fp8 else "bf16"
+    fwd_kernel_variant = (
+        f"hd256_{input_variant}_sm120_v1{'_split' if is_split_kv else ''}"
+        f"{'_pg' if (is_split_kv and pack_gqa) else ''}"
+    )
 
     use_lpt = (
-        use_sm120
-        and causal
+        causal
         and not is_split_kv
         and max_seqlen_q is not None
         and max_seqlen_k is not None
         and 2 * max_seqlen_q >= max_seqlen_k
     )
     clc_supported = (
-        use_sm120
-        and is_fp8
+        is_fp8
         and causal
         and cu_seqlens_q is not None
         and page_size == 64
@@ -797,9 +719,6 @@ def _flash_attn_fwd(
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
-    elif score_mod is not None:
-        if arch // 10 == 8:
-            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -902,37 +821,27 @@ def _flash_attn_fwd(
     out_partial = lse_partial = runtime_num_splits = None
     kernel_num_splits_dynamic = num_splits_dynamic
     if is_split_kv:
-        if use_sm120:
-            out_partial = torch.empty(
-                num_splits,
-                *q_batch_seqlen_shape,
-                num_head,
-                head_dim_v,
-                dtype=torch.float32,
-                device=device,
-            )
-            lse_partial = torch.empty(
-                num_splits,
-                *lse_shape,
-                dtype=torch.float32,
-                device=device,
-            )
-        else:
-            out_partial = torch.empty(
-                num_splits, *q_batch_seqlen_shape, num_head, head_dim_v,
-                dtype=torch.float32, device=device,
-            )
-            lse_partial = torch.empty(
-                num_splits, *lse_shape, dtype=torch.float32, device=device
-            )
+        out_partial = torch.empty(
+            num_splits,
+            *q_batch_seqlen_shape,
+            num_head,
+            head_dim_v,
+            dtype=torch.float32,
+            device=device,
+        )
+        lse_partial = torch.empty(
+            num_splits,
+            *lse_shape,
+            dtype=torch.float32,
+            device=device,
+        )
         if _runtime_balanced_splits:
             runtime_num_splits = torch.empty(
                 batch_size, dtype=torch.int32, device=device
             )
             kernel_num_splits_dynamic = runtime_num_splits
         use_short_q_dynamic_reducer = (
-            use_sm120
-            and cu_seqlens_q is not None
+            cu_seqlens_q is not None
             and max_seqlen_q in (1, 2, 3, 4)
             and total_q == batch_size * max_seqlen_q
             and lse is None
@@ -942,7 +851,6 @@ def _flash_attn_fwd(
         if work_map is not None and not use_short_q_dynamic_reducer:
             lse_partial.fill_(float("-inf"))
 
-    paged_kv_small_page = page_size is not None and page_size % tile_n != 0
     compile_key = (
         device.index,
         dtype,
@@ -981,11 +889,10 @@ def _flash_attn_fwd(
         use_lpt,
         use_clc,
         arch,
-        paged_kv_small_page,
         page_size,
         # ATREX PORT sm120: DYNSPLIT / COMPACTGRID are constexpr in the kernel; omitting them would
         # let a compact-grid launch reuse a non-compact cubin (wrong grid decode). page-aligned
-        # paged-vs-not is already keyed via page_size + paged_kv_small_page above.
+        # Paged-vs-not is already keyed by page_size above.
         kernel_num_splits_dynamic is not None if is_split_kv else False,
         work_map.shape[1] if work_map is not None else 0,
         request_order is not None,
@@ -1055,18 +962,6 @@ def _flash_attn_fwd(
             to_cute_tensor(t, assumed_align=4, leading_dim=1)
             for t in (q_descale, k_descale, v_descale)
         )
-        descale_tensors_tensor = (
-            DescaleTensors(
-                q_descale=q_descale_tensor,
-                k_descale=k_descale_tensor,
-                v_descale=v_descale_tensor,
-            )
-            if q_descale_tensor is not None
-            or k_descale_tensor is not None
-            or v_descale_tensor is not None
-            else None
-        )
-
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
@@ -1081,87 +976,54 @@ def _flash_attn_fwd(
         p_tensor = to_cute_tensor(p)
         row_max_tensor = to_cute_tensor(row_max)
 
-        if use_sm120:
-            # ATREX PORT: SM80-class SM120 kernel. Note the ctor takes `dtype` first (cutlass dtype)
-            # and num_stages/Q_in_regs (not q_stage/2CTA). page_size only when actually paged;
-            # dynamic_splits/compact_grid are constexpr toggles driven by the trailing tensors.
-            if not FlashAttentionForwardSm120.can_implement(
-                dtype,
-                head_dim,
-                head_dim_v,
-                tile_m,
-                tile_n,
-                sm120_num_stages,
-                num_threads,
-                causal,
-                sm120_q_in_regs,
-            ):
-                raise ValueError(
-                    "Atrex FA SM120 configuration exceeds kernel resource limits: "
-                    f"dtype={dtype}, head_dim={head_dim}, head_dim_v={head_dim_v}, "
-                    f"tile=({tile_m}, {tile_n}), stages={sm120_num_stages}, "
-                    f"threads={num_threads}, causal={causal}, "
-                    f"Q_in_regs={sm120_q_in_regs}"
-                )
-            fa_fwd = FlashAttentionForwardSm120(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                lpt=use_lpt,
-                use_clc=use_clc,
-                pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                num_stages=sm120_num_stages,
-                num_threads=num_threads,
-                Q_in_regs=sm120_q_in_regs,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                is_split_kv=is_split_kv,
-                page_size=page_size if page_table is not None else None,
-                dynamic_splits=kernel_num_splits_dynamic is not None,
-                compact_grid=work_map is not None,
-                compact_short_q=work_map is not None and work_map.shape[1] == 1,
-                reorder_batch=request_order is not None,
-                runtime_balanced_splits=_runtime_balanced_splits,
-                runtime_balanced_grid_size=_runtime_balanced_grid_size,
-                runtime_balanced_batch_size=_runtime_balanced_batch_size,
+        if not FlashAttentionForwardSm120.can_implement(
+            dtype,
+            head_dim,
+            head_dim_v,
+            tile_m,
+            tile_n,
+            sm120_num_stages,
+            num_threads,
+            causal,
+            sm120_q_in_regs,
+        ):
+            raise ValueError(
+                "Atrex FA SM120 configuration exceeds kernel resource limits: "
+                f"dtype={dtype}, head_dim={head_dim}, head_dim_v={head_dim_v}, "
+                f"tile=({tile_m}, {tile_n}), stages={sm120_num_stages}, "
+                f"threads={num_threads}, causal={causal}, "
+                f"Q_in_regs={sm120_q_in_regs}"
             )
-            fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
-            fa_fwd.atrex_sm120_prefill_clc_kernel.set_name_prefix("atrex")
-        else:
-            fa_fwd = FlashAttentionForwardHd256_2CTA_Sm103(
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                is_split_kv=is_split_kv,
-                pack_gqa=pack_gqa,
-                m_block_size=tile_m,
-                n_block_size=tile_n,
-                q_stage=q_stage,
-                is_persistent=not causal
-                    and not local
-                    and cu_seqlens_q is None
-                    and seqused_q is None
-                    and not is_split_kv,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=paged_kv_small_page,
-                paged_kv_page_size=page_size,
-                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
-                q_subtile_factor=q_subtile_factor,
-                use_2cta_instrs=use_2cta_instrs,
-                dedicated_clc_warp=False,
-                register_config=None,
-            )
-            fa_fwd.atrex_sm103_prefill_kernel.set_name_prefix("atrex")
+        fa_fwd = FlashAttentionForwardSm120(
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead=qhead_per_kvhead,
+            is_causal=causal,
+            is_local=local,
+            lpt=use_lpt,
+            use_clc=use_clc,
+            pack_gqa=pack_gqa,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            num_stages=sm120_num_stages,
+            num_threads=num_threads,
+            Q_in_regs=sm120_q_in_regs,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            has_aux_tensors=aux_tensors is not None,
+            is_split_kv=is_split_kv,
+            page_size=page_size if page_table is not None else None,
+            dynamic_splits=kernel_num_splits_dynamic is not None,
+            compact_grid=work_map is not None,
+            compact_short_q=work_map is not None and work_map.shape[1] == 1,
+            reorder_batch=request_order is not None,
+            runtime_balanced_splits=_runtime_balanced_splits,
+            runtime_balanced_grid_size=_runtime_balanced_grid_size,
+            runtime_balanced_batch_size=_runtime_balanced_batch_size,
+        )
+        fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
+        fa_fwd.atrex_sm120_prefill_clc_kernel.set_name_prefix("atrex")
         # TODO: check @can_implement
         if qv is not None:
             with use_filesystem_cutlass_dsl_version_hash():
@@ -1202,20 +1064,16 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                # SM120 takes dynamic-split, work-map and request-order tensors
-                # after mPageTable; other arches have no such parameters.
-                *([nsd_tensor, wm_tensor, request_order_tensor] if use_sm120 else []),
-                *(
-                    [q_descale_tensor, k_descale_tensor, v_descale_tensor]
-                    if use_sm120
-                    else []
-                ),
+                nsd_tensor,
+                wm_tensor,
+                request_order_tensor,
+                q_descale_tensor,
+                k_descale_tensor,
+                v_descale_tensor,
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
             ]
-            if arch // 10 in [10, 11]:
-                compile_args.append(descale_tensors_tensor)
             compile_args.extend([
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
@@ -1245,7 +1103,6 @@ def _flash_attn_fwd(
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             page_table=page_table,
-            arch=arch,
         )
 
     if not is_fake_mode():
@@ -1262,11 +1119,6 @@ def _flash_attn_fwd(
                 else t
                 for t in (q_call, k_call, v_call, qv_call)
             ]
-        descale_tensors = (
-            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
-            if q_descale is not None or k_descale is not None or v_descale is not None
-            else None
-        )
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key](
                 q_call,
@@ -1300,15 +1152,16 @@ def _flash_attn_fwd(
                 seqused_q,
                 seqused_k,
                 page_table,
-                # ATREX PORT sm120: matches the compile-args order above.
-                *([kernel_num_splits_dynamic, work_map, request_order] if use_sm120 else []),
-                *([q_descale, k_descale, v_descale] if use_sm120 else []),
+                kernel_num_splits_dynamic,
+                work_map,
+                request_order,
+                q_descale,
+                k_descale,
+                v_descale,
                 window_size_left,
                 window_size_right,
                 learnable_sink,
             ]
-            if arch // 10 in [10, 11]:
-                call_args.append(descale_tensors)
             call_args.extend([
                 (
                     normalized_block_sparse_tensors.mask_block_cnt,
@@ -1327,8 +1180,7 @@ def _flash_attn_fwd(
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         use_short_q_reducer = (
-            use_sm120
-            and cu_seqlens_q is not None
+            cu_seqlens_q is not None
             and max_seqlen_q in (1, 2, 3, 4)
             and total_q == batch_size * max_seqlen_q
             and lse is None

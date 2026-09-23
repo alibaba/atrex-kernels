@@ -15,7 +15,7 @@ from cutlass import Float32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm
 
-from atrex.api.cutlass_dsl_compat import (
+from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
     use_filesystem_cutlass_dsl_version_hash,
 )
 from atrex._vendor.flash_attn.cute.cache_utils import get_jit_cache

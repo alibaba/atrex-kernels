@@ -28,6 +28,17 @@ def _case(page_size, q_lens, kv_lens, *, contiguous=False):
     return case
 
 
+def test_public_eligibility_and_fail_fast():
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+
+    case = _case(64, [65, 3], [257, 513])
+    for version in (2, 3):
+        assert can_use_flash_attn_varlen_func(**dict(case, fa_version=version))
+    assert not can_use_flash_attn_varlen_func(**dict(case, fa_version=4))
+    with pytest.raises(NotImplementedError, match="fa_version"):
+        flash_attn_varlen_func(**dict(case, fa_version=4))
+
+
 def _check(case, splits=0, graph=False):
     from atrex import flash_attn_varlen_func
 

@@ -12,7 +12,9 @@ import cutlass.utils as utils
 import torch
 from cutlass.cute.typing import BFloat16, Float32, Int32, Optional
 
-from atrex.api.cutlass_dsl_compat import use_filesystem_cutlass_dsl_version_hash
+from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
+    use_filesystem_cutlass_dsl_version_hash,
+)
 
 
 HEAD_DIM = 256
