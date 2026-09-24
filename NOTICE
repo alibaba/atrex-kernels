@@ -10,3 +10,13 @@ Source: https://github.com/NVIDIA/cutlass
 
 The CUTLASS submodule and bundled CUTLASS-derived headers retain their original
 copyright notices and license terms.
+
+FlashInfer Chunk-GDN
+Copyright (c) 2025 FlashInfer team.
+SPDX-License-Identifier: Apache-2.0
+Source: https://github.com/flashinfer-ai/flashinfer at commit
+2ab910c58fdd2392914ea05e2a8714946ac0eef6
+
+The NVIDIA SM103 Chunk-GDN implementation incorporates FlashInfer-derived
+source together with Alibaba AKA M64 adaptations. The source files retain
+their original copyright and license notices.

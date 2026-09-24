@@ -25,8 +25,15 @@ An operator change is incomplete unless its matching target test is added or
 updated in the same change. The current files are:
 
 ```text
+op_test/nvidia/chunk_gdn/test_chunk_gdn_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
 ```
+
+The SM103 Chunk-GDN path integrates the AKA M64 implementation for prepared,
+L2-normalized Q/K inputs. It keeps the existing public Chunk-GDN API and uses
+strict eligibility checks rather than changing either the public API or the
+kernel contract. Its private launch interface and profiler-visible kernel name
+start with `atrex_aka_`.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
