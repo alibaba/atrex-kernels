@@ -1,0 +1,50 @@
+# 每晚将 GitHub main 快进同步到内源 dev。
+# 两个分支始终指向同一个 commit；同步过程不创建额外提交。
+name: 外源夜间同步
+
+triggers:
+  schedule:
+    - cron: '0 23 * * *'
+      branches: [dev]
+      always: true
+
+strategy:
+  fast-fail: false
+  concurrency:
+    group: '${{pipeline.id}}'
+    parallelism: 1
+
+params:
+  no_push:
+    type: boolean
+    default: false
+    description: 'true 时只检查同步结果，不推送内源 dev'
+
+jobs:
+  sync-github-main:
+    runs-on:
+      - aone-hosted
+      - linux
+      - amd64
+      - 8-32Gi
+    timeout: 1h
+    steps:
+      - id: checkout
+        uses: checkout
+        inputs:
+          fetch-depth: 0
+          lfs: false
+          submodules: false
+      - id: setup-github-proxy
+        uses: setup-github-proxy
+      - id: sync
+        envs:
+          NO_PUSH: '${{params.no_push}}'
+          WORKER_KEY: '${{secrets.WORKER_KEY}}'
+          WORKER_USER: '${{vars.WORKER_USER}}'
+          REPO_PATH: '${{git.repo}}'
+        run: |
+          set -e
+          bash scripts/ci_setup_git_credentials.sh
+          git remote set-url --push origin "https://code.alibaba-inc.com/${REPO_PATH}.git"
+          bash scripts/sync_github_main.sh
