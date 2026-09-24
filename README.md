@@ -26,7 +26,14 @@ updated in the same change. The current files are:
 
 ```text
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
+op_test/nvidia/flash_attn/test_flash_attn_sm103.py
 ```
+
+The SM103 FlashAttention path exposes a vLLM-compatible varlen/paged API and
+currently dispatches only the AKA BF16 q4 specialization for Qwen3.7-Max TP4:
+16 query heads, one KV head, head dimension 256, page size 128, and batch
+sizes 16 through 28. Unsupported calls are rejected before launch so another
+backend can be added as an explicit fallback without changing the public API.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the

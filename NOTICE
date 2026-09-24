@@ -10,3 +10,13 @@ Source: https://github.com/NVIDIA/cutlass
 
 The CUTLASS submodule and bundled CUTLASS-derived headers retain their original
 copyright notices and license terms.
+
+FlashInfer FA4 decode
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+Source: https://github.com/flashinfer-ai/flashinfer at commit
+5b1af972466a927e825e589e18263f20a5462349
+
+The NVIDIA SM103 AKA FA4 decode implementation incorporates FlashInfer-derived
+source adapted from revision f52eed27627561b2df2a6626071860ff32677675.
+The source file retains its original copyright and license notice.
