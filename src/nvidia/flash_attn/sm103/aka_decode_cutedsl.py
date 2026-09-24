@@ -1,11 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
+# Adapted from FlashInfer commit 5b1af972466a927e825e589e18263f20a5462349:
+# flashinfer/cute_dsl/attention/fusion/mask.py,
+# flashinfer/cute_dsl/attention/gqa_decode.py, and
+# flashinfer/cute_dsl/attention/gqa_decode_paged.py.
 
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass
 from functools import partial
-from typing import Literal, Tuple, Type, cast
+from typing import Literal, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -14,103 +18,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.pipeline import Agent, CooperativeGroup, NamedBarrier as nbar
-from cutlass.cute.typing import BFloat16, Float16, Float32, Int8, Int32, Int64, Optional, Union
-
-@dataclass(frozen=True)
-class MaskSpec:
-    has_window_left: bool = False
-    has_window_right: bool = False
-
-    @property
-    def has_left_bound(self) -> bool:
-        return self.has_window_left
-
-    @property
-    def has_right_bound(self) -> bool:
-        return self.has_window_right
-
-    @property
-    def needs_masking(self) -> bool:
-        return True
-
-@cute.jit
-def get_kv_block_range(spec: MaskSpec, blk_coord: cute.Coord, tile_shape: cute.Shape, seqlen_k: Int32, seqlen_q: Int32, window_left: Int32, window_right: Int32) -> tuple[Int32, Int32]:
-    qk_offset = seqlen_k - seqlen_q
-    start_block = 0
-    if cutlass.const_expr(spec.has_window_left):
-        first_q = blk_coord[0] * tile_shape[0] + qk_offset
-        min_kv = cutlass.max(0, first_q - window_left)
-        start_block = min_kv // tile_shape[1]
-    last_q = (blk_coord[0] + 1) * tile_shape[0] - 1 + qk_offset
-    end_elem = seqlen_k
-    if cutlass.const_expr(spec.has_window_right):
-        end_elem = cutlass.min(seqlen_k, last_q + window_right + 1)
-    end_block = cute.ceil_div(end_elem, tile_shape[1])
-    return (start_block, end_block)
-
-@cute.jit
-def get_trip_count(spec: MaskSpec, blk_coord: cute.Coord, tile_shape: cute.Shape, seqlen_k: Int32, seqlen_q: Int32, window_left: Int32, window_right: Int32) -> Int32:
-    (start_block, end_block) = get_kv_block_range(spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right)
-    return end_block - start_block
-
-@cute.jit
-def get_peel_sections(spec: MaskSpec, blk_coord: cute.Coord, tile_shape: cute.Shape, seqlen_k: Int32, seqlen_q: Int32, window_left: Int32, window_right: Int32) -> tuple[Int32, Int32, Int32, Int32, Int32]:
-    stage_tiler = (tile_shape[0] // 2, tile_shape[1])
-    (lo0, hi0) = get_kv_block_range(spec, (blk_coord[0] * 2, blk_coord[1], blk_coord[2]), stage_tiler, seqlen_k, seqlen_q, window_left, window_right)
-    (lo1, hi1) = get_kv_block_range(spec, (blk_coord[0] * 2 + 1, blk_coord[1], blk_coord[2]), stage_tiler, seqlen_k, seqlen_q, window_left, window_right)
-    lo1_clamped = cutlass.min(lo1, hi0)
-    head = lo1_clamped - lo0
-    main = hi0 - lo1_clamped
-    borrow = cutlass.min(head, cutlass.max(0, 1 - main))
-    return (lo0, head - borrow, main + borrow, hi1 - hi0, lo1 - lo1_clamped + borrow)
-
-@cute.jit
-def get_stage_peel_segments(spec: MaskSpec, blk_coord: cute.Coord, stage: int, tile_shape: cute.Shape, seqlen_k: Int32, seqlen_q: Int32, window_left: Int32, window_right: Int32) -> tuple[Int32, Int32, Int32, Int32, Int32, Int32]:
-    (union_start, head, _, tail, stage1_extra) = get_peel_sections(spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right)
-    (_, masked_left, unmasked, masked_right) = get_trip_segments(spec, (blk_coord[0] * 2 + stage, blk_coord[1], blk_coord[2]), (tile_shape[0] // 2, tile_shape[1]), seqlen_k, seqlen_q, window_left, window_right)
-    if cutlass.const_expr(stage == 0):
-        return (union_start, masked_left, unmasked, masked_right, Int32(0), tail)
-    else:
-        return (union_start + head, masked_left + stage1_extra, unmasked, masked_right, head, Int32(0))
-
-@cute.jit
-def get_trip_segments(spec: MaskSpec, blk_coord: cute.Coord, tile_shape: cute.Shape, seqlen_k: Int32, seqlen_q: Int32, window_left: Int32, window_right: Int32) -> tuple[Int32, Int32, Int32, Int32]:
-    (start_block, end_block) = get_kv_block_range(spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right)
-    if cutlass.const_expr(not spec.needs_masking):
-        return (start_block, 0, end_block - start_block, 0)
-    else:
-        qk_offset = seqlen_k - seqlen_q
-        first_q = blk_coord[0] * tile_shape[0] + qk_offset
-        last_q = first_q + tile_shape[0] - 1
-        lo_max = 0
-        if cutlass.const_expr(spec.has_window_left):
-            lo_max = cutlass.max(0, last_q - window_left)
-        hi_min = seqlen_k
-        if cutlass.const_expr(spec.has_window_right):
-            hi_min = cutlass.min(seqlen_k, first_q + window_right + 1)
-        unmasked_start = cute.ceil_div(lo_max, tile_shape[1])
-        unmasked_end = hi_min // tile_shape[1]
-        unmasked_start = cutlass.min(cutlass.max(unmasked_start, start_block), end_block)
-        unmasked_end = cutlass.min(cutlass.max(unmasked_end, unmasked_start), end_block)
-        return (start_block, unmasked_start - start_block, unmasked_end - unmasked_start, end_block - unmasked_end)
-
-@cute.jit
-def apply_mask(spec: MaskSpec, acc_qk: cute.Tensor, index_qk: cute.Tensor, seqlen_k: Int32, causal_offset: Int32, index_qk_static: cute.Tensor, window_left: Int32, window_right: Int32) -> None:
-    if cutlass.const_expr(spec.needs_masking):
-        base_k = index_qk[0][1] - index_qk_static[0][1]
-        row_q = index_qk[0][0] + causal_offset
-        hi = seqlen_k
-        if cutlass.const_expr(spec.has_window_right):
-            hi = cutlass.min(row_q + window_right + 1, seqlen_k)
-        hi_rel = hi - base_k
-        if cutlass.const_expr(spec.has_window_left):
-            lo_rel = row_q - window_left - base_k
-            for i in range(cute.size(acc_qk)):
-                k = index_qk_static[i][1]
-                acc_qk[i] = cutlass.select_((k < lo_rel) | (k >= hi_rel), -Float32.inf, acc_qk[i])
-        else:
-            for i in range(cute.size(acc_qk)):
-                acc_qk[i] = cutlass.select_(index_qk_static[i][1] >= hi_rel, -Float32.inf, acc_qk[i])
+from cutlass.cute.typing import Float32, Int8, Int32, Int64, Optional, Union
 
 class AttentionMask(ABC):
 
@@ -129,28 +37,6 @@ class AttentionMask(ABC):
     @abstractmethod
     def get_range_args(self, seqlen_q, seqlen_kv, tile_q, tile_kv, num_tiles_kv, num_iters_kv, kv_splits, kv_split_idx, warpgroups_kv, warpgroup_kv_idx) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
         ...
-
-@dataclass(frozen=True)
-class DenseMask(AttentionMask):
-
-    @cute.jit
-    def is_oob_kv(self, idx_q, idx_kv, seqlen_q, seqlen_kv) -> bool:
-        return idx_kv >= seqlen_kv
-
-    @cute.jit
-    def get_range_args(self, seqlen_q, seqlen_kv, tile_q, tile_kv, num_tiles_kv, num_iters_kv, kv_splits, kv_split_idx, warpgroups_kv, warpgroup_kv_idx) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
-        is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
-        is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
-        unmasked_start = warpgroup_kv_idx
-        unmasked_end = num_iters_kv
-        unmasked_step = warpgroups_kv
-        masked_start = masked_end = masked_step = 0
-        if seqlen_kv % tile_kv != 0 and is_last_split and is_last_phase:
-            unmasked_end -= 1
-            masked_start = num_tiles_kv - 1
-            masked_end = num_tiles_kv
-            masked_step = 1
-        return ((unmasked_start, unmasked_end, unmasked_step, False), (masked_start, masked_end, masked_step, True))
 
 @dataclass(frozen=True)
 class CausalMask(AttentionMask):

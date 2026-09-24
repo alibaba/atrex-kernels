@@ -115,8 +115,11 @@ def can_use_atrex_aka_fa4_decode(**kwargs) -> bool:
             return False
         if kwargs.get("causal") is not True:
             return False
+        softmax_scale = kwargs.get("softmax_scale")
+        if softmax_scale is None:
+            softmax_scale = _ATREX_AKA_SCALE
         if not math.isclose(
-            float(kwargs.get("softmax_scale")),
+            float(softmax_scale),
             _ATREX_AKA_SCALE,
             rel_tol=0.0,
             abs_tol=1e-12,
@@ -126,7 +129,7 @@ def can_use_atrex_aka_fa4_decode(**kwargs) -> bool:
             return False
         if kwargs.get("num_splits") != 0:
             return False
-        if kwargs.get("softcap") not in (0, 0.0):
+        if kwargs.get("softcap") not in (None, 0, 0.0):
             return False
         if kwargs.get("window_size_left") is not None:
             return False
@@ -136,8 +139,30 @@ def can_use_atrex_aka_fa4_decode(**kwargs) -> bool:
             return False
         if any(
             kwargs.get(name) is not None
-            for name in ("q_descale", "k_descale", "v_descale")
+            for name in (
+                "qv",
+                "seqused_q",
+                "min_seqlen_k",
+                "tile_mn",
+                "mma_pv_is_rs",
+                "intra_wg_overlap",
+                "pack_gqa",
+                "_arch",
+                "score_mod",
+                "mask_mod",
+                "block_sparse_tensors",
+                "lse",
+                "aux_tensors",
+                "aux_scalars",
+                "q_descale",
+                "k_descale",
+                "v_descale",
+                "gather_kv_indices",
+                "output_scale",
+            )
         ):
+            return False
+        if kwargs.get("num_threads", 384) != 384:
             return False
 
         if out is not None:
@@ -160,7 +185,33 @@ def forward(**kwargs):
     if can_use_atrex_aka_fa4_decode(**kwargs):
         from .aka_decode_runtime import atrex_aka_fa4_decode
 
-        return atrex_aka_fa4_decode(**kwargs)
+        return atrex_aka_fa4_decode(
+            q=kwargs["q"],
+            k=kwargs["k"],
+            v=kwargs["v"],
+            cu_seqlens_q=kwargs.get("cu_seqlens_q"),
+            cu_seqlens_k=kwargs.get("cu_seqlens_k"),
+            seqused_k=kwargs.get("seqused_k"),
+            max_seqlen_q=kwargs.get("max_seqlen_q"),
+            max_seqlen_k=kwargs.get("max_seqlen_k"),
+            page_table=kwargs.get("page_table"),
+            softmax_scale=(
+                _ATREX_AKA_SCALE
+                if kwargs.get("softmax_scale") is None
+                else kwargs["softmax_scale"]
+            ),
+            causal=kwargs.get("causal"),
+            softcap=kwargs.get("softcap"),
+            window_size_left=kwargs.get("window_size_left"),
+            window_size_right=kwargs.get("window_size_right"),
+            learnable_sink=kwargs.get("learnable_sink"),
+            out=kwargs.get("out"),
+            return_lse=kwargs.get("return_lse"),
+            q_descale=kwargs.get("q_descale"),
+            k_descale=kwargs.get("k_descale"),
+            v_descale=kwargs.get("v_descale"),
+            num_splits=kwargs.get("num_splits"),
+        )
     raise NotImplementedError(
         "No ATREX SM103 FlashAttention implementation supports this call; "
         "the current external build contains only the AKA BF16 q4 fast path"

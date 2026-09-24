@@ -8,13 +8,12 @@ from threading import Lock
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.typing import BFloat16, Float32, Int32
+from cutlass.cute.typing import Float32, Int32
 
 from .aka_decode_cutedsl import (
     CausalMask,
     GroupedQueryAttentionDecode,
     GroupedQueryAttentionDecodePaged,
-    warp_threads,
 )
 
 

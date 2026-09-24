@@ -95,13 +95,12 @@ def _make_case(seq_lens, *, seed=42):
         "v": value,
         "cu_seqlens_q": cu_seqlens_q,
         "seqused_k": seqused_k,
-        "block_table": page_table,
+        "page_table": page_table,
         "out": out,
         "max_seqlen_q": 4,
-        "max_seqlen_k": max(seq_lens),
+        "max_seqlen_k": page_table.shape[1] * page_size,
         "softmax_scale": 256**-0.5,
         "causal": True,
-        "fa_version": 4,
     }
 
 
@@ -112,10 +111,11 @@ def _launch_kwargs(case):
         "v": case["v"],
         "cu_seqlens_q": case["cu_seqlens_q"],
         "cu_seqlens_k": None,
+        "qv": None,
         "seqused_k": case["seqused_k"],
         "max_seqlen_q": case["max_seqlen_q"],
         "max_seqlen_k": case["max_seqlen_k"],
-        "page_table": case["block_table"],
+        "page_table": case["page_table"],
         "softmax_scale": case["softmax_scale"],
         "causal": case["causal"],
         "softcap": 0.0,
@@ -131,11 +131,17 @@ def _launch_kwargs(case):
     }
 
 
+def _runtime_kwargs(case):
+    kwargs = _launch_kwargs(case)
+    kwargs.pop("qv")
+    return kwargs
+
+
 def _reference(case):
     q = case["q"]
     key_cache = case["k"]
     value_cache = case["v"]
-    page_table = case["block_table"]
+    page_table = case["page_table"]
     seq_lens = case["seqused_k"].tolist()
     output = torch.empty_like(q)
     for request, kv_length in enumerate(seq_lens):
@@ -159,27 +165,36 @@ def _reference(case):
 def _call(case):
     import atrex
 
-    return atrex.flash_attn_varlen_func(**case)
+    output, lse = atrex.flash_attn_varlen_func(**_launch_kwargs(case))
+    assert lse is None
+    return output
 
 
-def test_public_signature_matches_unified_mudi_boundary():
+def test_public_signature_matches_vllm_fa4_lowering():
     import atrex
     from atrex.api.flash_attn import flash_attn_varlen_func
 
     expected = (
-        "q", "k", "v", "max_seqlen_q", "cu_seqlens_q", "max_seqlen_k",
-        "cu_seqlens_k", "seqused_k", "q_v", "dropout_p", "softmax_scale",
-        "causal", "window_size", "softcap", "alibi_slopes", "deterministic",
-        "return_attn_probs", "block_table", "return_softmax_lse", "out",
-        "scheduler_metadata", "q_descale", "k_descale", "v_descale",
-        "num_splits", "output_scale", "fa_version", "s_aux", "cp_world_size",
-        "cp_rank", "cp_tot_seqused_k", "mask_mod", "aux_tensors",
-        "dynamic_causal", "qv", "logits_soft_cap", "num_prefill",
-        "max_seqlen_k_decode", "max_seqlen_k_prefill",
+        "q", "k", "v", "qv", "cu_seqlens_q", "cu_seqlens_k",
+        "seqused_q", "seqused_k", "max_seqlen_q", "max_seqlen_k",
+        "min_seqlen_k", "page_table", "softmax_scale", "causal", "softcap",
+        "window_size_left", "window_size_right", "learnable_sink", "tile_mn",
+        "mma_pv_is_rs", "intra_wg_overlap", "num_threads", "num_splits",
+        "pack_gqa", "_arch", "score_mod", "mask_mod", "block_sparse_tensors",
+        "return_lse", "out", "lse", "aux_tensors", "aux_scalars",
+        "q_descale", "k_descale", "v_descale", "gather_kv_indices",
+        "output_scale",
     )
     assert tuple(inspect.signature(flash_attn_varlen_func).parameters) == expected
     assert callable(atrex.flash_attn_varlen_func)
     assert callable(atrex.can_use_flash_attn_varlen_func)
+
+    case = _make_case([127 + index for index in range(16)])
+    caller_kwargs = _launch_kwargs(case)
+    q = caller_kwargs.pop("q")
+    k = caller_kwargs.pop("k")
+    v = caller_kwargs.pop("v")
+    inspect.signature(flash_attn_varlen_func).bind(q, k, v, **caller_kwargs)
 
 
 def test_import_atrex_is_lazy():
@@ -208,19 +223,20 @@ def test_aka_q4_eligibility_is_strict():
     import atrex
 
     case = _make_case([127 + index for index in range(16)])
-    assert atrex.can_use_flash_attn_varlen_func(**case)
+    launch_kwargs = _launch_kwargs(case)
+    assert atrex.can_use_flash_attn_varlen_func(**launch_kwargs)
 
     rejected = (
         {"max_seqlen_q": 1},
         {"causal": False},
         {"softmax_scale": 0.1},
         {"num_splits": 1},
-        {"return_softmax_lse": True},
+        {"return_lse": True},
         {"q_descale": torch.ones(1, device="cuda")},
-        {"fa_version": 3},
+        {"learnable_sink": torch.ones(16, device="cuda")},
     )
     for override in rejected:
-        kwargs = dict(case)
+        kwargs = dict(launch_kwargs)
         kwargs.update(override)
         assert not atrex.can_use_flash_attn_varlen_func(**kwargs)
 
@@ -231,7 +247,7 @@ def test_aka_q4_eligibility_is_strict():
         17, device="cuda", dtype=torch.int32
     )
     q1["max_seqlen_q"] = 1
-    assert not atrex.can_use_flash_attn_varlen_func(**q1)
+    assert not atrex.can_use_flash_attn_varlen_func(**_launch_kwargs(q1))
     with pytest.raises(NotImplementedError, match="AKA BF16 q4"):
         _call(q1)
 
@@ -253,7 +269,7 @@ def test_poisoned_call_local_workspace():
     expected = _reference(case)
     device_index = case["q"].device.index or 0
     _, workspace_splits = runtime._atrex_aka_split_config(
-        16, case["block_table"].shape[1], device_index
+        16, case["page_table"].shape[1], device_index
     )
     workspace = torch.full(
         (runtime._atrex_aka_workspace_elements(workspace_splits, 16),),
@@ -262,7 +278,7 @@ def test_poisoned_call_local_workspace():
         device="cuda",
     )
     result, lse = runtime.atrex_aka_fa4_decode(
-        **_launch_kwargs(case), _workspace=workspace
+        **_runtime_kwargs(case), _workspace=workspace
     )
     torch.cuda.synchronize()
     assert result is case["out"]

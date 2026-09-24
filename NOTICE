@@ -17,6 +17,11 @@ SPDX-License-Identifier: BSD-3-Clause
 Source: https://github.com/flashinfer-ai/flashinfer at commit
 5b1af972466a927e825e589e18263f20a5462349
 
-The NVIDIA SM103 AKA FA4 decode implementation incorporates FlashInfer-derived
-source adapted from revision f52eed27627561b2df2a6626071860ff32677675.
-The source file retains its original copyright and license notice.
+The NVIDIA SM103 AKA FA4 decode implementation is adapted from these files at
+that public revision:
+
+- flashinfer/cute_dsl/attention/fusion/mask.py
+- flashinfer/cute_dsl/attention/gqa_decode.py
+- flashinfer/cute_dsl/attention/gqa_decode_paged.py
+
+The adapted source retains the original copyright and license notice.
