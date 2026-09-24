@@ -34,7 +34,8 @@ existing public API. Its adapter performs the caller-requested Q/K L2
 normalization and supplies a zero initial state for first-chunk prefill without
 changing the AKA kernel ABI. Strict eligibility checks guard the verified
 shape and metadata domain. Its private launch interface and profiler-visible
-kernels start with `atrex_aka_`.
+kernels start with `atrex_aka_`. This SM103 prefill path does not support CUDA
+Graph capture and rejects it before metadata synchronization or kernel launch.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the

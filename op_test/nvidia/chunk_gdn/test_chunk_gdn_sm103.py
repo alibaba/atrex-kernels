@@ -374,6 +374,46 @@ def test_chunk_gdn_sm103_matches_real_vllm_caller_without_pre_normalization():
     torch.testing.assert_close(final_state, expected_state, atol=5e-3, rtol=1e-3)
 
 
+def test_chunk_gdn_sm103_rejects_cuda_graph_capture_before_dispatch():
+    _requires_sm103()
+    import atrex
+
+    q, k, v, g, beta, _, cu, cu_cpu = _make_inputs((64,))
+    ctx = _build_context()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        can_use_during_capture = atrex.can_use_chunk_gdn_fwd_cutedsl(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=_SCALE,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+            allow_padding=True,
+        )
+    assert not can_use_during_capture
+
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="does not support CUDA Graph capture"):
+        with torch.cuda.graph(graph):
+            atrex.chunk_gdn_fwd_cutedsl(
+                ctx,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=_SCALE,
+                output_final_state=True,
+                cu_seqlens=cu,
+                cu_seqlens_cpu=cu_cpu,
+            )
+
+
 def test_chunk_gdn_sm103_prewarm_public_api():
     _requires_sm103()
     import atrex

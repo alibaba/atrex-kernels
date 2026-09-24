@@ -165,11 +165,13 @@ def fused_qk_l2_normalize_bf16(
             "q and k must have identical [..., 128] shapes, got "
             f"q={tuple(q.shape)}, k={tuple(k.shape)}"
         )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "SM103 AKA M64 Chunk-GDN does not support CUDA Graph capture"
+        )
 
     q_contig = q.contiguous()
     k_contig = k.contiguous()
-    q_out_supplied = q_out is not None
-    k_out_supplied = k_out is not None
     if q_out is None:
         q_out = torch.empty_like(q_contig)
     if k_out is None:
@@ -185,34 +187,6 @@ def fused_qk_l2_normalize_bf16(
                 f"{name} must be contiguous bf16 on {q.device} with shape "
                 f"{tuple(q.shape)}"
             )
-
-    # The current CuTeDSL runtime launch is not recorded by torch CUDA Graph
-    # capture. Preserve exact semantics with the original eager formula while
-    # capturing; ordinary execution still uses the fused kernel below.
-    if torch.cuda.is_current_stream_capturing():
-        q_fp32 = q_contig.float()
-        k_fp32 = k_contig.float()
-        q_normalized = (
-            q_fp32
-            * torch.rsqrt(
-                (q_fp32 * q_fp32).sum(dim=-1, keepdim=True) + 1e-6
-            )
-        ).to(q.dtype)
-        k_normalized = (
-            k_fp32
-            * torch.rsqrt(
-                (k_fp32 * k_fp32).sum(dim=-1, keepdim=True) + 1e-6
-            )
-        ).to(k.dtype)
-        if q_out_supplied:
-            q_out.copy_(q_normalized)
-        else:
-            q_out = q_normalized
-        if k_out_supplied:
-            k_out.copy_(k_normalized)
-        else:
-            k_out = k_normalized
-        return q_out, k_out
 
     q_2d = q_contig.view(-1, K_DIM)
     k_2d = k_contig.view(-1, K_DIM)

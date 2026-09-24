@@ -429,6 +429,8 @@ def can_use_chunk_gdn_fwd_cutedsl(
         if implementation is None:
             return False
         if target.family == "nvidia" and target.arch == "sm103":
+            if torch.cuda.is_current_stream_capturing():
+                return False
             if not use_qk_l2norm_in_kernel:
                 return False
             total_t = int(q.shape[1])
@@ -646,6 +648,14 @@ def chunk_gdn_fwd_cutedsl(
         ``(o, final_state)``. ``o`` is [B, T, HV, V] bf16. ``final_state`` is
         [B, HV, V, K] fp32 when requested, otherwise ``None``.
     """
+    if (
+        ctx.get("target_arch") == "sm103"
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "SM103 AKA M64 Chunk-GDN does not support CUDA Graph capture"
+        )
+
     requested_scale = scale
     if requested_scale is None:
         requested_scale = ctx["scale"] if ctx.get("scale") is not None else 1.0 / math.sqrt(ctx["K"])
