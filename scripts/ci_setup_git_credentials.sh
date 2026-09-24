@@ -20,6 +20,9 @@ umask 077
 chmod 600 "$HOME/.git-credentials"
 
 git config --global --unset-all url."https://code.alibaba-inc.com/".insteadOf 2>/dev/null || true
-for pattern in +        "git@code.alibaba-inc.com:" +        "git@gitlab.alibaba-inc.com:" +        "https://gitlab.alibaba-inc.com/"; do
+for pattern in \
+        "git@code.alibaba-inc.com:" \
+        "git@gitlab.alibaba-inc.com:" \
+        "https://gitlab.alibaba-inc.com/"; do
     git config --global --add url."https://code.alibaba-inc.com/".insteadOf "$pattern"
 done
