@@ -63,12 +63,22 @@ prepare_nvfp4_fused_moe_weights = _lazy_import_and_call(
     "prepare_nvfp4_fused_moe_weights",
     "atrex.api.nvfp4_fused_moe",
 )
+can_use_flash_attn_varlen_func = _lazy_import_and_call(
+    "can_use_flash_attn_varlen_func",
+    "atrex.api.flash_attn",
+)
+flash_attn_varlen_func = _lazy_import_and_call(
+    "flash_attn_varlen_func",
+    "atrex.api.flash_attn",
+)
 
 __all__ = (
+    "can_use_flash_attn_varlen_func",
     "can_use_chunk_gdn_fwd_cutedsl",
     "chunk_gdn_fwd_cutedsl",
     "chunk_gdn_fwd_cutedsl_build",
     "chunk_gdn_fwd_cutedsl_prewarm_buckets",
+    "flash_attn_varlen_func",
     "nvfp4_fused_moe",
     "prepare_nvfp4_fused_moe_weights",
 )
