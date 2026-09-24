@@ -223,7 +223,12 @@ def _is_supported_sm103_fast_path(
             return False
         cu_values = [0, total_t]
     else:
-        cu_values = _packed_cu_values(cu_seqlens, cu_seqlens_cpu, total_t)
+        cu_values = _packed_cu_values(
+            cu_seqlens,
+            cu_seqlens_cpu,
+            total_t,
+            require_matching_cpu=True,
+        )
     num_seqs = len(cu_values) - 1
     if num_seqs < 1 or num_seqs > SM103_MAX_SEQS:
         return False
@@ -275,6 +280,8 @@ def _packed_cu_values(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: Optional[torch.Tensor],
     total_t: int,
+    *,
+    require_matching_cpu: bool = False,
 ) -> list[int]:
     if (
         cu_seqlens.ndim != 1
@@ -285,15 +292,25 @@ def _packed_cu_values(
         raise ValueError(
             "cu_seqlens must be a contiguous 1D CUDA int32/int64 tensor"
         )
+    if require_matching_cpu and cu_seqlens_cpu is None:
+        raise ValueError(
+            "SM103 AKA M64 requires cu_seqlens_cpu when cu_seqlens is supplied"
+        )
     if cu_seqlens_cpu is not None:
         if (
             cu_seqlens_cpu.ndim != 1
             or cu_seqlens_cpu.device.type != "cpu"
             or cu_seqlens_cpu.dtype not in (torch.int32, torch.int64)
+            or not cu_seqlens_cpu.is_contiguous()
         ):
             raise ValueError(
-                "cu_seqlens_cpu must be a 1D CPU int32/int64 tensor"
+                "cu_seqlens_cpu must be a contiguous 1D CPU int32/int64 tensor"
             )
+        if require_matching_cpu:
+            if cu_seqlens_cpu.dtype != cu_seqlens.dtype:
+                raise ValueError("cu_seqlens_cpu dtype must match cu_seqlens")
+            if not torch.equal(cu_seqlens.detach().cpu(), cu_seqlens_cpu):
+                raise ValueError("cu_seqlens_cpu must match cu_seqlens exactly")
         values = [int(x) for x in cu_seqlens_cpu.tolist()]
     elif int(cu_seqlens.numel()) == 2:
         # Single sequence: by contract cu_seqlens == [0, total_t]. Synthesize it
@@ -571,8 +588,12 @@ def _dispatch_chunk_gdn_prefill(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch single- and multi-sequence prefill to the selected kernel."""
     if cu_seqlens is None:
+        cu_seqlens_cpu = torch.tensor(
+            [0, int(q.shape[1])], dtype=torch.int32
+        )
         cu_seqlens = torch.tensor(
-            [0, int(q.shape[1])], device=q.device, dtype=torch.int32)
+            [0, int(q.shape[1])], device=q.device, dtype=torch.int32
+        )
     return _chunk_gdn_fwd_cutedsl_cu_seqlens(
         ctx, q, k, v, g, beta,
         scale=scale,
@@ -843,7 +864,14 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
         raise ValueError(
             "ATREX cu_seqlens GDN prefill expects packed B=1 tensors, "
             f"got B={q.shape[0]}")
-    cu_values = _packed_cu_values(cu_seqlens, cu_seqlens_cpu, int(q.shape[1]))
+    cu_values = _packed_cu_values(
+        cu_seqlens,
+        cu_seqlens_cpu,
+        int(q.shape[1]),
+        require_matching_cpu=(
+            target.family == "nvidia" and target.arch == "sm103"
+        ),
+    )
     if target.family == "nvidia" and target.arch == "sm103":
         if not _is_supported_sm103_fast_path(
             q,

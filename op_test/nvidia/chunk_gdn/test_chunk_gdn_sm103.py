@@ -239,6 +239,55 @@ def test_chunk_gdn_sm103_accepts_int64_cu_seqlens():
     assert final_state.shape == (2, 32, 128, 128)
 
 
+def test_chunk_gdn_sm103_requires_matching_cpu_cu_seqlens():
+    _requires_sm103()
+    import atrex
+
+    q, k, v, g, beta, initial_state, cu, cu_cpu = _make_inputs((64,))
+    common = {
+        "scale": _SCALE,
+        "initial_state": initial_state,
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": False,
+    }
+    assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
+        q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=None, **common
+    )
+
+    bad_cu = cu.clone()
+    bad_cu[-1] -= 1
+    assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
+        q, k, v, g, beta,
+        cu_seqlens=bad_cu,
+        cu_seqlens_cpu=cu_cpu,
+        **common,
+    )
+
+    bad_cpu = cu_cpu.clone()
+    bad_cpu[-1] -= 1
+    assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
+        q, k, v, g, beta,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=bad_cpu,
+        **common,
+    )
+    with pytest.raises(ValueError, match="must match cu_seqlens exactly"):
+        atrex.chunk_gdn_fwd_cutedsl(
+            _build_context(),
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=_SCALE,
+            output_final_state=True,
+            cu_seqlens=bad_cu,
+            cu_seqlens_cpu=cu_cpu,
+            qk_l2norm_already_applied=True,
+            initial_state=initial_state,
+        )
+
+
 def test_chunk_gdn_sm103_rejects_unverified_options():
     _requires_sm103()
     import atrex
