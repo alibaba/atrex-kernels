@@ -161,9 +161,7 @@ def _is_supported_sm103_fast_path(
     beta: torch.Tensor,
     scale: Optional[float],
     initial_state: Optional[torch.Tensor],
-    cu_seqlens: Optional[torch.Tensor],
-    cu_seqlens_cpu: Optional[torch.Tensor],
-    use_qk_l2norm_in_kernel: bool,
+    cu_values: list[int],
     cp_context,
     transpose_state_layout: bool,
     state_checkpoints: Optional[torch.Tensor],
@@ -206,7 +204,7 @@ def _is_supported_sm103_fast_path(
         or beta.shape != g.shape
     ):
         return False
-    if use_qk_l2norm_in_kernel or cp_context is not None or transpose_state_layout:
+    if cp_context is not None or transpose_state_layout:
         return False
     if (
         checkpoint_every_n_tokens != 0
@@ -218,24 +216,12 @@ def _is_supported_sm103_fast_path(
     if not math.isclose(requested_scale, SM103_SCALE, rel_tol=0.0, abs_tol=1e-12):
         return False
 
-    if cu_seqlens is None:
-        if cu_seqlens_cpu is not None:
-            return False
-        cu_values = [0, total_t]
-    else:
-        cu_values = _packed_cu_values(
-            cu_seqlens,
-            cu_seqlens_cpu,
-            total_t,
-            require_matching_cpu=True,
-        )
     num_seqs = len(cu_values) - 1
     if num_seqs < 1 or num_seqs > SM103_MAX_SEQS:
         return False
     expected_state = (num_seqs, SM103_HV, V_DIM, K_DIM)
-    return (
-        initial_state is not None
-        and initial_state.device == q.device
+    return initial_state is None or (
+        initial_state.device == q.device
         and initial_state.dtype == torch.float32
         and tuple(initial_state.shape) == expected_state
         and initial_state.is_contiguous()
@@ -443,6 +429,18 @@ def can_use_chunk_gdn_fwd_cutedsl(
         if implementation is None:
             return False
         if target.family == "nvidia" and target.arch == "sm103":
+            if not use_qk_l2norm_in_kernel:
+                return False
+            total_t = int(q.shape[1])
+            if cu_seqlens is None:
+                cu_values = [0, total_t]
+            else:
+                cu_values = _packed_cu_values(
+                    cu_seqlens,
+                    cu_seqlens_cpu,
+                    total_t,
+                    require_matching_cpu=True,
+                )
             return _is_supported_sm103_fast_path(
                 q,
                 k,
@@ -451,9 +449,7 @@ def can_use_chunk_gdn_fwd_cutedsl(
                 beta,
                 scale,
                 initial_state,
-                cu_seqlens,
-                cu_seqlens_cpu,
-                use_qk_l2norm_in_kernel,
+                cu_values,
                 cp_context,
                 transpose_state_layout,
                 state_checkpoints,
@@ -728,14 +724,13 @@ def chunk_gdn_fwd_cutedsl_prewarm_buckets(
             "T": None, "scale": None, "output_final_state": None,
             "static_initialized": False, "target_arch": "sm103",
         }
+        implementation.prewarm_fused_qk_l2_normalize_bf16(device=dev_idx)
         for lengths in ((128,), (97,), (65, 63)):
             seqlen = sum(lengths)
             q = torch.randn(
                 (1, seqlen, SM103_H, K_DIM), device=dev, dtype=torch.bfloat16
             )
             k = torch.randn_like(q)
-            q = torch.nn.functional.normalize(q.float(), dim=-1).to(torch.bfloat16)
-            k = torch.nn.functional.normalize(k.float(), dim=-1).to(torch.bfloat16)
             v = torch.randn(
                 (1, seqlen, SM103_HV, V_DIM),
                 device=dev,
@@ -768,7 +763,7 @@ def chunk_gdn_fwd_cutedsl_prewarm_buckets(
                 output_final_state=True,
                 cu_seqlens=cu,
                 cu_seqlens_cpu=cu_cpu,
-                qk_l2norm_already_applied=True,
+                qk_l2norm_already_applied=False,
                 initial_state=init,
             )
         torch.cuda.synchronize()
@@ -881,9 +876,7 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
             beta,
             scale,
             initial_state,
-            cu_seqlens,
-            cu_seqlens_cpu,
-            not qk_l2norm_already_applied,
+            cu_values,
             None,
             False,
             state_checkpoints,
@@ -891,12 +884,14 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
             checkpoint_every_n_tokens,
         ):
             raise ValueError(
-                "call is outside the verified SM103 AKA M64 contract; Q/K "
-                "must already be L2-normalized and all SM103 eligibility "
-                "requirements must hold"
+                "call is outside the verified SM103 AKA M64 contract"
             )
         q_flat = q.squeeze(0)
         k_flat = k.squeeze(0)
+        if not qk_l2norm_already_applied:
+            q_flat, k_flat = implementation.fused_qk_l2_normalize_bf16(
+                q_flat, k_flat
+            )
         v_flat = v.squeeze(0)
         gate = g.squeeze(0)
         if not gate_is_exp:
@@ -919,6 +914,9 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
             dtype=torch.float32,
             device=q.device,
         )
+        initial_state_arg = initial_state
+        if initial_state_arg is None:
+            initial_state_arg = torch.zeros_like(final_state)
         implementation.atrex_aka_chunk_gated_delta_rule_sm103_m64(
             q_flat,
             k_flat,
@@ -927,7 +925,7 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
             beta_flat,
             output,
             cu_seqlens_i32,
-            initial_state,
+            initial_state_arg,
             final_state,
             float(scale),
         )

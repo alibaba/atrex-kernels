@@ -29,11 +29,12 @@ op_test/nvidia/chunk_gdn/test_chunk_gdn_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
 ```
 
-The SM103 Chunk-GDN path integrates the AKA M64 implementation for prepared,
-L2-normalized Q/K inputs. It keeps the existing public Chunk-GDN API and uses
-strict eligibility checks rather than changing either the public API or the
-kernel contract. Its private launch interface and profiler-visible kernel name
-start with `atrex_aka_`.
+The SM103 Chunk-GDN path integrates the AKA M64 implementation behind the
+existing public API. Its adapter performs the caller-requested Q/K L2
+normalization and supplies a zero initial state for first-chunk prefill without
+changing the AKA kernel ABI. Strict eligibility checks guard the verified
+shape and metadata domain. Its private launch interface and profiler-visible
+kernels start with `atrex_aka_`.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the

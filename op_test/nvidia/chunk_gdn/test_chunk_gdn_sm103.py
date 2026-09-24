@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -46,10 +47,10 @@ def _make_inputs(
 ):
     torch.manual_seed(seed)
     total_t = sum(lengths)
-    q = torch.randn((total_t, 4, 128), device="cuda", dtype=torch.float32)
+    q = torch.randn((total_t, 4, 128), device="cuda", dtype=torch.bfloat16)
     k = torch.randn_like(q)
-    q = F.normalize(q, dim=-1).to(torch.bfloat16).contiguous().unsqueeze(0)
-    k = F.normalize(k, dim=-1).to(torch.bfloat16).contiguous().unsqueeze(0)
+    q = q.contiguous().unsqueeze(0)
+    k = k.contiguous().unsqueeze(0)
     v = torch.randn(
         (1, total_t, 32, 128), device="cuda", dtype=torch.bfloat16
     )
@@ -78,8 +79,16 @@ def _reference(
     initial_state: torch.Tensor,
     cu_cpu: torch.Tensor,
 ):
-    q_flat = q.squeeze(0).float().repeat_interleave(8, dim=1)
-    k_flat = k.squeeze(0).float().repeat_interleave(8, dim=1)
+    q_flat = q.squeeze(0).float()
+    k_flat = k.squeeze(0).float()
+    q_flat = (
+        q_flat
+        * torch.rsqrt((q_flat * q_flat).sum(dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16).float().repeat_interleave(8, dim=1)
+    k_flat = (
+        k_flat
+        * torch.rsqrt((k_flat * k_flat).sum(dim=-1, keepdim=True) + 1e-6)
+    ).to(torch.bfloat16).float().repeat_interleave(8, dim=1)
     v_flat = v.squeeze(0).float()
     alpha = torch.exp(g.squeeze(0).float())
     beta_flat = beta.squeeze(0).float()
@@ -129,11 +138,11 @@ def _atrex_call(lengths: tuple[int, ...], *, seed=42, continuation=False):
         g,
         beta,
         scale=_SCALE,
-        initial_state=initial_state,
         output_final_state=True,
         cu_seqlens=cu,
         cu_seqlens_cpu=cu_cpu,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
+        allow_padding=True,
     )
     output, final_state = atrex.chunk_gdn_fwd_cutedsl(
         _build_context(),
@@ -146,25 +155,21 @@ def _atrex_call(lengths: tuple[int, ...], *, seed=42, continuation=False):
         output_final_state=True,
         cu_seqlens=cu,
         cu_seqlens_cpu=cu_cpu,
-        qk_l2norm_already_applied=True,
-        initial_state=initial_state,
+        initial_state=initial_state if continuation else None,
     )
     return inputs, output, final_state
 
 
-def _bench_ms(fn, *, warmup: int = 5, repetitions: int = 20) -> float:
+def _bench_wall_ms(fn, *, warmup: int = 5, repetitions: int = 20) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     samples = []
     for _ in range(repetitions):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        start_ns = time.perf_counter_ns()
         fn()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end))
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter_ns() - start_ns) / 1e6)
     samples.sort()
     return samples[len(samples) // 2]
 
@@ -215,11 +220,11 @@ def test_chunk_gdn_sm103_accepts_int64_cu_seqlens():
         g,
         beta,
         scale=_SCALE,
-        initial_state=initial_state,
         output_final_state=True,
         cu_seqlens=cu,
         cu_seqlens_cpu=cu_cpu,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
+        allow_padding=True,
     )
     output, final_state = atrex.chunk_gdn_fwd_cutedsl(
         _build_context(),
@@ -232,7 +237,6 @@ def test_chunk_gdn_sm103_accepts_int64_cu_seqlens():
         output_final_state=True,
         cu_seqlens=cu,
         cu_seqlens_cpu=cu_cpu,
-        qk_l2norm_already_applied=True,
         initial_state=initial_state,
     )
     assert output.shape == (1, 64, 32, 128)
@@ -248,7 +252,7 @@ def test_chunk_gdn_sm103_requires_matching_cpu_cu_seqlens():
         "scale": _SCALE,
         "initial_state": initial_state,
         "output_final_state": True,
-        "use_qk_l2norm_in_kernel": False,
+        "use_qk_l2norm_in_kernel": True,
     }
     assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=None, **common
@@ -283,7 +287,6 @@ def test_chunk_gdn_sm103_requires_matching_cpu_cu_seqlens():
             output_final_state=True,
             cu_seqlens=bad_cu,
             cu_seqlens_cpu=cu_cpu,
-            qk_l2norm_already_applied=True,
             initial_state=initial_state,
         )
 
@@ -301,53 +304,74 @@ def test_chunk_gdn_sm103_rejects_unverified_options():
         "cu_seqlens_cpu": cu_cpu,
     }
     assert atrex.can_use_chunk_gdn_fwd_cutedsl(
-        q, k, v, g, beta, use_qk_l2norm_in_kernel=False, **common
-    )
-    assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g, beta, use_qk_l2norm_in_kernel=True, **common
     )
     assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
+        q, k, v, g, beta, use_qk_l2norm_in_kernel=False, **common
+    )
+    assert atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g, beta, initial_state=None,
         scale=_SCALE, cu_seqlens=cu, cu_seqlens_cpu=cu_cpu,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
     )
     assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g.to(torch.bfloat16), beta,
-        use_qk_l2norm_in_kernel=False, **common
+        use_qk_l2norm_in_kernel=True, **common
     )
     assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g, beta, scale=1.0,
         initial_state=initial_state, cu_seqlens=cu, cu_seqlens_cpu=cu_cpu,
-        use_qk_l2norm_in_kernel=False,
+        use_qk_l2norm_in_kernel=True,
     )
     assert not atrex.can_use_chunk_gdn_fwd_cutedsl(
         q, k, v, g, beta, state_checkpoints=torch.empty_like(initial_state),
         checkpoint_cu_starts=torch.tensor([0, 1], device="cuda", dtype=torch.int64),
         checkpoint_every_n_tokens=64,
-        use_qk_l2norm_in_kernel=False, **common
+        use_qk_l2norm_in_kernel=True, **common
     )
 
 
-def test_chunk_gdn_sm103_forward_rejects_unnormalized_contract():
+def test_chunk_gdn_sm103_matches_real_vllm_caller_without_pre_normalization():
     _requires_sm103()
     import atrex
 
     q, k, v, g, beta, initial_state, cu, cu_cpu = _make_inputs((64,))
-    with pytest.raises(ValueError, match="already be L2-normalized"):
-        atrex.chunk_gdn_fwd_cutedsl(
-            _build_context(),
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale=_SCALE,
-            output_final_state=True,
-            cu_seqlens=cu,
-            cu_seqlens_cpu=cu_cpu,
-            qk_l2norm_already_applied=False,
-            initial_state=initial_state,
-        )
+    assert not torch.allclose(
+        torch.linalg.vector_norm(q.float(), dim=-1),
+        torch.ones(q.shape[:-1], device=q.device),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert atrex.can_use_chunk_gdn_fwd_cutedsl(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=_SCALE,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu_cpu,
+        allow_padding=True,
+    )
+    output, final_state = atrex.chunk_gdn_fwd_cutedsl(
+        _build_context(),
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=_SCALE,
+        output_final_state=True,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu_cpu,
+    )
+    expected_output, expected_state = _reference(
+        q, k, v, g, beta, initial_state, cu_cpu
+    )
+    torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(final_state, expected_state, atol=5e-3, rtol=1e-3)
 
 
 def test_chunk_gdn_sm103_prewarm_public_api():
@@ -379,6 +403,19 @@ def test_chunk_gdn_sm103_balanced_b3_performance_upper_bound():
     ctx = _build_context()
 
     def call():
+        assert atrex.can_use_chunk_gdn_fwd_cutedsl(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=_SCALE,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+            allow_padding=True,
+        )
         return atrex.chunk_gdn_fwd_cutedsl(
             ctx,
             q,
@@ -390,13 +427,12 @@ def test_chunk_gdn_sm103_balanced_b3_performance_upper_bound():
             output_final_state=True,
             cu_seqlens=cu,
             cu_seqlens_cpu=cu_cpu,
-            qk_l2norm_already_applied=True,
             initial_state=initial_state,
         )
 
-    latency_ms = _bench_ms(call)
+    latency_ms = _bench_wall_ms(call)
     print(
-        f"SM103 AKA M64 balanced B=3 latency={latency_ms:.4f}ms "
+        f"SM103 AKA M64 balanced B=3 caller wall latency={latency_ms:.4f}ms "
         f"(limit={_MAX_BALANCED_B3_MS:.2f}ms)"
     )
     assert latency_ms <= _MAX_BALANCED_B3_MS
@@ -462,6 +498,8 @@ def test_chunk_gdn_sm103_profiler_kernel_names_have_atrex_aka_prefix():
     aka_names = [name for name in names if "atrex_aka" in name]
     assert aka_names, f"no ATREX AKA kernel observed; CUDA events: {names}"
     assert all(name.startswith("atrex_aka_") for name in aka_names), aka_names
+    assert any("l2norm" in name.lower() for name in aka_names), aka_names
+    assert any("GatedDeltaNetChunkedKernel" in name for name in aka_names), aka_names
     print({"atrex_aka_kernel_names": aka_names})
 
 
@@ -486,6 +524,19 @@ if __name__ == "__main__":
     def benchmark_call():
         import atrex
 
+        assert atrex.can_use_chunk_gdn_fwd_cutedsl(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=_SCALE,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+            allow_padding=True,
+        )
         return atrex.chunk_gdn_fwd_cutedsl(
             ctx,
             q,
@@ -497,10 +548,9 @@ if __name__ == "__main__":
             output_final_state=True,
             cu_seqlens=cu,
             cu_seqlens_cpu=cu_cpu,
-            qk_l2norm_already_applied=True,
             initial_state=initial_state,
         )
 
-    print({"lengths": lengths, "atrex_ms": _bench_ms(
+    print({"lengths": lengths, "atrex_caller_wall_ms": _bench_wall_ms(
         benchmark_call, warmup=args.warmup, repetitions=args.rep
     )})
