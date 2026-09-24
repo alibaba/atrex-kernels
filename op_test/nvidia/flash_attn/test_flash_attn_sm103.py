@@ -318,7 +318,7 @@ def test_call_local_workspace_does_not_remain_allocated():
     from atrex.src.nvidia.flash_attn.sm103 import aka_decode_runtime as runtime
 
     cases = [
-        _make_case([97 + index] * batch, seed=100 + batch)
+        _make_case([97 + batch] * batch, seed=100 + batch)
         for batch in range(16, 29)
     ]
     device_index = torch.cuda.current_device()

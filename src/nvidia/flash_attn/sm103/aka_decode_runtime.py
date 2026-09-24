@@ -12,6 +12,7 @@ from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from .aka_decode_cutedsl import (
     CausalMask,
+    GroupedQueryAttentionDecode,
     GroupedQueryAttentionDecodePaged,
     warp_threads,
 )
@@ -128,7 +129,7 @@ def _atrex_aka_compile_decode(
         single_warp_batch=True,
     )
     kernel.decode.set_name_prefix("atrex_aka")
-    kernel.reduction_kernel.set_name_prefix("atrex_aka")
+    GroupedQueryAttentionDecode.reduction_kernel.set_name_prefix("atrex_aka")
 
     sym_splits = cute.sym_int()
     sym_batch = cute.sym_int()
