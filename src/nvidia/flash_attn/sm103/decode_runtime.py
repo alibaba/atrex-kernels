@@ -730,10 +730,10 @@ def _fa4_decode_varlen(
         )
     if q.device.type != "cuda" or k.device != q.device or v.device != q.device:
         raise ValueError("Q/K/V must share one CUDA device")
-    if torch.cuda.get_device_capability(q.device) not in ((10, 0), (10, 3)):
-        raise NotImplementedError("Atrex short-Q decode requires SM100 or SM103")
-    if _arch is not None and _arch not in (100, 103):
-        raise NotImplementedError("Atrex short-Q decode requires SM100 or SM103")
+    if torch.cuda.get_device_capability(q.device) != (10, 3):
+        raise NotImplementedError("Atrex short-Q decode requires SM103")
+    if _arch is not None and _arch != 103:
+        raise NotImplementedError("Atrex short-Q decode requires SM103")
     if not q.is_contiguous():
         raise NotImplementedError("Atrex short-Q decode requires contiguous packed Q")
     if k.stride(-1) != 1 or v.stride(-1) != 1:

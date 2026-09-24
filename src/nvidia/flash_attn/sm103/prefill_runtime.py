@@ -332,7 +332,7 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch(v.device.index) if _arch is None else _arch
-    assert arch in (100, 103), "Atrex FA4 prefill only supports SM100 and SM103"
+    assert arch == 103, "Atrex FA4 prefill only supports SM103"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     if softmax_scale is None:
         softmax_scale = (
@@ -354,7 +354,7 @@ def _flash_attn_fwd(
         and head_dim_v == 256
         and v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
     ), (
-        "Atrex FA4 prefill only supports BF16 or FP8 HD256 on SM100/SM103 with the 2CTA kernel"
+        "Atrex FA4 prefill only supports BF16 or FP8 HD256 on SM103 with the 2CTA kernel"
     )
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
     device = v.device

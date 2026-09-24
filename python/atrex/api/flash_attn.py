@@ -63,7 +63,14 @@ def _validate_nvidia_call(call, torch, target_key, batch_size, window):
             or sink.device != q.device
         ):
             raise ValueError("s_aux must be BF16 [num_q_heads] on the Q device")
-    _validate_out(call, torch)
+    _validate_out(
+        call,
+        torch,
+        require_contiguous=(
+            target_key == ("nvidia", "sm103")
+            and 1 <= call["max_seqlen_q"] <= 5
+        ),
+    )
     _validate_descales(call, torch, batch_size, k.shape[-2])
 
     if target_key == ("nvidia", "sm103"):

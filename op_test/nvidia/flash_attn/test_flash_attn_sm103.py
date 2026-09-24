@@ -835,6 +835,23 @@ def test_public_eligibility_and_fail_fast():
         with pytest.raises(ValueError, match="out"):
             flash_attn_varlen_func(**kwargs)
 
+    short_case = build_case(
+        128, [1, 1], [257, 513], hq=16, fp8=False
+    )
+    noncontiguous_out = torch.empty(
+        short_case["q"].shape[0],
+        short_case["q"].shape[1] * 2,
+        short_case["q"].shape[2],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )[:, ::2]
+    assert noncontiguous_out.stride(-1) == 1
+    assert not noncontiguous_out.is_contiguous()
+    kwargs = dict(short_case, fa_version=4, out=noncontiguous_out)
+    assert not can_use_flash_attn_varlen_func(**kwargs)
+    with pytest.raises(ValueError, match="out"):
+        flash_attn_varlen_func(**kwargs)
+
 
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("layout", ["interleaved", "strided"])
