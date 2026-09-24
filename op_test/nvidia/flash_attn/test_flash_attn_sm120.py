@@ -48,10 +48,24 @@ def test_public_eligibility_and_fail_fast():
         ({"scheduler_metadata": torch.empty(1, device="cuda")}, "scheduler"),
         ({"num_prefill": 2}, "prefill/decode"),
         ({"fa_version": 4}, "fa_version"),
+        ({"num_splits": 257}, "num_splits"),
     ):
         kwargs = dict(case, **update)
         assert not can_use_flash_attn_varlen_func(**kwargs)
-        with pytest.raises(NotImplementedError, match=match):
+        with pytest.raises((NotImplementedError, ValueError), match=match):
+            flash_attn_varlen_func(**kwargs)
+    for bad_out in (
+        torch.empty_like(case["q"]),
+        torch.empty(
+            (case["q"].shape[0] + 1, *case["q"].shape[1:]),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        torch.empty(case["q"].shape, dtype=torch.bfloat16),
+    ):
+        kwargs = dict(case, out=bad_out)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises(ValueError, match="out"):
             flash_attn_varlen_func(**kwargs)
 
 

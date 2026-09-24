@@ -34,9 +34,27 @@ def test_public_eligibility_and_fail_fast():
     case = _case(64, [65, 3], [257, 513])
     for version in (2, 3):
         assert can_use_flash_attn_varlen_func(**dict(case, fa_version=version))
-    assert not can_use_flash_attn_varlen_func(**dict(case, fa_version=4))
-    with pytest.raises(NotImplementedError, match="fa_version"):
-        flash_attn_varlen_func(**dict(case, fa_version=4))
+    for update, match in (
+        ({"fa_version": 4}, "fa_version"),
+        ({"causal": False}, "causal"),
+    ):
+        kwargs = dict(case, **update)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises((NotImplementedError, ValueError), match=match):
+            flash_attn_varlen_func(**kwargs)
+    for bad_out in (
+        torch.empty_like(case["q"]),
+        torch.empty(
+            (case["q"].shape[0] + 1, *case["q"].shape[1:]),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        torch.empty(case["q"].shape, dtype=torch.bfloat16),
+    ):
+        kwargs = dict(case, out=bad_out)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises(ValueError, match="out"):
+            flash_attn_varlen_func(**kwargs)
 
 
 def _check(case, splits=0, graph=False):

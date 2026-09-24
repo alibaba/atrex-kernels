@@ -813,9 +813,27 @@ def test_public_eligibility_and_fail_fast():
     case = build_case(128, [65, 3], [257, 513], hq=16)
     case["fa_version"] = 4
     assert can_use_flash_attn_varlen_func(**case)
-    assert not can_use_flash_attn_varlen_func(**dict(case, fa_version=3))
-    with pytest.raises(NotImplementedError, match="fa_version"):
-        flash_attn_varlen_func(**dict(case, fa_version=3))
+    for update, match in (
+        ({"fa_version": 3}, "fa_version"),
+        ({"causal": False}, "causal"),
+    ):
+        kwargs = dict(case, **update)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises((NotImplementedError, ValueError), match=match):
+            flash_attn_varlen_func(**kwargs)
+    for bad_out in (
+        torch.empty_like(case["q"]),
+        torch.empty(
+            (case["q"].shape[0] + 1, *case["q"].shape[1:]),
+            dtype=torch.bfloat16,
+            device="cuda",
+        ),
+        torch.empty(case["q"].shape, dtype=torch.bfloat16),
+    ):
+        kwargs = dict(case, out=bad_out)
+        assert not can_use_flash_attn_varlen_func(**kwargs)
+        with pytest.raises(ValueError, match="out"):
+            flash_attn_varlen_func(**kwargs)
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])

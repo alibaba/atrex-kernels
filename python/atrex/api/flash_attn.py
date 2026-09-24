@@ -10,6 +10,133 @@ _TARGET_FA_VERSIONS = {
 }
 
 
+def _validate_out(call, torch, *, require_contiguous=False):
+    out = call["out"]
+    if out is None:
+        return
+    q = call["q"]
+    expected_dtype = (
+        torch.bfloat16
+        if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        else q.dtype
+    )
+    if out.shape != q.shape or out.dtype != expected_dtype or out.device != q.device:
+        raise ValueError(
+            "out must have Q's shape/device and the backend output dtype"
+        )
+    if out.stride(-1) != 1 or (require_contiguous and not out.is_contiguous()):
+        raise ValueError("out has an unsupported layout")
+
+
+def _validate_descales(call, torch, batch_size, num_kv_heads):
+    q = call["q"]
+    scales = (call["q_descale"], call["k_descale"], call["v_descale"])
+    if q.dtype == torch.bfloat16:
+        if any(scale is not None for scale in scales):
+            raise NotImplementedError("BF16 attention does not consume FP8 descales")
+        return
+    for scale in scales:
+        if scale is None:
+            continue
+        if (
+            scale.shape != (batch_size, num_kv_heads)
+            or scale.dtype != torch.float32
+            or scale.device != q.device
+        ):
+            raise ValueError(
+                "FP8 descales must be float32 [batch,num_kv_heads] on the Q device"
+            )
+
+
+def _validate_nvidia_call(call, torch, target_key, batch_size, window):
+    q, k = call["q"], call["k"]
+    block_table = call["block_table"]
+    if window != (-1, -1):
+        raise NotImplementedError(
+            f"Atrex {target_key[1]} attention does not support sliding windows"
+        )
+    if call["s_aux"] is not None:
+        sink = call["s_aux"]
+        if (
+            sink.shape != (q.shape[-2],)
+            or sink.dtype != torch.bfloat16
+            or sink.device != q.device
+        ):
+            raise ValueError("s_aux must be BF16 [num_q_heads] on the Q device")
+    _validate_out(call, torch)
+    _validate_descales(call, torch, batch_size, k.shape[-2])
+
+    if target_key == ("nvidia", "sm103"):
+        if not call["causal"]:
+            raise NotImplementedError("Atrex SM103 attention requires causal=True")
+        return
+
+    if call["num_splits"] > 256:
+        raise NotImplementedError("Atrex SM120 attention supports num_splits <= 256")
+    if block_table is not None and k.shape[1] % 16:
+        raise NotImplementedError(
+            "Atrex SM120 paged attention requires page_size divisible by 16"
+        )
+
+
+def _validate_ppu_call(call, torch, batch_size, window, softcap, eligibility_only):
+    q, k, v = (call[name] for name in ("q", "k", "v"))
+    block_table = call["block_table"]
+    seqused_k = call["seqused_k"]
+    if q.dtype != torch.float8_e4m3fn:
+        raise NotImplementedError("PPU attention requires FP8 E4M3 Q/K/V")
+    if tuple(q.shape[1:]) != (8, 256) or not q.is_contiguous():
+        raise NotImplementedError("PPU attention requires contiguous Q [tokens,8,256]")
+    if block_table is None or tuple(k.shape[2:]) != (1, 256):
+        raise NotImplementedError(
+            "PPU attention requires paged K/V [blocks,page_size,1,256]"
+        )
+    if k.shape[1] < 64 or k.shape[1] % 64:
+        raise NotImplementedError(
+            "PPU prep_kv requires page_size to be a multiple of 64"
+        )
+    block_elements = k.shape[1] * k.shape[2] * k.shape[3]
+    layouts = []
+    for tensor in (k, v):
+        if any(stride <= 0 for stride in tensor.stride()):
+            raise ValueError("PPU KV requires positive strides")
+        if tuple(tensor.stride()[1:]) != (256, 256, 1):
+            raise NotImplementedError(
+                "PPU prep_kv requires contiguous rows within each block"
+            )
+        if tensor.stride(0) % block_elements:
+            raise NotImplementedError(
+                "PPU prep_kv requires an integral block stride"
+            )
+        if tensor.numel() and tensor.data_ptr() % 16:
+            raise ValueError("PPU prep_kv requires 16-byte aligned cache pointers")
+        layouts.append(tensor.stride(0) // block_elements)
+    if layouts[0] != layouts[1]:
+        raise NotImplementedError("PPU prep_kv requires matching K/V block layouts")
+    if not call["causal"] or window != (-1, -1):
+        raise NotImplementedError(
+            "PPU attention supports causal full-window attention"
+        )
+    if softcap or call["s_aux"] is not None:
+        raise NotImplementedError("PPU attention does not support softcap or sinks")
+    if call["return_softmax_lse"]:
+        raise NotImplementedError("PPU attention does not return softmax LSE")
+    if seqused_k.shape != (batch_size,) or block_table.shape[0] != batch_size:
+        raise ValueError("PPU sequence metadata batch dimensions must match")
+    if call["max_seqlen_k"] > block_table.shape[1] * k.shape[1]:
+        raise ValueError("PPU block_table does not cover max_seqlen_k")
+    _validate_out(call, torch, require_contiguous=True)
+    if eligibility_only and any(
+        call[name] is not None for name in ("q_descale", "k_descale", "v_descale")
+    ):
+        raise NotImplementedError(
+            "PPU can_use cannot prove device descales are fixed at one"
+        )
+    softmax_scale = call["softmax_scale"]
+    if softmax_scale is not None and abs(float(softmax_scale) - 256**-0.5) > 1e-12:
+        raise NotImplementedError("PPU attention requires softmax_scale=1/sqrt(256)")
+
+
 def _validate_flash_attn_call(call):
     """Validate the public contract without compiling or allocating buffers."""
     import torch
@@ -85,8 +212,14 @@ def _validate_flash_attn_call(call):
         raise ValueError("Incompatible K/V dimensions")
     if k.shape[-2] <= 0 or q.shape[-2] % k.shape[-2]:
         raise ValueError("Q heads must be divisible by KV heads")
+    if q.shape[-2] <= 0:
+        raise ValueError("Q must contain at least one attention head")
     if any(tensor.stride(-1) != 1 for tensor in (q, k, v)):
         raise ValueError("Q/K/V head dimensions must be contiguous")
+    if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and any(
+        tensor.requires_grad for tensor in (q, k, v)
+    ):
+        raise NotImplementedError("Atrex FP8 attention is forward-only")
     if call["num_splits"] < 0:
         raise ValueError("num_splits must be nonnegative")
     if cu_seqlens_q is None:
@@ -114,11 +247,6 @@ def _validate_flash_attn_call(call):
         if softcap not in (0, 0.0, logits_soft_cap):
             raise ValueError("softcap and logits_soft_cap disagree")
         softcap = logits_soft_cap
-    if q.dtype == torch.bfloat16 and any(
-        call[name] is not None for name in ("q_descale", "k_descale", "v_descale")
-    ):
-        raise NotImplementedError("BF16 attention does not consume FP8 descales")
-
     target = detect_device_target(q.device)
     target_key = (target.family, target.arch)
     supported_versions = _TARGET_FA_VERSIONS.get(target_key)
@@ -134,42 +262,32 @@ def _validate_flash_attn_call(call):
             f"received {fa_version}"
         )
 
+    if cu_seqlens_q.ndim != 1:
+        raise ValueError("cu_seqlens_q must be one-dimensional")
+    batch_size = cu_seqlens_q.shape[0] - 1
+    if batch_size < 0:
+        raise ValueError("Invalid cu_seqlens_q")
+    if q.shape[0] and batch_size == 0:
+        raise ValueError("Nonempty Q requires sequence metadata")
+    if cu_seqlens_k is not None and cu_seqlens_k.shape != (batch_size + 1,):
+        raise ValueError("cu_seqlens_k must have shape [batch+1]")
+    if seqused_k is not None and seqused_k.shape != (batch_size,):
+        raise ValueError("seqused_k must have shape [batch]")
+    if block_table is not None and (
+        block_table.ndim != 2 or block_table.shape[0] != batch_size
+    ):
+        raise ValueError("block_table must have shape [batch,max_pages]")
+    if block_table is not None and k.shape[1] <= 0:
+        raise ValueError("Paged K/V requires a positive page size")
+    if call["max_seqlen_q"] < 0 or call["max_seqlen_k"] < 0:
+        raise ValueError("maximum sequence lengths must be nonnegative")
+
     if target_key in (("nvidia", "sm103"), ("nvidia", "sm120")):
-        if window != (-1, -1):
-            raise NotImplementedError(
-                f"Atrex {target.arch} attention does not support sliding windows"
-            )
+        _validate_nvidia_call(call, torch, target_key, batch_size, window)
     else:
-        if q.dtype != torch.float8_e4m3fn:
-            raise NotImplementedError("PPU attention requires FP8 E4M3 Q/K/V")
-        if tuple(q.shape[1:]) != (8, 256):
-            raise NotImplementedError("PPU attention requires Q [tokens,8,256]")
-        if block_table is None or tuple(k.shape[2:]) != (1, 256):
-            raise NotImplementedError(
-                "PPU attention requires paged K/V [blocks,page_size,1,256]"
-            )
-        if k.shape[1] < 64 or k.shape[1] % 64:
-            raise NotImplementedError(
-                "PPU prep_kv requires page_size to be a multiple of 64"
-            )
-        if not call["causal"] or window != (-1, -1):
-            raise NotImplementedError(
-                "PPU attention supports causal full-window attention"
-            )
-        if softcap or call["s_aux"] is not None:
-            raise NotImplementedError("PPU attention does not support softcap or sinks")
-        if call["return_softmax_lse"]:
-            raise NotImplementedError("PPU attention does not return softmax LSE")
-        if eligibility_only and any(
-            call[name] is not None
-            for name in ("q_descale", "k_descale", "v_descale")
-        ):
-            raise NotImplementedError(
-                "PPU can_use cannot prove device descales are fixed at one"
-            )
-        softmax_scale = call["softmax_scale"]
-        if softmax_scale is not None and abs(float(softmax_scale) - 256**-0.5) > 1e-12:
-            raise NotImplementedError("PPU attention requires softmax_scale=1/sqrt(256)")
+        _validate_ppu_call(
+            call, torch, batch_size, window, softcap, eligibility_only
+        )
 
     return target, window, softcap
 
