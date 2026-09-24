@@ -48,9 +48,9 @@ python3 -m pip install -r requirements-dev.txt
 ./build.sh
 ```
 
-`build.sh` writes the wheel to `dist/` and force-reinstalls it into the same
-Python environment used for the build. Set `PYTHON=/path/to/python` to select a
-different environment.
+`build.sh` writes the wheel to `dist/`, resolves and installs its declared
+runtime dependencies, then force-reinstalls only the freshly built ATREX wheel.
+Set `PYTHON=/path/to/python` to select a different environment.
 
 ## License
 
