@@ -25,8 +25,17 @@ An operator change is incomplete unless its matching target test is added or
 updated in the same change. The current files are:
 
 ```text
+op_test/nvidia/chunk_gdn/test_chunk_gdn_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
 ```
+
+The SM103 Chunk-GDN path integrates the AKA M64 implementation behind the
+existing public API. Its adapter performs the caller-requested Q/K L2
+normalization and supplies a zero initial state for first-chunk prefill without
+changing the AKA kernel ABI. Strict eligibility checks guard the verified
+shape and metadata domain. Its private launch interface and profiler-visible
+kernels start with `atrex_aka_`. This SM103 prefill path does not support CUDA
+Graph capture and rejects it before metadata synchronization or kernel launch.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
