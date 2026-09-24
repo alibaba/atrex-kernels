@@ -1,0 +1,12 @@
+ATREX
+Copyright 2026 Alibaba Group
+
+This product includes software developed by third parties.
+
+NVIDIA CUTLASS
+Copyright (c) 2017-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+Source: https://github.com/NVIDIA/cutlass
+
+The CUTLASS submodule and bundled CUTLASS-derived headers retain their original
+copyright notices and license terms.

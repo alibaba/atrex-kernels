@@ -1,0 +1,4 @@
+interface:
+  display_name: "ATREX Kernel Integration"
+  short_description: "Integrate one operator with minimal API and GPU tests"
+  default_prompt: "Use $atrex-kernel-integration to integrate this operator with the smallest scope, compatible lazy dispatch, atrex-prefixed kernels, one functional test file, and validation only on its target GPU."

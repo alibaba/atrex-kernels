@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+build/
+dist/
+*.egg-info/
+
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+
+python/atrex/src
+python/atrex/third_party
