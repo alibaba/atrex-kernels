@@ -24,6 +24,12 @@ if [[ -z "$wheel_path" ]]; then
     exit 1
 fi
 
+# Resolve and install the wheel's declared runtime dependencies without forcing
+# an expensive reinstall of an already-satisfied GPU dependency stack.
+"$PYTHON_EXECUTABLE" -m pip install "$wheel_path"
+# The project version is intentionally stable during local development, so the
+# first command may consider ATREX itself already satisfied. Replace only the
+# freshly built project wheel after dependency resolution has completed.
 "$PYTHON_EXECUTABLE" -m pip install "$wheel_path" --force-reinstall --no-deps
 
 echo "Built and installed $wheel_path"
