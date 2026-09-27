@@ -1,8 +1,4 @@
-"""CuTeDSL Chunk-GDN forward API for NVIDIA SM120.
-
-This wraps the SM120-tuned 3-kernel GDN chunk-forward implementation:
-K0 preprocess + K_inv Neumann + K1 fused chunk_h+chunk_o.
-"""
+"""CuTeDSL Chunk-GDN forward API for NVIDIA SM103 and SM120."""
 
 import math
 from typing import Optional, Tuple
@@ -15,6 +11,11 @@ BT = 32
 K_DIM = 128
 V_DIM = 128
 BV = 16
+SM103_H = 4
+SM103_HV = 32
+SM103_MAX_SEQS = 16
+SM103_MAX_TOKENS = 16384
+SM103_SCALE = K_DIM ** -0.5
 
 
 def _select_chunk_gdn_implementation(device=None):
@@ -25,25 +26,25 @@ def _select_chunk_gdn_implementation(device=None):
     return select_chunk_gdn_implementation(device)
 
 
-def _check_sm120_device(tensor: torch.Tensor):
+def _check_chunk_gdn_device(tensor: torch.Tensor):
     if tensor.device.type != "cuda":
         raise ValueError("CuTeDSL Chunk-GDN requires CUDA tensors")
     implementation = _select_chunk_gdn_implementation(tensor.device)
     if implementation is None:
         target = detect_device_target(tensor.device)
         raise RuntimeError(
-            "CuTeDSL Chunk-GDN requires NVIDIA sm120; "
+            "CuTeDSL Chunk-GDN requires a supported NVIDIA target; "
             f"detected {target.family}/{target.arch}"
         )
     return implementation
 
 
-def _check_sm120_current_device():
+def _check_chunk_gdn_current_device():
     implementation = _select_chunk_gdn_implementation()
     if implementation is None:
         target = detect_device_target()
         raise RuntimeError(
-            "CuTeDSL Chunk-GDN requires NVIDIA sm120; "
+            "CuTeDSL Chunk-GDN requires a supported NVIDIA target; "
             f"detected {target.family}/{target.arch}"
         )
     return implementation
@@ -92,14 +93,14 @@ def _validate_inputs(ctx: dict, q: torch.Tensor, k: torch.Tensor, v: torch.Tenso
         if tensor.device != q.device:
             raise ValueError(f"{name} must be on the same CUDA device as q")
 
-    return _check_sm120_device(q)
+    return _check_chunk_gdn_device(q)
 
 
 def _gate_dtype_supported(tensor: torch.Tensor) -> bool:
     return tensor.dtype in (torch.bfloat16, torch.float32)
 
 
-def _is_supported_fast_path(
+def _is_supported_sm120_fast_path(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -143,6 +144,90 @@ def _is_supported_fast_path(
     return True
 
 
+def _cuda_runtime_major(version: Optional[str]) -> Optional[int]:
+    if version is None:
+        return None
+    try:
+        return int(version.split(".", 1)[0])
+    except ValueError:
+        return None
+
+
+def _is_supported_sm103_fast_path(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: Optional[float],
+    initial_state: Optional[torch.Tensor],
+    cu_values: list[int],
+    cp_context,
+    transpose_state_layout: bool,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> bool:
+    """Return whether a call is inside the verified AKA M64 contract."""
+    if q.device.type != "cuda":
+        return False
+    target = detect_device_target(q.device)
+    if (
+        target.family != "nvidia"
+        or target.arch != "sm103"
+        or (_cuda_runtime_major(target.runtime_version) or 0) < 13
+    ):
+        return False
+    if any(tensor.device != q.device for tensor in (k, v, g, beta)):
+        return False
+    if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
+        return False
+    if g.dtype != torch.float32 or beta.dtype != torch.float32:
+        return False
+    if not all(tensor.is_contiguous() for tensor in (q, k, v, g, beta)):
+        return False
+    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
+        return False
+    physical_b, total_t, hq, dk = q.shape
+    v_b, v_t, hv, dv = v.shape
+    if (
+        physical_b != 1
+        or v_b != 1
+        or v_t != total_t
+        or total_t <= 0
+        or total_t > SM103_MAX_TOKENS
+        or hq != SM103_H
+        or hv != SM103_HV
+        or dk != K_DIM
+        or dv != V_DIM
+        or g.shape != (1, total_t, SM103_HV)
+        or beta.shape != g.shape
+    ):
+        return False
+    if cp_context is not None or transpose_state_layout:
+        return False
+    if (
+        checkpoint_every_n_tokens != 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
+        return False
+    requested_scale = SM103_SCALE if scale is None else float(scale)
+    if not math.isclose(requested_scale, SM103_SCALE, rel_tol=0.0, abs_tol=1e-12):
+        return False
+
+    num_seqs = len(cu_values) - 1
+    if num_seqs < 1 or num_seqs > SM103_MAX_SEQS:
+        return False
+    expected_state = (num_seqs, SM103_HV, V_DIM, K_DIM)
+    return initial_state is None or (
+        initial_state.device == q.device
+        and initial_state.dtype == torch.float32
+        and tuple(initial_state.shape) == expected_state
+        and initial_state.is_contiguous()
+    )
+
+
 def _is_supported_initial_state(
     initial_state: Optional[torch.Tensor],
     q: torch.Tensor,
@@ -181,6 +266,8 @@ def _packed_cu_values(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: Optional[torch.Tensor],
     total_t: int,
+    *,
+    require_matching_cpu: bool = False,
 ) -> list[int]:
     if (
         cu_seqlens.ndim != 1
@@ -191,15 +278,25 @@ def _packed_cu_values(
         raise ValueError(
             "cu_seqlens must be a contiguous 1D CUDA int32/int64 tensor"
         )
+    if require_matching_cpu and cu_seqlens_cpu is None:
+        raise ValueError(
+            "SM103 AKA M64 requires cu_seqlens_cpu when cu_seqlens is supplied"
+        )
     if cu_seqlens_cpu is not None:
         if (
             cu_seqlens_cpu.ndim != 1
             or cu_seqlens_cpu.device.type != "cpu"
             or cu_seqlens_cpu.dtype not in (torch.int32, torch.int64)
+            or not cu_seqlens_cpu.is_contiguous()
         ):
             raise ValueError(
-                "cu_seqlens_cpu must be a 1D CPU int32/int64 tensor"
+                "cu_seqlens_cpu must be a contiguous 1D CPU int32/int64 tensor"
             )
+        if require_matching_cpu:
+            if cu_seqlens_cpu.dtype != cu_seqlens.dtype:
+                raise ValueError("cu_seqlens_cpu dtype must match cu_seqlens")
+            if not torch.equal(cu_seqlens.detach().cpu(), cu_seqlens_cpu):
+                raise ValueError("cu_seqlens_cpu must match cu_seqlens exactly")
         values = [int(x) for x in cu_seqlens_cpu.tolist()]
     elif int(cu_seqlens.numel()) == 2:
         # Single sequence: by contract cu_seqlens == [0, total_t]. Synthesize it
@@ -319,15 +416,50 @@ def can_use_chunk_gdn_fwd_cutedsl(
     **kwargs,
 ) -> bool:
     """Return whether ATREX should handle this GDN chunk call."""
-    # vLLM passes this flag; packed cu_seqlens are validated below.
-    del scale, allow_padding
+    # ``allow_padding`` does not change the mathematical contract. Tail
+    # handling is validated by each architecture-specific implementation.
+    del allow_padding
     try:
         if head_first or kwargs:
             return False
         if cu_seqlens is None and cu_seqlens_cpu is not None:
             return False
+        target = detect_device_target(q.device)
+        implementation = _select_chunk_gdn_implementation(q.device)
+        if implementation is None:
+            return False
+        if target.family == "nvidia" and target.arch == "sm103":
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            if not use_qk_l2norm_in_kernel:
+                return False
+            total_t = int(q.shape[1])
+            if cu_seqlens is None:
+                cu_values = [0, total_t]
+            else:
+                cu_values = _packed_cu_values(
+                    cu_seqlens,
+                    cu_seqlens_cpu,
+                    total_t,
+                    require_matching_cpu=True,
+                )
+            return _is_supported_sm103_fast_path(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state,
+                cu_values,
+                cp_context,
+                transpose_state_layout,
+                state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+            )
         has_cu_seqlens = cu_seqlens is not None
-        if not _is_supported_fast_path(
+        if not _is_supported_sm120_fast_path(
             q,
             k,
             v,
@@ -337,8 +469,6 @@ def can_use_chunk_gdn_fwd_cutedsl(
             cp_context,
             transpose_state_layout,
         ):
-            return False
-        if _select_chunk_gdn_implementation(q.device) is None:
             return False
         t = int(q.shape[1])
         hv = int(v.shape[2])
@@ -380,7 +510,7 @@ def chunk_gdn_fwd_cutedsl_build(
     output_final_state: bool = False,
     scale: Optional[float] = None,
 ) -> dict:
-    """Build the SM120 CuTeDSL Chunk-GDN forward context.
+    """Build a target-specific CuTeDSL Chunk-GDN forward context.
 
     Called once during model initialization. The context is a plain metadata dict;
     all prefill runs on the varlen megakernel (compile-once), so sequence length
@@ -388,9 +518,23 @@ def chunk_gdn_fwd_cutedsl_build(
     given) is only recorded for shape validation. ``warmup``/``seq_len`` are kept for
     backward-compatible signatures; runtime compile is avoided via prewarm_buckets.
     """
-    _check_sm120_current_device()
+    _check_chunk_gdn_current_device()
+    target = detect_device_target()
     if B != 1:
         raise ValueError(f"only B=1 is supported, got B={B}")
+    if target.family == "nvidia" and target.arch == "sm103":
+        if (H, HV, K, V) != (SM103_H, SM103_HV, K_DIM, V_DIM):
+            raise ValueError(
+                "SM103 AKA M64 requires H/HV/K/V=(4, 32, 128, 128), "
+                f"got {(H, HV, K, V)}"
+            )
+        requested_scale = SM103_SCALE if scale is None else float(scale)
+        if not math.isclose(
+            requested_scale, SM103_SCALE, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                f"SM103 AKA M64 requires scale={SM103_SCALE}, got {requested_scale}"
+            )
     if K != K_DIM or V != V_DIM:
         raise ValueError(f"only K={K_DIM}, V={V_DIM} are supported, got K={K}, V={V}")
     if HV % H != 0:
@@ -416,6 +560,7 @@ def chunk_gdn_fwd_cutedsl_build(
         "scale": init_scale if seq_len is not None else None,
         "output_final_state": output_final_state if seq_len is not None else None,
         "static_initialized": False,
+        "target_arch": target.arch,
     }
     return ctx
 
@@ -439,10 +584,14 @@ def _dispatch_chunk_gdn_prefill(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Dispatch single- and multi-sequence prefill to the SM120 kernel."""
+    """Dispatch single- and multi-sequence prefill to the selected kernel."""
     if cu_seqlens is None:
+        cu_seqlens_cpu = torch.tensor(
+            [0, int(q.shape[1])], dtype=torch.int32
+        )
         cu_seqlens = torch.tensor(
-            [0, int(q.shape[1])], device=q.device, dtype=torch.int32)
+            [0, int(q.shape[1])], device=q.device, dtype=torch.int32
+        )
     return _chunk_gdn_fwd_cutedsl_cu_seqlens(
         ctx, q, k, v, g, beta,
         scale=scale,
@@ -476,7 +625,7 @@ def chunk_gdn_fwd_cutedsl(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run SM120 CuTeDSL Chunk-GDN forward.
+    """Run the selected NVIDIA CuTeDSL Chunk-GDN forward implementation.
 
     Args:
         ctx: Context from :func:`chunk_gdn_fwd_cutedsl_build`.
@@ -499,6 +648,14 @@ def chunk_gdn_fwd_cutedsl(
         ``(o, final_state)``. ``o`` is [B, T, HV, V] bf16. ``final_state`` is
         [B, HV, V, K] fp32 when requested, otherwise ``None``.
     """
+    if (
+        ctx.get("target_arch") == "sm103"
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "SM103 AKA M64 Chunk-GDN does not support CUDA Graph capture"
+        )
+
     requested_scale = scale
     if requested_scale is None:
         requested_scale = ctx["scale"] if ctx.get("scale") is not None else 1.0 / math.sqrt(ctx["K"])
@@ -555,17 +712,79 @@ def chunk_gdn_fwd_cutedsl_prewarm_buckets(
     del output_final_state
     if K != K_DIM:
         raise ValueError(f"fused Q/K normalization requires K={K_DIM}, got {K}")
-    implementation = _check_sm120_current_device()
+    implementation = _check_chunk_gdn_current_device()
 
     dev_idx = torch.cuda.current_device()
     dev = torch.device(f"cuda:{dev_idx}")
-    implementation.prewarm_fused_qk_l2_normalize_bf16(device=dev_idx)
-
     sc = float(scale) if scale is not None else 1.0 / math.sqrt(K)
+    target = detect_device_target(dev)
+    if target.family == "nvidia" and target.arch == "sm103":
+        if include_state_checkpoints:
+            raise ValueError("SM103 AKA M64 does not support state checkpoints")
+        if (H, HV, K, V) != (SM103_H, SM103_HV, K_DIM, V_DIM):
+            raise ValueError(
+                "SM103 AKA M64 requires H/HV/K/V=(4, 32, 128, 128), "
+                f"got {(H, HV, K, V)}"
+            )
+        if not math.isclose(sc, SM103_SCALE, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"SM103 AKA M64 requires scale={SM103_SCALE}, got {sc}")
+        ctx = {
+            "B": 1, "H": SM103_H, "HV": SM103_HV,
+            "K": K_DIM, "V": V_DIM, "BT": BT, "BV": BV,
+            "T": None, "scale": None, "output_final_state": None,
+            "static_initialized": False, "target_arch": "sm103",
+        }
+        implementation.prewarm_fused_qk_l2_normalize_bf16(device=dev_idx)
+        for lengths in ((128,), (97,), (65, 63)):
+            seqlen = sum(lengths)
+            q = torch.randn(
+                (1, seqlen, SM103_H, K_DIM), device=dev, dtype=torch.bfloat16
+            )
+            k = torch.randn_like(q)
+            v = torch.randn(
+                (1, seqlen, SM103_HV, V_DIM),
+                device=dev,
+                dtype=torch.bfloat16,
+            )
+            g = torch.nn.functional.logsigmoid(
+                torch.randn((1, seqlen, SM103_HV), device=dev)
+            )
+            beta = torch.sigmoid(
+                torch.randn((1, seqlen, SM103_HV), device=dev)
+            )
+            offsets = [0]
+            for length in lengths:
+                offsets.append(offsets[-1] + length)
+            cu_cpu = torch.tensor(offsets, dtype=torch.int32)
+            cu = cu_cpu.to(device=dev)
+            init = torch.zeros(
+                (len(lengths), SM103_HV, V_DIM, K_DIM),
+                device=dev,
+                dtype=torch.float32,
+            )
+            _chunk_gdn_fwd_cutedsl_cu_seqlens(
+                ctx,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=sc,
+                output_final_state=True,
+                cu_seqlens=cu,
+                cu_seqlens_cpu=cu_cpu,
+                qk_l2norm_already_applied=False,
+                initial_state=init,
+            )
+        torch.cuda.synchronize()
+        return
+
+    implementation.prewarm_fused_qk_l2_normalize_bf16(device=dev_idx)
     ctx = {
         "B": 1, "H": int(H), "HV": int(HV), "K": int(K), "V": int(V),
         "BT": BT, "BV": BV, "T": None, "scale": None,
         "output_final_state": None, "static_initialized": False,
+        "target_arch": target.arch,
     }
     checkpoint_modes = (False, True) if include_state_checkpoints else (False,)
     for seqlen in (BT * 4, BT * 3 + 1):
@@ -640,11 +859,88 @@ def _chunk_gdn_fwd_cutedsl_cu_seqlens(
         g,
         beta,
     )
+    target = detect_device_target(q.device)
+    ctx_target = ctx.get("target_arch")
+    if ctx_target is not None and ctx_target != target.arch:
+        raise ValueError(
+            f"Chunk-GDN context targets {ctx_target}, but inputs are on {target.arch}"
+        )
     if q.shape[0] != 1:
         raise ValueError(
             "ATREX cu_seqlens GDN prefill expects packed B=1 tensors, "
             f"got B={q.shape[0]}")
-    cu_values = _packed_cu_values(cu_seqlens, cu_seqlens_cpu, int(q.shape[1]))
+    cu_values = _packed_cu_values(
+        cu_seqlens,
+        cu_seqlens_cpu,
+        int(q.shape[1]),
+        require_matching_cpu=(
+            target.family == "nvidia" and target.arch == "sm103"
+        ),
+    )
+    if target.family == "nvidia" and target.arch == "sm103":
+        if not _is_supported_sm103_fast_path(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            cu_values,
+            None,
+            False,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
+        ):
+            raise ValueError(
+                "call is outside the verified SM103 AKA M64 contract"
+            )
+        q_flat = q.squeeze(0)
+        k_flat = k.squeeze(0)
+        if not qk_l2norm_already_applied:
+            q_flat, k_flat = implementation.fused_qk_l2_normalize_bf16(
+                q_flat, k_flat
+            )
+        v_flat = v.squeeze(0)
+        gate = g.squeeze(0)
+        if not gate_is_exp:
+            gate = torch.exp(gate)
+        gate = gate.contiguous()
+        beta_flat = beta.squeeze(0)
+        cu_seqlens_i32 = (
+            cu_seqlens
+            if cu_seqlens.dtype == torch.int32
+            else cu_seqlens.to(dtype=torch.int32)
+        )
+        num_seqs = len(cu_values) - 1
+        output = torch.empty(
+            (int(q.shape[1]), SM103_HV, V_DIM),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        final_state = torch.empty(
+            (num_seqs, SM103_HV, V_DIM, K_DIM),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        initial_state_arg = initial_state
+        if initial_state_arg is None:
+            initial_state_arg = torch.zeros_like(final_state)
+        implementation.atrex_aka_chunk_gated_delta_rule_sm103_m64(
+            q_flat,
+            k_flat,
+            v_flat,
+            gate,
+            beta_flat,
+            output,
+            cu_seqlens_i32,
+            initial_state_arg,
+            final_state,
+            float(scale),
+        )
+        return output.unsqueeze(0), final_state if output_final_state else None
+
     num_seqs = len(cu_values) - 1
     total_t = int(q.shape[1])
     hv = int(v.shape[2])
