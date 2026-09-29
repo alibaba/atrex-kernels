@@ -43,10 +43,18 @@ Python source strings. Add headers only when genuinely shared.
   coding the contract.
 - No match: add `python/atrex/api/<operator>.py` and register only the agreed
   public functions in `python/atrex/__init__.py` via `_lazy_import_and_call`.
+- Name API modules only by operator semantics: `python/atrex/api/<operator>.py`.
+  Do not put vendor, architecture, backend, runtime, or DSL names in API
+  filenames.
+- Route implementations with the same semantic contract through one public
+  function. Put genuinely different contracts in separate public functions in
+  the same operator module.
 
-Preserve established import paths, names, positional behavior, defaults, and
-returns, even when a legacy name mentions an implementation language. Keep
-selectors, layouts, compiler helpers, and unused historical exports private.
+Preserve established top-level import paths, names, positional behavior,
+defaults, and returns, even when a legacy name mentions an implementation
+language. Treat `python/atrex/api` module paths as private implementation
+details. Keep selectors, layouts, compiler helpers, and unused historical
+exports private.
 
 Dispatch one semantic API in this order:
 

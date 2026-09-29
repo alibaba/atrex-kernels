@@ -41,19 +41,19 @@ def _lazy_import_and_call(
 
 chunk_gdn_fwd_cutedsl_build = _lazy_import_and_call(
     "chunk_gdn_fwd_cutedsl_build",
-    "atrex.api.chunk_gdn_cutedsl",
+    "atrex.api.chunk_gdn",
 )
 chunk_gdn_fwd_cutedsl = _lazy_import_and_call(
     "chunk_gdn_fwd_cutedsl",
-    "atrex.api.chunk_gdn_cutedsl",
+    "atrex.api.chunk_gdn",
 )
 can_use_chunk_gdn_fwd_cutedsl = _lazy_import_and_call(
     "can_use_chunk_gdn_fwd_cutedsl",
-    "atrex.api.chunk_gdn_cutedsl",
+    "atrex.api.chunk_gdn",
 )
 chunk_gdn_fwd_cutedsl_prewarm_buckets = _lazy_import_and_call(
     "chunk_gdn_fwd_cutedsl_prewarm_buckets",
-    "atrex.api.chunk_gdn_cutedsl",
+    "atrex.api.chunk_gdn",
 )
 nvfp4_fused_moe = _lazy_import_and_call(
     "nvfp4_fused_moe",

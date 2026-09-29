@@ -1,4 +1,4 @@
-"""CuTeDSL Chunk-GDN forward API for NVIDIA SM103 and SM120."""
+"""Chunk-GDN forward API for NVIDIA SM103 and SM120."""
 
 import math
 from typing import Optional, Tuple
@@ -28,12 +28,12 @@ def _select_chunk_gdn_implementation(device=None):
 
 def _check_chunk_gdn_device(tensor: torch.Tensor):
     if tensor.device.type != "cuda":
-        raise ValueError("CuTeDSL Chunk-GDN requires CUDA tensors")
+        raise ValueError("Chunk-GDN requires CUDA tensors")
     implementation = _select_chunk_gdn_implementation(tensor.device)
     if implementation is None:
         target = detect_device_target(tensor.device)
         raise RuntimeError(
-            "CuTeDSL Chunk-GDN requires a supported NVIDIA target; "
+            "Chunk-GDN requires a supported NVIDIA target; "
             f"detected {target.family}/{target.arch}"
         )
     return implementation
@@ -44,7 +44,7 @@ def _check_chunk_gdn_current_device():
     if implementation is None:
         target = detect_device_target()
         raise RuntimeError(
-            "CuTeDSL Chunk-GDN requires a supported NVIDIA target; "
+            "Chunk-GDN requires a supported NVIDIA target; "
             f"detected {target.family}/{target.arch}"
         )
     return implementation
