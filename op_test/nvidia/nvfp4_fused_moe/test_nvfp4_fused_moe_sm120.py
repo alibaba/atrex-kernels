@@ -1538,7 +1538,7 @@ def test_topk8_shape_does_not_enter_e512_topk10_path():
 
 def test_e512_topk10_shape_detector_eligibility():
     # Pure detector test: no compile, no allocation, no device switch (skill §3).
-    from atrex.api.nvfp4_fused_moe_sm120 import (
+    from atrex.api.nvfp4_fused_moe import (
         _E512_TOPK10_TASK29_TASK30_MAX_M,
         _hybrid_v5_uses_compact_small_m_sf,
         _sm120_has_validated_shape,
@@ -1565,8 +1565,8 @@ def test_e512_topk10_shape_detector_eligibility():
 @requires_sm120a
 def test_e512_topk10_prewarm_builds_dedicated_bindings():
     # First call JIT-compiles the extension; import alone must not compile.
-    from atrex.api import nvfp4_fused_moe_sm120 as api
-    mod = api.nvfp4_fused_moe_sm120_build()
+    from atrex.api import nvfp4_fused_moe as api
+    mod = api._build_and_load()
     required = (
         "e512_topk10_task29_forward_fused",
         "e512_topk10_task29_forward_grouped_m16_fused_act",
@@ -1652,7 +1652,7 @@ _E512_ROUTING_COMPACT_MAX_M = 16
 
 
 def _e512_small_m_max():
-    from atrex.api.nvfp4_fused_moe_sm120 import (
+    from atrex.api.nvfp4_fused_moe import (
         _E512_TOPK10_TASK29_TASK30_MAX_M,
     )
     return int(_E512_TOPK10_TASK29_TASK30_MAX_M)

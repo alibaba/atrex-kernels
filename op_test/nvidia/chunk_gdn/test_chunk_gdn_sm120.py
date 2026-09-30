@@ -50,7 +50,7 @@ def _make_inputs(B=1, T=128, H=16, HV=32, K=128, V=128):
 
 
 def test_chunk_gdn_public_api_exposes_state_checkpoints():
-    from atrex.api.chunk_gdn_cutedsl import (
+    from atrex.api.chunk_gdn import (
         can_use_chunk_gdn_fwd_cutedsl,
         chunk_gdn_fwd_cutedsl,
         chunk_gdn_fwd_cutedsl_prewarm_buckets,
@@ -74,7 +74,7 @@ def test_chunk_gdn_public_api_exposes_state_checkpoints():
 
 def test_chunk_gdn_rejects_mismatched_checkpoint_buffer_rows():
     _requires_sm120()
-    from atrex.api.chunk_gdn_cutedsl import (
+    from atrex.api.chunk_gdn import (
         chunk_gdn_fwd_cutedsl,
         chunk_gdn_fwd_cutedsl_build,
     )
