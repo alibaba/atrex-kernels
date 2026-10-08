@@ -137,10 +137,12 @@ class _Fa4DecodeReduceShared:
             cute.arch.sync_threads()
             output = Float32(0.0)
             for split in cutlass.range_constexpr(self.num_splits):
-                output += (
-                    weights[split]
-                    * mO_partial[split, batch, query_slot, head, tidx]
-                )
+                weight = weights[split]
+                if weight > Float32(0.0):
+                    output += (
+                        weight
+                        * mO_partial[split, batch, query_slot, head, tidx]
+                    )
             packed_token = query_start + query_slot
             mO[packed_token, head, tidx] = (
                 output * inv_sum_smem[0] * scale_o
@@ -253,16 +255,17 @@ class _Fa4DecodeReduce:
                         correction,
                         split,
                     )
-                    output += (
-                        split_correction
-                        * mO_partial[
-                            split,
-                            batch,
-                            query_slot,
-                            head,
-                            dimension,
-                        ]
-                    )
+                    if split_correction > Float32(0.0):
+                        output += (
+                            split_correction
+                            * mO_partial[
+                                split,
+                                batch,
+                                query_slot,
+                                head,
+                                dimension,
+                            ]
+                        )
                 mO[packed_token, head, dimension] = (
                     output * inv_sum * scale_o
                 ).to(BFloat16)

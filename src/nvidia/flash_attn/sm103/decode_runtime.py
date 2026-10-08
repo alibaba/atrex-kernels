@@ -832,10 +832,10 @@ def _fa4_decode_varlen(
             kv_splits, batch_size, max_seqlen_q, num_qo_heads
         )
         # Empty splits refresh their statistics but may not store O. The
-        # reducer still reads O before weighting it by zero, so initialize on
-        # every invocation (also captured for every graph replay). Keep scratch
-        # local: the allocator/graph pool owns reuse, not a per-layer cache.
-        workspace = torch.zeros(
+        # reducer skips O reads when their weight is zero, so no workspace
+        # initialization is needed. Keep scratch local to the allocator/graph
+        # pool rather than retaining a per-layer cache.
+        workspace = torch.empty(
             required_bytes, dtype=torch.uint8, device=q.device,
         )
         o_partial, l_partial, m_partial = _slice_workspace(
