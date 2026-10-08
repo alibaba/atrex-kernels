@@ -853,6 +853,91 @@ def test_public_eligibility_and_fail_fast():
         flash_attn_varlen_func(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "ctx_lens",
+    [
+        [513 + 7 * index for index in range(16)],
+        [
+            1563, 12520, 14313, 2095, 3158, 2696, 4997, 6072,
+            2226, 565, 5312, 13175, 2882, 17340, 11425, 840,
+        ],
+    ],
+    ids=["short_context", "production_q4"],
+)
+def test_aka_bf16_q4_uses_unified_api(monkeypatch, ctx_lens):
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+    from atrex.src.nvidia.flash_attn.sm103 import launch
+
+    q_lens = [4] * len(ctx_lens)
+    q, k, v, page_table, cu_q, cu, seqused_k, out = build_decode_case(
+        ctx_lens, q_lens, 16, 1, 128, seed=42
+    )
+    kwargs = dict(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=4,
+        cu_seqlens_q=cu_q,
+        max_seqlen_k=page_table.shape[1] * 128,
+        seqused_k=seqused_k,
+        block_table=page_table,
+        softmax_scale=256**-0.5,
+        causal=True,
+        out=out,
+        num_splits=0,
+        fa_version=4,
+    )
+    assert can_use_flash_attn_varlen_func(**kwargs)
+
+    selected = []
+    run_aka = launch._run_aka_q4
+
+    def observe_aka(**call):
+        selected.append(True)
+        return run_aka(**call)
+
+    monkeypatch.setattr(launch, "_run_aka_q4", observe_aka)
+    actual = flash_attn_varlen_func(**kwargs)
+    expected = fp32_reference(q, k, v, page_table, ctx_lens, q_lens, cu)
+    assert actual is out
+    assert selected == [True]
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=5e-2)
+
+    if max(ctx_lens) < 1000:
+        warmup = torch.cuda.Stream()
+        warmup.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup):
+            flash_attn_varlen_func(**kwargs)
+        torch.cuda.current_stream().wait_stream(warmup)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = flash_attn_varlen_func(**kwargs)
+        replay_lens = [length - 8 for length in ctx_lens]
+        seqused_k.copy_(torch.tensor(replay_lens, device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = fp32_reference(
+            q, k, v, page_table, replay_lens, q_lens, cu
+        )
+        assert captured is out
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=5e-2)
+
+    # The AKA specialization is narrow; other short-Q calls retain the
+    # existing SM103 decode route under the same public API.
+    private_call = dict(
+        q=q, k=k, v=v, cu_seqlens_q=cu_q, cu_seqlens_k=None,
+        seqused_k=seqused_k, max_seqlen_q=4,
+        max_seqlen_k=page_table.shape[1] * 128, page_table=page_table,
+        softmax_scale=256**-0.5, causal=True, softcap=0.0,
+        window_size_left=None, window_size_right=None, learnable_sink=None,
+        out=out, return_lse=False, q_descale=None, k_descale=None,
+        v_descale=None, num_splits=0,
+    )
+    assert launch._can_use_aka_q4(**private_call)
+    assert not launch._can_use_aka_q4(**dict(private_call, return_lse=True))
+    assert not launch._can_use_aka_q4(**dict(private_call, num_splits=1))
+
+
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("layout", ["interleaved", "strided"])
 @pytest.mark.parametrize("fp8", [False, True])

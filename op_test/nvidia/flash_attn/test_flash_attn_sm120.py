@@ -49,6 +49,7 @@ def test_public_eligibility_and_fail_fast():
         ({"num_prefill": 2}, "prefill/decode"),
         ({"fa_version": 4}, "fa_version"),
         ({"num_splits": 257}, "num_splits"),
+        ({"s_aux": torch.zeros(16, dtype=torch.bfloat16, device="cuda")}, "s_aux"),
     ):
         kwargs = dict(case, **update)
         assert not can_use_flash_attn_varlen_func(**kwargs)

@@ -78,6 +78,8 @@ def _validate_nvidia_call(call, torch, target_key, batch_size, window):
             raise NotImplementedError("Atrex SM103 attention requires causal=True")
         return
 
+    if call["s_aux"] is not None:
+        raise NotImplementedError("Atrex SM120 attention does not support s_aux")
     if call["num_splits"] > 256:
         raise NotImplementedError("Atrex SM120 attention supports num_splits <= 256")
     if block_table is not None and k.shape[1] % 16:
