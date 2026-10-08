@@ -1183,7 +1183,7 @@ _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 # Only reached on the sm120 split-KV path (is_split_kv True).
 # =====================================================================================
 def _compile_fwd_combine(
-    dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
+    dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
@@ -1194,7 +1194,6 @@ def _compile_fwd_combine(
         dtype=dtype,
         dtype_partial=dtype_partial,
         head_dim=head_dim,
-        num_head=num_head,
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
@@ -1283,7 +1282,6 @@ def _flash_attn_fwd_combine(
         dtype,
         dtype_partial,
         head_dim,
-        out.shape[-2],
         tile_m,
         k_block_size,
         log_max_splits,

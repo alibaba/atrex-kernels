@@ -60,7 +60,7 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    SchedulerState,
+    ClcState,
     SchedulingMode,
     TileSchedulerArguments,
     TileSchedulerProtocol,
@@ -87,7 +87,7 @@ class SingleTileVarlenScheduler2CTA(SingleTileVarlenScheduler):
     def clc_problem_shape(params):
         return ClcDynamicPersistentTileSchedulerParams(
             problem_shape_ntile_mnl=SingleTileVarlenScheduler.get_grid_shape(params),
-            cluster_shape_mnk=(params.decoder.cluster_shape_m, 1, 1),
+            cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
         )
 
 
@@ -1353,7 +1353,7 @@ class FlashAttentionForwardHd256_2CTA_Sm103:
 
         if const_expr(self.use_clc_scheduler):
             block_idx = cute.arch.block_idx()
-            clc = SchedulerState.create_clc(
+            clc = ClcState.create(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
                     block_idx,
@@ -1364,7 +1364,7 @@ class FlashAttentionForwardHd256_2CTA_Sm103:
                 consumer_state=clc_consumer_state,
                 producer_state=clc_producer_state,
             )
-            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, ctx=clc)
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
         else:
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
         assert isinstance(tile_scheduler, TileSchedulerProtocol), f"tile_scheduler is not a TileSchedulerProtocol: {type(tile_scheduler)}"

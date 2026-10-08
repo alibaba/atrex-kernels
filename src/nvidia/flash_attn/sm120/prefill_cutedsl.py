@@ -1932,8 +1932,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # prefill.  That makes each batch occupy the same contiguous range in
         # the flattened launch, so canceled block coordinates can be decoded
         # directly without rerunning the generic warp-prefix varlen mapper.
-        num_batch = tile_sched_params.decoder.num_batch
-        num_head_sched = tile_sched_params.decoder.num_head
+        num_batch = tile_sched_params.num_batch
+        num_head_sched = tile_sched_params.num_head
         num_m_blocks = cute.ceil_div(
             tile_sched_params.total_q // num_batch, self.tile_m
         )
