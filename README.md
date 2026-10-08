@@ -49,6 +49,21 @@ other supported short-Q/decode and prefill calls use the corresponding Atrex
 kernels. Callers can check eligibility with `can_use_flash_attn_varlen_func`;
 unsupported options are rejected rather than silently ignored.
 
+This is a breaking change for callers of the former lower-level SM103 FA4
+signature: use the varlen/paged arguments (`block_table`, `window_size`,
+`s_aux`, `return_softmax_lse`) and its conditional return shape instead of
+`page_table`, separate window bounds, `learnable_sink`, and `return_lse`.
+Existing callers should migrate with the vLLM integration; retaining the
+previous ATREX revision is the rollback path. The NVIDIA package requires
+`flash-attn-4==4.0.0b19`; target environments should not install the classic
+`flash-attn` distribution alongside it because both provide `flash_attn`.
+
+ZW-M890P retains `prep_kv`: each call allocates packed K and V buffers of
+`requests * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
+optional Split-KV partial buffers. For 64 requests at 16K KV length, packed
+K/V total 512 MiB. Account for this invocation-local scratch when sizing the
+serving KV cache; it is not a persistent per-layer cache.
+
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
 [`atrex-kernel-integration`](.agents/skills/atrex-kernel-integration/SKILL.md)

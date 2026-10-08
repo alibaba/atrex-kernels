@@ -165,18 +165,22 @@ def _ensure_prefill_jit(
     softmax_scale,
     causal,
     pack_gqa,
+    softcap,
+    learnable_sink,
     q_descale=None,
     k_descale=None,
     v_descale=None,
 ):
-    """Compile the matching prefill specialization from a short-Q call.
+    """Prepare the default-feature prefill specialization once per static key.
 
-    vLLM naturally compiles the decode/MTP specializations while preparing
-    CUDA graphs.  A decode-shaped call already carries every static property
-    needed by the sequence-length-independent prefill compiler, so use it to
-    populate the prefill cache as well.  This keeps the first real prefill
-    request off the compilation path without launching a dummy prefill.
+    A short-Q call supplies the static properties needed by default-feature
+    prefill (softcap=0, no attention sink). Serving startup must exercise each
+    short-Q shape before graph capture and before accepting requests. A failed
+    mandatory precompile is deliberately reported, not silently bypassed.
+    Non-default features compile their own specialization on first use.
     """
+    if softcap not in (None, 0, 0.0) or learnable_sink is not None:
+        return
     if (
         q is None
         or k is None
@@ -211,6 +215,11 @@ def _ensure_prefill_jit(
     with _PREFILL_JIT_LOCK:
         if key in _PREFILL_JIT_KEYS:
             return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SM103 prefill specialization was not compiled before CUDA "
+                "graph capture; warm up the short-Q shape during startup"
+            )
         _prefill_forward()(
             q,
             k,
@@ -254,12 +263,6 @@ def _short_q_forward():
 
 def _run_prefill(**kwargs):
     """Run 2CTA prefill and normalize its private four-value result."""
-    if kwargs.get("num_splits") == 0:
-        # vLLM uses 0 to delegate split selection to the operator. The Atrex
-        # 2CTA prefill path is intentionally non-split, represented as 1 by
-        # its private interface.
-        kwargs = dict(kwargs)
-        kwargs["num_splits"] = 1
     result = _prefill_forward()(**kwargs)
     return result[0], result[1]
 
@@ -290,6 +293,8 @@ def forward(**kwargs):
             softmax_scale=kwargs.get("softmax_scale"),
             causal=kwargs.get("causal", False),
             pack_gqa=kwargs.get("pack_gqa"),
+            softcap=kwargs.get("softcap"),
+            learnable_sink=kwargs.get("learnable_sink"),
             q_descale=kwargs.get("q_descale"),
             k_descale=kwargs.get("k_descale"),
             v_descale=kwargs.get("v_descale"),

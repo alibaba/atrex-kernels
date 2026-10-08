@@ -2,7 +2,7 @@
 
 CuTeDSL 4.5.2 does not include every installed Python source in the cache
 version used by ``cute.compile``.  ATREX therefore supplies a filesystem hash
-while compiling its vendored FlashAttention kernels.  The delegate is
+while compiling its FlashAttention kernels.  The delegate is
 installed once; each compilation selects its override through a context-local
 value, so concurrent compilations are not serialized by a process-wide lock.
 """

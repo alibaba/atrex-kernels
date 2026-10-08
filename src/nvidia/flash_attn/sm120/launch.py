@@ -168,59 +168,6 @@ def _sm120_paged_tile_n(page_size: int) -> int:
             return tile_n
     return 0
 
-def make_sm120_short_q_ragged_metadata(
-    kv_lengths,
-    *,
-    query_length=1,
-    max_splits=None,
-    device=None,
-):
-    """Build graph inputs for a load-balanced SM120 Q1 or Q4 launch.
-
-    Build this metadata outside CUDA graph capture and pass the returned
-    tensors as ``num_splits_dynamic`` and ``work_map``. The compact work map
-    uses one encoded int32 per CTA. Q1/M16 and Q4/M32 with one KV head both
-    have ``m_block == head == 0``.
-    """
-    import math
-
-    import torch
-
-    lengths = [int(length) for length in kv_lengths]
-    if query_length not in (1, 4):
-        raise ValueError("compact SM120 metadata supports query_length 1 or 4")
-    if not lengths or min(lengths) <= 0:
-        raise ValueError("kv_lengths must contain positive lengths")
-    if len(lengths) >= (1 << 15):
-        raise ValueError("too many sequences for compact Q1 work encoding")
-    if max_splits is None:
-        max_splits = 48 if query_length == 4 else 96
-    if not 1 < max_splits <= 128:
-        raise ValueError("max_splits must be in [2, 128]")
-    max_length = max(lengths)
-    split_counts = [
-        max(1, math.ceil(max_splits * length / max_length))
-        for length in lengths
-    ]
-    encoded_work = [
-        (sequence << 16) | split
-        for sequence, split_count in enumerate(split_counts)
-        for split in range(split_count)
-    ]
-    return (
-        torch.tensor(split_counts, dtype=torch.int32, device=device),
-        torch.tensor(encoded_work, dtype=torch.int32, device=device).view(-1, 1),
-    )
-
-def make_sm120_q1_ragged_metadata(kv_lengths, *, max_splits=96, device=None):
-    """Backward-compatible Q1 wrapper for ragged SM120 metadata."""
-    return make_sm120_short_q_ragged_metadata(
-        kv_lengths,
-        query_length=1,
-        max_splits=max_splits,
-        device=device,
-    )
-
 def _run_sm120(**kwargs):
     """Run the L20N path and preserve the public ``(out, lse)`` ABI.
 
@@ -243,8 +190,6 @@ def _run_sm120(**kwargs):
     page_table = kwargs.get("page_table")
     max_seqlen_q = kwargs.get("max_seqlen_q")
     requested_splits = kwargs.get("num_splits") or 0
-    num_splits_dynamic = kwargs.get("num_splits_dynamic")
-    work_map = kwargs.get("work_map")
 
     # Keep speculative verification as one native causal attention problem.
     # Q positions and grouped query heads are packed together inside the
@@ -299,8 +244,6 @@ def _run_sm120(**kwargs):
                 and num_kv_heads == 1
                 and (page_size == 64 or (is_fp8 and page_size == 128))
                 and q.shape[0] == num_sequences * max_seqlen_q
-                and num_splits_dynamic is None
-                and work_map is None
             )
             runtime_balanced_grid_size = 0
             if runtime_balanced_splits:
@@ -399,70 +342,6 @@ def _run_sm120(**kwargs):
         )
     else:
         sm120_kwargs["num_splits"] = max(1, requested_splits)
-    num_sequences = cu_seqlens_q.shape[0] - 1 if cu_seqlens_q is not None else 0
-    min_k = kwargs.get("min_seqlen_k")
-    max_k = kwargs.get("max_seqlen_k")
-    page_size = k.shape[1] if page_table is not None and k is not None and k.ndim == 4 else None
-    # Single-CTA CLC only wins at the measured page64 scheduling cliff. Keep
-    # the static kernel for all other shapes, especially page128 and mild skew.
-    sm120_kwargs["_use_clc"] = (
-        sm120_kwargs["num_splits"] == 1
-        and q is not None
-        and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and kwargs.get("causal")
-        and page_size == 64
-        and 3 <= num_sequences <= 4
-        and max_seqlen_q == 1024
-        and q.shape[0] == num_sequences * max_seqlen_q
-        and min_k is not None
-        and min_k > 0
-        and max_k is not None
-        and max_k >= 32 * min_k
-        and not kwargs.get("return_lse")
-        and kwargs.get("softcap") is None
-        and kwargs.get("window_size_left") is None
-        and kwargs.get("window_size_right") is None
-    )
-    # B64 has enough CTAs that fine-grained CLC only adds synchronization.
-    # Preserve batch-local KV reuse and move whole requests only when a
-    # device-side check detects both extreme skew and a heavy final wave.
-    use_request_order = (
-        sm120_kwargs["num_splits"] == 1
-        and q is not None
-        and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and kwargs.get("causal")
-        and page_size in (64, 128)
-        and num_sequences == 64
-        and max_seqlen_q is not None
-        and 5 <= max_seqlen_q <= 2048
-        and max_k is not None
-        and max_k >= 256 * 1024
-        and q.shape[0] == num_sequences * max_seqlen_q
-        and seqused_k is not None
-        and num_splits_dynamic is None
-        and work_map is None
-        and not kwargs.get("return_lse")
-        and kwargs.get("softcap") is None
-        and kwargs.get("window_size_left") is None
-        and kwargs.get("window_size_right") is None
-    )
-    if use_request_order:
-        sorted_k, request_order_i64 = torch.sort(
-            seqused_k, descending=True, stable=True
-        )
-        has_extreme_skew = sorted_k[0] >= 32 * sorted_k[-1]
-        has_heavy_tail = 4 * seqused_k[-8:].sum() >= seqused_k.sum()
-        use_sorted_order = has_extreme_skew & has_heavy_tail
-        # Both the flag and all indices are overwritten before the kernel.
-        # Invocation-local storage also participates in graph-pool reuse.
-        request_order = torch.empty(
-            seqused_k.shape[0] + 1, device=seqused_k.device, dtype=torch.int32,
-        )
-        request_order[0].copy_(use_sorted_order)
-        request_order[1:].copy_(request_order_i64)
-        sm120_kwargs["request_order"] = request_order
-    else:
-        sm120_kwargs["request_order"] = None
     sm120_kwargs["_arch"] = 120
     result = _sm120_forward()(**sm120_kwargs)
     return result[0], result[1]

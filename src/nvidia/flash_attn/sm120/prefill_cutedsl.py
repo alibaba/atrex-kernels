@@ -6,7 +6,6 @@
 # Built on Cute-DSL example: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/ampere/flash_attention_v2.py
 
 import math
-import os
 from types import SimpleNamespace
 from typing import Type, Callable, Optional
 from functools import partial
@@ -15,12 +14,11 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 
 from quack import copy_utils
@@ -31,8 +29,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
-# ATREX PORT: keep the local seqlen_info OOB clamp; use the installed FA4 package
-# for the other CuTe helpers.
+# Keep the local out-of-bounds sequence-length clamp.
 from atrex.src.nvidia.flash_attn.sm120.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
@@ -136,80 +133,6 @@ def _mma_m16n8k32_f32_fp8(
     )
 
 
-@dsl_user_op
-def _clc_init_query_sm120(
-    mbarrier_addr: cute.Pointer,
-    clc_response_ptr: cute.Pointer,
-    *,
-    loc=None,
-    ip=None,
-):
-    response_i32 = clc_response_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    mbarrier_i32 = mbarrier_addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [response_i32, mbarrier_i32],
-        "mbarrier.init.shared::cta.b64 [$1], 1;\n\t"
-        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [$0], [$1];\n\t"
-        "mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [$1], 16;",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _clc_next_query_sm120(
-    mbarrier_addr: cute.Pointer,
-    clc_response_ptr: cute.Pointer,
-    *,
-    loc=None,
-    ip=None,
-):
-    response_i32 = clc_response_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    mbarrier_i32 = mbarrier_addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [response_i32, mbarrier_i32],
-        "fence.proxy.async.shared::cta;\n\t"
-        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 [$0], [$1];\n\t"
-        "mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [$1], 16;",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _clc_wait_sm120(
-    mbarrier_addr: cute.Pointer,
-    phase: Int32,
-    *,
-    loc=None,
-    ip=None,
-):
-    mbarrier_i32 = mbarrier_addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [mbarrier_i32, phase.ir_value(loc=loc, ip=ip)],
-        "{\n\t.reg .pred p;\nwaitLoop:\n\t"
-        "mbarrier.try_wait.parity.relaxed.cta.shared::cta.b64 p, [$0], $1;\n\t"
-        "@!p bra waitLoop;\n}",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 class FlashAttentionForwardBase:
 
     def __init__(
@@ -221,7 +144,6 @@ class FlashAttentionForwardBase:
         is_causal: bool = False,
         is_local: bool = False,
         lpt: bool = False,
-        use_clc: bool = False,
         pack_gqa: bool = True,
         tile_m: int = 128,
         tile_n: int = 128,
@@ -235,9 +157,6 @@ class FlashAttentionForwardBase:
         is_split_kv: bool = False,
         page_size: Optional[int] = None,   # PAGED
         dynamic_splits: bool = False,       # DYNSPLIT
-        compact_grid: bool = False,          # COMPACTGRID
-        compact_short_q: bool = False,
-        reorder_batch: bool = False,
         runtime_balanced_splits: bool = False,
         runtime_balanced_grid_size: int = 0,
         runtime_balanced_batch_size: int = 0,
@@ -271,11 +190,6 @@ class FlashAttentionForwardBase:
         self.blocks_per_page = (page_size // tile_n) if page_size is not None else 1
         # DYNSPLIT: read the split count per sequence instead of using one scalar for the batch.
         self.dynamic_splits = dynamic_splits
-        # COMPACTGRID: take (m_block, head, batch, split) from a host-built work map instead of
-        # decoding it from a rectangular blockIdx, so only useful CTAs are launched.
-        self.compact_grid = compact_grid
-        self.compact_short_q = compact_short_q
-        self.reorder_batch = reorder_batch
         self.runtime_balanced_splits = runtime_balanced_splits
         self.runtime_balanced_grid_size = runtime_balanced_grid_size
         self.runtime_balanced_batch_size = runtime_balanced_batch_size
@@ -292,7 +206,6 @@ class FlashAttentionForwardBase:
         self.is_causal = is_causal
         self.is_local = is_local
         self.lpt = lpt
-        self.use_clc = use_clc
         self.pack_gqa = pack_gqa
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -382,7 +295,6 @@ class FlashAttentionForwardBase:
             (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         )
         smem_usage = smem_usage_QV + smem_usage_K + smem_usage_P
-        # TODO: sm86 and sm89
         smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
@@ -511,7 +423,6 @@ class FlashAttentionForwardBase:
             (self.num_producer_threads // tV_shape_dim_1, tV_shape_dim_1),
             order=(1, 0),
         )
-        # TODO: need a different layout for O if O dtype is not the same as V dtype
         # tO_layout: thread layout for O store
         output_copy_elems = universal_copy_bits // self.output_dtype.width
         tO_shape_dim_1 = sO_layout_atom.outer.shape[1] // output_copy_elems
@@ -1076,19 +987,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sK: sK_struct
             sP: sP_struct
 
-        @cute.struct
-        class SharedStorageQKVFP8Clc:
-            sV: sV_struct
-            sQ: sQ_struct
-            sK: sK_struct
-            sP: sP_struct
-            clc_mbar: cute.struct.MemRange[Int64, 1]
-            clc_response: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
-            clc_coord: cute.struct.Align[cute.struct.MemRange[Int32, 2], 8]
-
         if const_expr(self.is_fp8):
-            if const_expr(self.use_clc):
-                return SharedStorageQKVFP8Clc
             return SharedStorageQKVFP8 if const_expr(not self.Q_in_regs) else SharedStorageSharedQVFP8
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
 
@@ -1107,8 +1006,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
         mNumSplitsDynamic: Optional[cute.Tensor] = None,   # DYNSPLIT
-        mWorkMap: Optional[cute.Tensor] = None,   # COMPACTGRID
-        mRequestOrder: Optional[cute.Tensor] = None,
         mQDescale: Optional[cute.Tensor] = None,
         mKDescale: Optional[cute.Tensor] = None,
         mVDescale: Optional[cute.Tensor] = None,
@@ -1206,26 +1103,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # final scheduling wave.
             lpt=self.lpt,
         )
-        if const_expr(self.use_clc):
-            assert TileScheduler is SingleTileVarlenScheduler
-        if const_expr(self.reorder_batch):
-            assert TileScheduler is SingleTileVarlenScheduler
-            assert not self.use_clc and not self.compact_grid
-            assert not self.runtime_balanced_splits and not self.is_split_kv
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         if const_expr(self.runtime_balanced_splits):
             # Use a fixed launch shape while mapping CTAs from device-resident
             # sequence lengths. This keeps CUDA Graph replay stable.
             grid_dim = (self.runtime_balanced_grid_size, Int32(1), Int32(1))
-        elif const_expr(self.compact_grid):
-            # COMPACTGRID: one CTA per row of the work map, nothing wasted.
-            grid_dim = (cute.size(mWorkMap.shape[0]), Int32(1), Int32(1))
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
 
-        launch_kernel = self.atrex_sm120_prefill_clc_kernel if const_expr(self.use_clc) else self.atrex_sm120_prefill_kernel
-        launch_kernel(
+        self.atrex_sm120_prefill_kernel(
             mQ,
             mK,
             mV,
@@ -1237,8 +1124,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedK,
             mPageTable,   # PAGED
             mNumSplitsDynamic,   # DYNSPLIT
-            mWorkMap,   # COMPACTGRID
-            mRequestOrder,
             mQDescale,
             mKDescale,
             mVDescale,
@@ -1284,8 +1169,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],   # PAGED
         mNumSplitsDynamic: Optional[cute.Tensor],   # DYNSPLIT
-        mWorkMap: Optional[cute.Tensor],   # COMPACTGRID
-        mRequestOrder: Optional[cute.Tensor],
         mQDescale: Optional[cute.Tensor],
         mKDescale: Optional[cute.Tensor],
         mVDescale: Optional[cute.Tensor],
@@ -1422,31 +1305,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             if tidx == 0:
                 if split_idx == 0:
                     mNumSplitsDynamic[batch_size] = ns_b
-        elif const_expr(self.compact_grid):
-            # COMPACTGRID: the scheduler's rectangular decode is ignored; row j of the work map
-            # says exactly which (m_block, head, sequence, split) this CTA owns.
-            j, _, _ = cute.arch.block_idx()
-            if const_expr(self.compact_short_q):
-                m_block = Int32(0)
-                num_head = Int32(0)
-                encoded_work = mWorkMap[j, 0]
-                batch_size = encoded_work >> 16
-                split_idx = encoded_work & 0xFFFF
-            else:
-                m_block = mWorkMap[j, 0]
-                num_head = mWorkMap[j, 1]
-                batch_size = mWorkMap[j, 2]
-                split_idx = mWorkMap[j, 3]
         else:
             tile_scheduler = TileScheduler.create(tile_sched_params)
             work_tile = tile_scheduler.initial_work_tile_info()
             m_block, num_head, batch_size, split_idx = work_tile.tile_idx
-            if const_expr(self.reorder_batch):
-                reordered_batch = batch_size
-                if cute.arch.lane_idx() == 0:
-                    if mRequestOrder[0] != 0:
-                        reordered_batch = Int32(mRequestOrder[batch_size + 1])
-                batch_size = cute.arch.shuffle_sync(reordered_batch, 0)
 
         block_info = BlockInfo(
             self.tile_m,
@@ -1841,7 +1703,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # TODO: local
 
         # normalize acc_O by row_sum and calculate the lse
         row_scale = softmax.finalize()
@@ -1872,602 +1733,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             num_head,
             batch_size,
         )
-
-    @cute.kernel
-    def atrex_sm120_prefill_clc_kernel(
-        self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
-        mCuSeqlensQ: Optional[cute.Tensor],
-        mCuSeqlensK: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
-        mSeqUsedK: Optional[cute.Tensor],
-        mPageTable: Optional[cute.Tensor],   # PAGED
-        mNumSplitsDynamic: Optional[cute.Tensor],   # DYNSPLIT
-        mWorkMap: Optional[cute.Tensor],   # COMPACTGRID
-        mRequestOrder: Optional[cute.Tensor],
-        mQDescale: Optional[cute.Tensor],
-        mKDescale: Optional[cute.Tensor],
-        mVDescale: Optional[cute.Tensor],
-        softmax_scale_log2: Float32,
-        softmax_scale: Optional[Float32],
-        window_size_left: Optional[Int32],
-        window_size_right: Optional[Int32],
-        sQ_layout: cute.ComposedLayout,
-        sK_layout: cute.ComposedLayout,
-        sV_layout: cute.ComposedLayout,
-        sO_layout: cute.ComposedLayout,
-        sP_layout: cute.ComposedLayout | None,
-        gmem_tiled_copy_Q: cute.TiledCopy,
-        gmem_tiled_copy_K: cute.TiledCopy,
-        gmem_tiled_copy_V: cute.TiledCopy,
-        gmem_tiled_copy_O: cute.TiledCopy,
-        tiled_mma_qk: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
-        SharedStorage: cutlass.Constexpr,
-        tile_sched_params,
-        TileScheduler: cutlass.Constexpr[Callable],
-        aux_data: AuxData = AuxData(),
-        fastdiv_mods=None,
-        num_splits: Int32 = Int32(1),   # SPLITKV
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        clc_mbar_ptr = storage.clc_mbar.data_ptr()
-        clc_response_ptr = storage.clc_response.data_ptr()
-        clc_coord_ptr = storage.clc_coord.data_ptr()
-        sQ = cute.make_tensor(
-            cute.recast_ptr(storage.sQ.data_ptr(), dtype=self.dtype), sQ_layout
-        )
-        sK = storage.sK.get_tensor(sK_layout)
-        sV = storage.sV.get_tensor(sV_layout)
-        sP = storage.sP.get_tensor(sP_layout)
-        sVt = layout_utils.transpose_view(sV)
-
-        # CLC is restricted by the host to uniform-Q, non-split packed-GQA
-        # prefill.  That makes each batch occupy the same contiguous range in
-        # the flattened launch, so canceled block coordinates can be decoded
-        # directly without rerunning the generic warp-prefix varlen mapper.
-        num_batch = tile_sched_params.num_batch
-        num_head_sched = tile_sched_params.num_head
-        num_m_blocks = cute.ceil_div(
-            tile_sched_params.total_q // num_batch, self.tile_m
-        )
-        blocks_per_batch = num_m_blocks * num_head_sched
-        tile_idx = cute.arch.block_idx()[0]
-        batch_size = tile_idx // blocks_per_batch
-        mh_block = tile_idx - batch_size * blocks_per_batch
-        num_head = mh_block // num_m_blocks
-        m_block = mh_block - num_head * num_m_blocks
-        split_idx = Int32(0)
-        work_valid = tile_idx < cute.arch.grid_dim()[0]
-        clc_phase = Int32(0)
-        if tidx == 0:
-            _clc_init_query_sm120(clc_mbar_ptr, clc_response_ptr)
-
-        while work_valid:
-            self.process_tile_clc(
-                m_block,
-                num_head,
-                batch_size,
-                split_idx,
-                mQ,
-                mK,
-                mV,
-                mO,
-                mLSE,
-                mCuSeqlensQ,
-                mCuSeqlensK,
-                mSeqUsedQ,
-                mSeqUsedK,
-                mPageTable,
-                mNumSplitsDynamic,
-                mQDescale,
-                mKDescale,
-                mVDescale,
-                softmax_scale_log2,
-                softmax_scale,
-                window_size_left,
-                window_size_right,
-                sQ,
-                sK,
-                sV,
-                sP,
-                sVt,
-                sO_layout,
-                gmem_tiled_copy_Q,
-                gmem_tiled_copy_K,
-                gmem_tiled_copy_V,
-                gmem_tiled_copy_O,
-                tiled_mma_qk,
-                tiled_mma_pv,
-                aux_data,
-                fastdiv_mods,
-                num_splits,
-                tidx,
-            )
-            if tidx == 0:
-                _clc_wait_sm120(clc_mbar_ptr, clc_phase)
-                clc_x, _, _, clc_valid = cute.arch.clc_response(clc_response_ptr)
-                cute.arch.fence_proxy("async.shared", space="cta")
-                clc_coord_ptr[0] = clc_x
-                clc_coord_ptr[1] = Int32(clc_valid)
-            cute.arch.barrier()
-            # SM120 issues CLC directly rather than constructing the SM100
-            # multicast scheduler state.
-            next_tile_idx = cute.arch.grid_dim()[0]
-            clc_valid_i32 = clc_coord_ptr[1]
-            if clc_valid_i32 != Int32(0):
-                next_tile_idx = clc_coord_ptr[0]
-            batch_size = next_tile_idx // blocks_per_batch
-            mh_block = next_tile_idx - batch_size * blocks_per_batch
-            num_head = mh_block // num_m_blocks
-            m_block = mh_block - num_head * num_m_blocks
-            clc_phase ^= 1
-            work_valid = clc_valid_i32 != Int32(0)
-            if work_valid:
-                if tidx == 0:
-                    _clc_next_query_sm120(clc_mbar_ptr, clc_response_ptr)
-
-    @cute.jit
-    def process_tile_clc(
-        self: cutlass.Constexpr,
-        m_block,
-        num_head,
-        batch_size,
-        split_idx,
-        mQ,
-        mK,
-        mV,
-        mO,
-        mLSE,
-        mCuSeqlensQ,
-        mCuSeqlensK,
-        mSeqUsedQ,
-        mSeqUsedK,
-        mPageTable,
-        mNumSplitsDynamic,
-        mQDescale,
-        mKDescale,
-        mVDescale,
-        softmax_scale_log2,
-        softmax_scale,
-        window_size_left,
-        window_size_right,
-        sQ,
-        sK,
-        sV,
-        sP,
-        sVt,
-        sO_layout,
-        gmem_tiled_copy_Q,
-        gmem_tiled_copy_K,
-        gmem_tiled_copy_V,
-        gmem_tiled_copy_O,
-        tiled_mma_qk,
-        tiled_mma_pv,
-        aux_data,
-        fastdiv_mods,
-        num_splits,
-        tidx,
-        *,
-        loc=None,
-        ip=None,
-    ):
-        block_info = BlockInfo(
-            self.tile_m,
-            self.tile_n,
-            self.is_causal,
-            self.is_local,
-            self.is_split_kv,  # SPLITKV
-            window_size_left,
-            window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-        )
-        seqlen = SeqlenInfoQK.create(
-            batch_idx=batch_size,
-            seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
-            mCuSeqlensQ=mCuSeqlensQ,
-            mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=mSeqUsedQ,
-            mSeqUsedK=mSeqUsedK,
-        )
-        # DYNSPLIT: this sequence's own split count. Splits beyond it come back with
-        # n_block_max <= n_block_min -- the empty-split case the SplitKV patch already handles
-        # (acc_O=0, lse=-inf; combine's scale>0 guard drops them), so nothing else has to change.
-        if const_expr(not self.runtime_balanced_splits):
-            ns_b = num_splits
-            if const_expr(self.dynamic_splits):
-                ns_b = mNumSplitsDynamic[batch_size]
-        n_block_min, n_block_max = block_info.get_n_block_min_max(
-            seqlen, m_block, split_idx, ns_b
-        )
-        # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
-        # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
-        # negative block index for K/V loads; the load/store predicates already
-        # guard all memory accesses when seqlen is 0.
-        n_block = cutlass.max(n_block_max - 1, 0)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get the appropriate tiles for this thread block.
-        # ///////////////////////////////////////////////////////////////////////////////
-        blkQ_shape = (self.tile_m, self.tile_hdim)
-        blkK_shape = (self.tile_n, self.tile_hdim)
-        blkV_shape = (self.tile_n, self.tile_hdimv)
-        # PACKGQA: grid iterates nheads_kv, so num_head IS the kv head already.
-        num_head_kv = num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
-        if const_expr(self.pack_gqa):
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mQ_cur = mQ[None, None, num_head, batch_size]
-            else:
-                # explicit nested-mode offset instead of offset_batch_Q (whose rank-3
-                # domain_offset with None coords misbehaves here)
-                mQ_cur = cute.domain_offset(
-                    ((0, seqlen.offset_q), 0), mQ[None, None, num_head]
-                )
-        elif const_expr(not seqlen.has_cu_seqlens_q):
-            mQ_cur = mQ[None, None, num_head, batch_size]
-        else:
-            # keep the ORIGINAL rank-2 domain_offset: routing the unpacked varlen path through
-            # offset_batch_Q (rank-3 domain_offset with None coords) gave illegal accesses once
-            # m_block > 0 and offset_q > 0 (4x2048 varlen prefill).
-            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
-        mK_pages, mV_pages = None, None
-        if const_expr(self.paged_kv):
-            # PAGED: mK/mV are (page_size, head_dim, head_kv, num_pages) after the layout
-            # transpose -- the 4th mode is the PAGE index, not the batch. Keep it whole and let
-            # load_K/load_V pick the page for each n_block. mK_cur/mV_cur below are only used to
-            # build the copy partitions and predicates, whose layouts do not depend on the page.
-            mK_pages = mK[None, None, num_head_kv, None]
-            mV_pages = mV[None, None, num_head_kv, None]
-            mK_cur = mK[None, None, num_head_kv, 0]
-            mV_cur = mV[None, None, num_head_kv, 0]
-        elif const_expr(not seqlen.has_cu_seqlens_k):
-            mK_cur = mK[None, None, num_head_kv, batch_size]
-            mV_cur = mV[None, None, num_head_kv, batch_size]
-        else:
-            mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
-            mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
-        gQ = (
-            cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-            if const_expr(not self.pack_gqa)
-            else None
-        )
-        gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
-        gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
-
-        gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
-        gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Tile MMA compute thread partitions and allocate accumulators
-        # ///////////////////////////////////////////////////////////////////////////////
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
-        thr_mma_pv = tiled_mma_pv.get_slice(tidx)
-        if const_expr(self.is_fp8):
-            tSrQ = None
-            tSrK = None
-            tOrVt = None
-        else:
-            tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
-            tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
-            tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
-        acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
-        acc_O.fill(0.0)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Smem copy atom tiling
-        # ///////////////////////////////////////////////////////////////////////////////
-        # mma.sync.m16n8k32 consumes four packed 32-bit registers for A and
-        # two for B.  Each ldmatrix.b16 result therefore carries two adjacent
-        # FP8 values.  The m8n16 instruction is for sub-byte unpacking and is
-        # not the native FP8 fragment layout.
-        if const_expr(self.is_fp8):
-            smem_thr_copy_Q = None
-            smem_thr_copy_K = None
-            smem_thr_copy_V = None
-            tSsQ = None
-            tSsK = None
-            tOsVt = None
-        else:
-            smem_copy_atom_QK = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-                self.dtype,
-            )
-            smem_copy_atom_V = cute.make_copy_atom(
-                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-                self.dtype,
-            )
-            smem_thr_copy_Q = utils.make_tiled_copy_A(
-                smem_copy_atom_QK, tiled_mma_qk
-            ).get_slice(tidx)
-            smem_thr_copy_K = utils.make_tiled_copy_B(
-                smem_copy_atom_QK, tiled_mma_qk
-            ).get_slice(tidx)
-            smem_thr_copy_V = utils.make_tiled_copy_B(
-                smem_copy_atom_V, tiled_mma_pv
-            ).get_slice(tidx)
-            tSsQ = smem_thr_copy_Q.partition_S(sQ)
-            tSsK = smem_thr_copy_K.partition_S(sK)
-            tOsVt = smem_thr_copy_V.partition_S(sVt)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
-        # of tile_shape
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Construct identity layout for KV
-        cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
-        tKcK = gmem_thr_copy_K.partition_S(cK)
-        t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
-        if const_expr(self.tile_hdim == self.tile_hdimv):
-            tVcV = tKcK
-            t0VcV = t0KcK
-        else:
-            cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
-            tVcV = gmem_thr_copy_V.partition_S(cV)
-            t0VcV = gmem_thr_copy_V.get_slice(0).partition_S(cV)
-        # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
-        # use "if" on the mn dimension.
-        # This is to reduce register pressure and gets 2-3% performance gain.
-        tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
-        if const_expr(self.same_hdim_kv):
-            tVpV = tKpK
-        else:
-            tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
-
-        qk_descale = Float32(1.0)
-        v_descale = Float32(1.0)
-        tile_softmax_scale_log2 = softmax_scale_log2
-        tile_softmax_scale = softmax_scale
-        if const_expr(self.is_fp8):
-            if const_expr(mQDescale is not None):
-                qk_descale *= Float32(mQDescale[batch_size, num_head_kv])
-            if const_expr(mKDescale is not None):
-                qk_descale *= Float32(mKDescale[batch_size, num_head_kv])
-            if const_expr(mVDescale is not None):
-                v_descale = Float32(mVDescale[batch_size, num_head_kv])
-            tile_softmax_scale_log2 *= qk_descale
-            if const_expr(tile_softmax_scale is not None):
-                tile_softmax_scale *= qk_descale
-
-        # shape: (atom_v_m * rest_m)
-        softmax = Softmax.create(
-            tile_softmax_scale_log2,
-            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
-            softmax_scale=tile_softmax_scale,
-        )
-        softmax.reset()
-
-        # group parameters for compute_one_n_block
-        mma_params = SimpleNamespace(
-            thr_mma_qk=thr_mma_qk,
-            thr_mma_pv=thr_mma_pv,
-            tSrQ=tSrQ,
-            tSrK=tSrK,
-            tOrVt=tOrVt,
-            acc_O=acc_O,
-        )
-        smem_copy_params = SimpleNamespace(
-            smem_thr_copy_Q=smem_thr_copy_Q,
-            smem_thr_copy_K=smem_thr_copy_K,
-            smem_thr_copy_V=smem_thr_copy_V,
-            tSsQ=tSsQ,
-            tSsK=tSsK,
-            tOsVt=tOsVt,
-            sQ=sQ,
-            sK=sK,
-            sV=sV,
-            sP=sP,
-        )
-        load_K = partial(
-            self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k,
-            mKV_pages=mK_pages, mPageTable=mPageTable, page_batch_idx=batch_size,  # PAGED
-            gmem_thr_copy=gmem_thr_copy_K,
-        )
-        load_V = partial(
-            self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k,
-            mKV_pages=mV_pages, mPageTable=mPageTable, page_batch_idx=batch_size,  # PAGED
-            gmem_thr_copy=gmem_thr_copy_V,
-        )
-
-        compute_one_n_block = partial(
-            self.compute_one_n_block,
-            mma_params=mma_params,
-            smem_copy_params=smem_copy_params,
-            softmax=softmax,
-            load_K=load_K,
-            load_V=load_V,
-            score_mod=self.score_mod,
-            batch_idx=batch_size,
-            head_idx=num_head,
-            m_block=m_block,
-            aux_data=aux_data,
-            fastdiv_mods=fastdiv_mods,
-            n_block_min=n_block_min,   # PREFETCHCLAMP
-        )
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Prologue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start async loads of the last mn-tile, where we take care of the mn residue
-        if const_expr(not self.pack_gqa):
-            gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-            self.load_Q(
-                gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1]
-            )
-        else:
-            # PACKGQA: rows of the tile come from qhead_per_kvhead different heads, so the load
-            # is a per-row pointer gather instead of a contiguous tile copy.
-            PackGQA(
-                self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
-            ).load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
-        cute.arch.cp_async_commit_group()
-
-        def preprocess_Q():
-            cute.arch.cp_async_wait_group(self.num_stages * 2 - 1)
-            if const_expr(self.Q_in_regs):
-                cute.arch.barrier()
-                tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-                cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
-
-        # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
-        # read from smem_q to registers, then load V.
-        # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
-        if const_expr(self.Q_in_regs):
-            load_K(n_block, smem_pipe_write=0, need_predicates=True)
-            cute.arch.cp_async_commit_group()
-            preprocess_Q()
-            cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
-
-        for stage in cutlass.range_constexpr(self.num_stages):
-            # PREFETCHCLAMP: `>= n_block_min` instead of `>= 0` -- see the guards in
-            # compute_one_n_block. commit_group() stays unconditional so the pipeline depth the
-            # first preprocess_Q() waits on does not change.
-            if const_expr(not self.Q_in_regs or stage > 0):
-                if stage == 0 or n_block - stage >= n_block_min:
-                    load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                cute.arch.cp_async_commit_group()
-            if const_expr(stage < self.num_stages - 1):
-                if stage == 0 or n_block - stage >= n_block_min:
-                    load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                cute.arch.cp_async_commit_group()
-        if const_expr(not self.Q_in_regs):
-            preprocess_Q()
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Mainloop
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start processing of the first n-block.
-        # For performance reason, we separate out two kinds of iterations:
-        # those that need masking on S, and those that don't.
-        # We need masking on S for the very last block when K and V has length not multiple of tile_n.
-        # We also need masking on S if it's causal, for the last several blocks.
-        mask = AttentionMask(
-            self.tile_m,
-            self.tile_n,
-            seqlen,
-            window_size_left,
-            window_size_right,
-            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-        )
-        mask_fn = partial(
-            mask.apply_mask,
-            batch_idx=batch_size,
-            head_idx=num_head,
-            m_block=m_block,
-            thr_mma=thr_mma_qk,
-            mask_causal=self.is_causal,
-            mask_local=self.is_local,
-            aux_data=aux_data,
-            fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
-        )
-
-        # First iteration with seqlen masking
-        smem_pipe_read = Int32(0)
-        smem_pipe_write = Int32(self.num_stages - 1)
-        # NOREGRESS: the empty-split guard is a runtime branch around a big inlined region;
-        # only the SplitKV path needs it, and paying it unconditionally cost ~8% on the
-        # tile_m=128 prefill config.
-        if const_expr(self.is_split_kv):
-            if n_block_max > n_block_min:  # SPLITKV: empty trailing split does nothing
-                compute_one_n_block(
-                    n_block,
-                    smem_pipe_read,
-                    smem_pipe_write,
-                    is_first_n_block=True,
-                    seqlen=seqlen,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-                )
-        else:
-            compute_one_n_block(
-                n_block,
-                smem_pipe_read,
-                smem_pipe_write,
-                is_first_n_block=True,
-                seqlen=seqlen,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-            )
-        smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # Next couple of iterations with causal masking
-        if const_expr(self.is_causal or self.is_local):
-            n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                seqlen, m_block, n_block_min
-            )
-            # NOREGRESS: original trip count when not splitting.
-            if const_expr(self.is_split_kv):
-                n_mask_count = cutlass.max(n_block_max - 1 - n_block_min_causal_local_mask, 0)
-            else:
-                n_mask_count = n_block_max - 1 - n_block_min_causal_local_mask
-            for n_tile in cutlass.range(n_mask_count, unroll=1):
-                n_block = n_block_max - 2 - n_tile
-                compute_one_n_block(
-                    n_block,
-                    smem_pipe_read,
-                    smem_pipe_write,
-                    seqlen=seqlen,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-                )
-                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # The remaining iterations have no masking
-        # SPLITKV: trip count is RELATIVE to this split's n_block_min (was: absolute n_block),
-        # and clamped so an EMPTY trailing split iterates zero times.
-        # NOREGRESS: keep the original absolute trip count when not splitting.
-        if const_expr(self.is_split_kv):
-            n_tile_count = cutlass.max(n_block - n_block_min, 0)
-        else:
-            n_tile_count = n_block
-        for n_tile in cutlass.range(n_tile_count, unroll=1):
-            compute_one_n_block(
-                n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
-                seqlen=seqlen, is_first_n_block=False,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
-            )
-            smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-            smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # TODO: local
-
-        # normalize acc_O by row_sum and calculate the lse
-        row_scale = softmax.finalize()
-        if const_expr(self.is_fp8):
-            row_scale.store(row_scale.load() * v_descale)
-        softmax.rescale_O(acc_O, row_scale)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Epilogue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # reuse sQ's data iterator
-        sO = cute.make_tensor(
-            cute.recast_ptr(sQ.iterator, dtype=self.output_dtype), sO_layout
-        )
-        self.epilogue(
-            acc_O,
-            softmax.row_sum,
-            split_idx,
-            mO,
-            mLSE,
-            sO,
-            seqlen,
-            gmem_tiled_copy_O,
-            None,
-            tiled_mma_pv,
-            tidx,
-            m_block,
-            num_head,
-            batch_size,
-        )
-
 
     @cute.jit
     def compute_one_n_block(
@@ -2730,13 +1995,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
 
 
-# SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility
-
-# =====================================================================================
-# ATREX PORT: SM120 (Blackwell GeForce / L20N) forward. Same SM80-era MMA, 99 KB SMEM.
-# Subclasses the in-file FlashAttentionForwardSm80 (vendored above) and overrides the SMEM
-# capacity check. Inheriting this implementation keeps the CpAsync code paths (no TMA-O on sm120).
-# =====================================================================================
+# SM120 reuses the CpAsync forward path with a 99 KB shared-memory limit.
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
     @staticmethod

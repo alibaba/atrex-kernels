@@ -10,7 +10,6 @@ from torch._guards import active_fake_mode
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
 
 from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
     use_filesystem_cutlass_dsl_version_hash,

@@ -4,7 +4,7 @@ import os
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple, Callable, Union
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -46,87 +46,6 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
 )
-
-
-_EMPTY_AUX_DATA = AuxData(None, None)
-
-
-@dataclass(frozen=True)
-class _PreparedFlashAttnVarlen:
-    """Compiled varlen forward with sequence-independent host dispatch."""
-
-    kernel: Callable
-    softmax_scale: float
-    head_dim_v: int
-    output_dtype: torch.dtype
-    is_fp8: bool
-    cu_seqlens_q: Optional[torch.Tensor]
-    cu_seqlens_k: Optional[torch.Tensor]
-    seqused_q: Optional[torch.Tensor]
-    seqused_k: Optional[torch.Tensor]
-    page_table: Optional[torch.Tensor]
-    def run(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        out: Optional[torch.Tensor] = None,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_k: Optional[torch.Tensor] = None,
-        seqused_q: Optional[torch.Tensor] = None,
-        seqused_k: Optional[torch.Tensor] = None,
-        page_table: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Launch the prepared kernel without rebuilding the dispatch key.
-
-        Runtime metadata can override the tensors used during ``prepare``.
-        This is required by vLLM, whose graph-stable metadata buffers keep
-        their layout but change contents on every scheduler step.
-        """
-        if out is None:
-            out = torch.empty(
-                *q.shape[:-1],
-                self.head_dim_v,
-                dtype=self.output_dtype,
-                device=q.device,
-            )
-        q_call, k_call, v_call = (t.detach() for t in (q, k, v))
-        if self.is_fp8:
-            # Work around FP8 export until torch >= 2.11 is the minimum.
-            q_call, k_call, v_call = (
-                t.view(torch.uint8)
-                if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                else t
-                for t in (q_call, k_call, v_call)
-            )
-        self.kernel(
-            q_call,
-            k_call,
-            v_call,
-            out.detach(),
-            None,
-            self.softmax_scale,
-            self.cu_seqlens_q if cu_seqlens_q is None else cu_seqlens_q,
-            self.cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
-            self.seqused_q if seqused_q is None else seqused_q,
-            self.seqused_k if seqused_k is None else seqused_k,
-            self.page_table if page_table is None else page_table,
-            # Dynamic split/work-map/request-order, Q/K/V descales, window,
-            # sink, then block-sparse metadata.
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            _EMPTY_AUX_DATA,
-        )
-        return out
 
 
 def _parse_arch_str(arch_str):
@@ -265,7 +184,6 @@ def _flash_attn_fwd(
     seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    min_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -292,24 +210,11 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
-    # ATREX PORT sm120: explicit params (not module globals) for the split-KV/compact-grid path.
-    # num_splits_dynamic: int32 CUDA tensor [num_batch], per-sequence split count (DYNSPLIT).
-    # work_map: int32 CUDA tensor [rows,4] = (m_block, head, batch, split), or the Q1/HKV1
-    # compact form [rows,1] = ((batch << 16) | split), host work map (COMPACTGRID);
-    #   when given the grid launches exactly `rows` CTAs. Both sm120-only; ignored on other arches.
-    num_splits_dynamic: Optional[torch.Tensor] = None,
-    work_map: Optional[torch.Tensor] = None,
-    request_order: Optional[torch.Tensor] = None,
     _runtime_balanced_splits: bool = False,
     _runtime_balanced_grid_size: int = 0,
     _runtime_balanced_batch_size: int = 0,
     _allow_pack_gqa_split: bool = False,
-    _prepare_only: bool = False,
-    _use_clc: bool = False,
-) -> Union[
-    Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
-    _PreparedFlashAttnVarlen,
-]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -577,72 +482,13 @@ def _flash_attn_fwd(
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     # Prefill is causal varlen; decode is non-causal packed GQA with SplitKV.
-    assert not local, "Atrex FA4 sm120 does not support local/sliding-window attention"
+    assert not local, "Atrex SM120 does not support local/sliding-window attention"
     assert cu_seqlens_k is not None or page_table is not None, (
-        "Atrex FA4 sm120 requires varlen or paged K/V"
+        "Atrex SM120 requires varlen or paged K/V"
     )
     assert num_splits <= 256, "num_splits must be <= 256 (combine kernel limit)"
-    if num_splits_dynamic is not None:
-        _validate_tensor(
-            num_splits_dynamic,
-            "num_splits_dynamic",
-            (batch_size,),
-            torch.int32,
-            device,
-        )
-    if work_map is not None:
-        if (
-            work_map.device != device
-            or work_map.dtype != torch.int32
-            or work_map.ndim != 2
-            or work_map.shape[1] not in (1, 4)
-            or not work_map.is_contiguous()
-        ):
-            raise ValueError(
-                "SM120 work_map must be contiguous int32 CUDA [rows, 1|4]"
-            )
-        if work_map.shape[1] == 1 and not (
-            num_splits_dynamic is not None
-            and cu_seqlens_q is not None
-            and max_seqlen_q in (1, 4)
-            and total_q == batch_size * max_seqlen_q
-            and num_head_kv == 1
-        ):
-            raise ValueError(
-                "the compact short-Q work map requires ragged Q1/Q4, one KV head, "
-                "and dynamic split counts"
-            )
-    if request_order is not None:
-        if (
-            request_order.device != device
-            or request_order.dtype != torch.int32
-            or request_order.shape != (batch_size + 1,)
-            or not request_order.is_contiguous()
-        ):
-            raise ValueError(
-                "SM120 request_order must be contiguous int32 CUDA [flag, batch]"
-            )
     # Split-KV and packed GQA can coexist only through the opt-in scatter path.
     is_split_kv = num_splits > 1
-    if request_order is not None and not (
-        is_fp8
-        and causal
-        and page_size in (64, 128)
-        and batch_size == 64
-        and cu_seqlens_q is not None
-        and seqused_k is not None
-        and max_seqlen_q is not None
-        and 5 <= max_seqlen_q <= 2048
-        and total_q == batch_size * max_seqlen_q
-        and not is_split_kv
-        and work_map is None
-        and not _runtime_balanced_splits
-        and not _use_clc
-    ):
-        raise ValueError(
-            "SM120 request_order requires B64 uniform-Q FP8 causal paged "
-            "prefill with page_size 64/128 and no SplitKV"
-        )
     _pgsplit = (
         _allow_pack_gqa_split
         or os.environ.get("ATREX_FA4_PGSPLIT", "0") == "1"
@@ -664,24 +510,6 @@ def _flash_attn_fwd(
         and max_seqlen_k is not None
         and 2 * max_seqlen_q >= max_seqlen_k
     )
-    clc_supported = (
-        is_fp8
-        and causal
-        and cu_seqlens_q is not None
-        and page_size == 64
-        and max_seqlen_q is not None
-        and total_q == batch_size * max_seqlen_q
-        and not is_split_kv
-        and not _runtime_balanced_splits
-        and work_map is None
-    )
-    if _use_clc and not clc_supported:
-        raise ValueError(
-            "SM120 CLC requires uniform-Q FP8 causal paged attention with "
-            "page_size=64 and no SplitKV"
-        )
-    use_clc = _use_clc
-
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -755,12 +583,6 @@ def _flash_attn_fwd(
             assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 128 == 0
-            # if min_seqlen_k is None or causal:
-            #     disable_sparse_kv_bitmask = False
-            # else:
-            #     # seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
-            #     seqlen_k_boundary = min_seqlen_k
-            #     disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
 
         if requires_grad and sparse_kv:
             if cu_seqlens_q is None:
@@ -778,14 +600,10 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
-    # ATREX PORT sm120: fp32 partial buffers for the split-KV combine. Partials MUST be fp32 (the
-    # combine kernel's bf16-partial path faults on this build). Keep them invocation-local so eager
-    # execution can reuse storage through PyTorch's caching allocator and CUDA graphs can own the
-    # storage through their private pools. The kernels write every launched split; compact grids
-    # initialize LSE for slots that are not launched, and the dynamic short-Q reducer never reads
-    # O for a split outside the current request's runtime count.
+    # Split-KV partials are invocation-local. PyTorch reuses eager allocations,
+    # while CUDA graphs retain them in the graph-private pool.
     out_partial = lse_partial = runtime_num_splits = None
-    kernel_num_splits_dynamic = num_splits_dynamic
+    kernel_num_splits_dynamic = None
     if is_split_kv:
         out_partial = torch.empty(
             num_splits,
@@ -806,16 +624,6 @@ def _flash_attn_fwd(
                 batch_size, dtype=torch.int32, device=device
             )
             kernel_num_splits_dynamic = runtime_num_splits
-        use_short_q_dynamic_reducer = (
-            cu_seqlens_q is not None
-            and max_seqlen_q in (1, 2, 3, 4)
-            and total_q == batch_size * max_seqlen_q
-            and lse is None
-            and num_splits <= 256
-            and kernel_num_splits_dynamic is not None
-        )
-        if work_map is not None and not use_short_q_dynamic_reducer:
-            lse_partial.fill_(float("-inf"))
 
     compile_key = (
         device.index,
@@ -853,15 +661,10 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         use_lpt,
-        use_clc,
         arch,
         page_size,
-        # ATREX PORT sm120: DYNSPLIT / COMPACTGRID are constexpr in the kernel; omitting them would
-        # let a compact-grid launch reuse a non-compact cubin (wrong grid decode). page-aligned
-        # Paged-vs-not is already keyed by page_size above.
+        # Dynamic splits change the compiled kernel's optional tensor signature.
         kernel_num_splits_dynamic is not None if is_split_kv else False,
-        work_map.shape[1] if work_map is not None else 0,
-        request_order is not None,
         _runtime_balanced_splits,
         _runtime_balanced_grid_size,
         _runtime_balanced_batch_size,
@@ -898,22 +701,12 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        # ATREX PORT sm120: per-sequence split counts (DYNSPLIT) and host work map (COMPACTGRID).
+        # Runtime-balanced short-Q launches provide per-sequence split counts.
         nsd_tensor = (
             to_cute_tensor(
                 kernel_num_splits_dynamic, assumed_align=4, leading_dim=0
             )
             if kernel_num_splits_dynamic is not None
-            else None
-        )
-        wm_tensor = (
-            to_cute_tensor(work_map, assumed_align=4, leading_dim=1)
-            if work_map is not None
-            else None
-        )
-        request_order_tensor = (
-            to_cute_tensor(request_order, assumed_align=4, leading_dim=0)
-            if request_order is not None
             else None
         )
         q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -968,7 +761,6 @@ def _flash_attn_fwd(
             is_causal=causal,
             is_local=local,
             lpt=use_lpt,
-            use_clc=use_clc,
             pack_gqa=pack_gqa,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -981,16 +773,11 @@ def _flash_attn_fwd(
             is_split_kv=is_split_kv,
             page_size=page_size if page_table is not None else None,
             dynamic_splits=kernel_num_splits_dynamic is not None,
-            compact_grid=work_map is not None,
-            compact_short_q=work_map is not None and work_map.shape[1] == 1,
-            reorder_batch=request_order is not None,
             runtime_balanced_splits=_runtime_balanced_splits,
             runtime_balanced_grid_size=_runtime_balanced_grid_size,
             runtime_balanced_batch_size=_runtime_balanced_batch_size,
         )
         fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
-        fa_fwd.atrex_sm120_prefill_clc_kernel.set_name_prefix("atrex")
-        # TODO: check @can_implement
         if qv is not None:
             with use_filesystem_cutlass_dsl_version_hash():
                 compiled_kernel = cute.compile(
@@ -1031,8 +818,6 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 page_table_tensor,
                 nsd_tensor,
-                wm_tensor,
-                request_order_tensor,
                 q_descale_tensor,
                 k_descale_tensor,
                 v_descale_tensor,
@@ -1050,26 +835,6 @@ def _flash_attn_fwd(
                     *compile_args, options="--enable-tvm-ffi"
                 )
             _flash_attn_fwd.compile_cache[compile_key] = compiled_kernel
-
-    if _prepare_only:
-        assert not is_fake_mode(), "Prepared execution requires a CUDA device"
-        assert q is not None and qv is None, "Prepared execution requires standard Q/K/V"
-        assert not is_split_kv and lse is None, "Prepared execution does not support auxiliary outputs"
-        assert q_descale is None and k_descale is None and v_descale is None
-        assert normalized_block_sparse_tensors is None and aux_tensors is None and not aux_scalars
-        assert window_size_left is None and window_size_right is None and learnable_sink is None
-        return _PreparedFlashAttnVarlen(
-            kernel=_flash_attn_fwd.compile_cache[compile_key],
-            softmax_scale=softmax_scale,
-            head_dim_v=head_dim_v,
-            output_dtype=out_torch_dtype,
-            is_fp8=is_fp8,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            page_table=page_table,
-        )
 
     if not is_fake_mode():
         q_call, k_call, v_call, qv_call = [
@@ -1119,8 +884,6 @@ def _flash_attn_fwd(
                 seqused_k,
                 page_table,
                 kernel_num_splits_dynamic,
-                work_map,
-                request_order,
                 q_descale,
                 k_descale,
                 v_descale,
@@ -1151,7 +914,6 @@ def _flash_attn_fwd(
             and total_q == batch_size * max_seqlen_q
             and lse is None
             and num_splits <= 256
-            and (work_map is None or kernel_num_splits_dynamic is not None)
         )
         if use_short_q_reducer:
             from atrex.src.nvidia.flash_attn.sm120.decode_reduce import sm120_q1_reduce
@@ -1178,10 +940,7 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
-# =====================================================================================
-# ATREX PORT sm120: split-KV combine using the public FlashAttention CuTe kernel.
-# Only reached on the sm120 split-KV path (is_split_kv True).
-# =====================================================================================
+# Split-KV combine uses the public FlashAttention CuTe kernel.
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
@@ -1304,75 +1063,3 @@ def _flash_attn_fwd_combine(
 
 
 _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
-
-
-def flash_attn_varlen_func(
-    q, k, v, qv=None,
-    cu_seqlens_q=None, cu_seqlens_k=None,
-    max_seqlen_q=None, max_seqlen_k=None, min_seqlen_k=None,
-    seqused_q=None, seqused_k=None,
-    gather_kv_indices=None, page_table=None,
-    softmax_scale=None, causal=False, window_size=(None, None),
-    learnable_sink=None, softcap=0.0, num_splits=1, pack_gqa=None,
-    score_mod=None, mask_mod=None, block_sparse_tensors=None,
-    aux_tensors=None, aux_scalars=None, return_lse=False, out=None,
-    num_splits_dynamic=None, work_map=None, request_order=None,
-):
-    """Forward-only varlen attention -> out, or (out, lse) with return_lse.
-
-    Tensor layout: q (total_q, nheads, hdim), k/v (total_k, nheads_k, hdim[_v]),
-    or the (batch, seqlen, ...) form. Paged KV via page_table (+ seqused_k).
-    """
-    aux_scalars = tuple(aux_scalars) if aux_scalars else None
-    if k is v and v.shape[-1] == 512:  # MLA weight-absorbed formula
-        qv = q if qv is None else qv
-        q = k = None
-    out, lse, _, _ = _flash_attn_fwd(
-        q, k, v, qv=qv,
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-        seqused_q=seqused_q, seqused_k=seqused_k,
-        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, min_seqlen_k=min_seqlen_k,
-        page_table=page_table, softmax_scale=softmax_scale, causal=causal,
-        window_size_left=window_size[0], window_size_right=window_size[1],
-        learnable_sink=learnable_sink, softcap=softcap, num_splits=num_splits,
-        pack_gqa=pack_gqa, score_mod=score_mod, mask_mod=mask_mod,
-        block_sparse_tensors=block_sparse_tensors, aux_tensors=aux_tensors,
-        aux_scalars=aux_scalars, return_lse=return_lse,
-        gather_kv_indices=gather_kv_indices, out=out,
-        num_splits_dynamic=num_splits_dynamic, work_map=work_map,
-        request_order=request_order,
-    )
-    return (out, lse) if return_lse else out
-
-
-def prepare_flash_attn_varlen_func(
-    q,
-    k,
-    v,
-    *,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
-    seqused_q=None,
-    seqused_k=None,
-    page_table=None,
-    softmax_scale=None,
-    causal=False,
-    num_splits=1,
-    pack_gqa=None,
-) -> _PreparedFlashAttnVarlen:
-    """Compile and bind a sequence-independent varlen forward launcher."""
-    return _flash_attn_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        page_table=page_table,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        _prepare_only=True,
-    )

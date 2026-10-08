@@ -1,9 +1,4 @@
-"""SM103 attention: public API, numerical/graph and poisoned-workspace regression.
-
-Migrated from master FA4 tests, plus original-page/stride/descale contract cases.
-Optional ATREX_FA_INVENTORY supplies a captured production inventory; the default
-bounded workspace sweep below is synthetic and is not production performance evidence.
-"""
+"""SM103 attention public API, numerical, graph, and workspace tests."""
 
 from __future__ import annotations
 
@@ -38,6 +33,38 @@ def test_descale_type_identity():
     # CuTe DSL validates the annotated class, not just NamedTuple fields.
     from atrex.src.nvidia.flash_attn.sm103 import prefill_cutedsl, prefill_runtime
     assert prefill_runtime.DescaleTensors is prefill_cutedsl.DescaleTensors
+
+
+def test_cold_prefill_prepare_rejects_graph_capture(monkeypatch):
+    from atrex.src.nvidia.flash_attn.sm103 import launch
+
+    monkeypatch.setattr(launch, "_PREFILL_JIT_KEYS", set())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        launch,
+        "_prefill_forward",
+        lambda: pytest.fail("cold specialization must not compile in capture"),
+    )
+    q = torch.empty((1, 8, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.empty((1, 64, 1, 256), device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=256**-0.5,
+        causal=True,
+        pack_gqa=None,
+        softcap=0.0,
+        learnable_sink=None,
+    )
+    with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        launch._ensure_prefill_jit(q, k, k, **kwargs)
+
+    # Non-default features have no matching precompiled default specialization.
+    launch._ensure_prefill_jit(q, k, k, **(kwargs | {"softcap": 1.0}))
+    launch._ensure_prefill_jit(q, k, k, **(kwargs | {"learnable_sink": q[0, :, 0]}))
 
 
 # --------------------------------------------------------------------------- #

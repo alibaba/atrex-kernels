@@ -72,7 +72,6 @@ flash_attn_varlen_func = _lazy_import_and_call(
     "atrex.api.flash_attn",
 )
 
-
 __all__ = (
     "can_use_flash_attn_varlen_func",
     "can_use_chunk_gdn_fwd_cutedsl",

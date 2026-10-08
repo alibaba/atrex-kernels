@@ -425,78 +425,6 @@ def test_sm120_paged_prefill_fp8_auto_schedule(page_size, q_len, kv_len):
     assert replay_rel_l1 < 0.04
 
 
-def test_sm120_paged_prefill_fp8_clc_cuda_graph():
-    """CLC is graph-safe and bitwise matches the unchanged static path."""
-    _requires_sm120()
-    from atrex.src.nvidia.flash_attn.sm120.launch import forward
-
-    torch.manual_seed(13)
-    dev, page_size, hq, hkv, dim = "cuda", 64, 16, 2, 256
-    qlens = [1024, 1024, 1024]
-    kvlens = [1024, 4096, 32768]
-    page_counts = [length // page_size for length in kvlens]
-    q = (torch.randn(sum(qlens), hq, dim, device=dev) * 0.5).to(
-        torch.float8_e4m3fn
-    )
-    k = (
-        torch.randn(sum(page_counts), page_size, hkv, dim, device=dev) * 0.5
-    ).to(torch.float8_e4m3fn)
-    v = (
-        torch.randn(sum(page_counts), page_size, hkv, dim, device=dev) * 0.5
-    ).to(torch.float8_e4m3fn)
-    cu_q = torch.tensor(
-        [0] + torch.tensor(qlens).cumsum(0).tolist(), device=dev, dtype=torch.int32
-    )
-    seqused_k = torch.tensor(kvlens, device=dev, dtype=torch.int32)
-    page_table = torch.zeros(
-        len(qlens), max(page_counts), device=dev, dtype=torch.int32
-    )
-    page_begin = 0
-    for batch_idx, count in enumerate(page_counts):
-        page_table[batch_idx, :count] = torch.arange(
-            page_begin, page_begin + count, device=dev, dtype=torch.int32
-        )
-        page_begin += count
-    descale = torch.ones(len(qlens), hkv, device=dev)
-    scale = 1.0 / math.sqrt(dim)
-
-    def run(out, min_seqlen_k):
-        return forward(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_q,
-            seqused_k=seqused_k,
-            page_table=page_table,
-            max_seqlen_q=max(qlens),
-            max_seqlen_k=max(kvlens),
-            min_seqlen_k=min_seqlen_k,
-            softmax_scale=scale,
-            causal=True,
-            num_splits=0,
-            q_descale=descale,
-            k_descale=descale,
-            v_descale=descale,
-            out=out,
-        )
-
-    static_out = torch.empty_like(q, dtype=torch.bfloat16)
-    clc_out = torch.empty_like(static_out)
-    run(static_out, None)
-    run(clc_out, min(kvlens))
-    torch.cuda.synchronize()
-    assert torch.equal(clc_out, static_out)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        replay_out, _ = run(clc_out, min(kvlens))
-    for _ in range(3):
-        graph.replay()
-    torch.cuda.synchronize()
-    assert replay_out.data_ptr() == clc_out.data_ptr()
-    assert torch.equal(replay_out, static_out)
-
-
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_sm120_paged_prefill_fp8_b64_varlen(page_size):
     """The generic scheduler handles B64 across both 31-request groups."""
@@ -569,7 +497,7 @@ def test_sm120_paged_prefill_fp8_b64_varlen(page_size):
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_sm120_paged_prefill_fp8_b64_cuda_graph(page_size):
-    """B64 device-side request ordering is dynamic and graph-safe."""
+    """B64 paged FP8 prefill matches the static path across graph replays."""
     _requires_sm120()
     from atrex import flash_attn_varlen_func
     from atrex.src.nvidia.flash_attn.sm120.runtime import _flash_attn_fwd
