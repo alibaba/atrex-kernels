@@ -36,39 +36,39 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
-from atrex._vendor.flash_attn.cute.paged_kv import PagedKVManager
-from atrex._vendor.flash_attn.cute.copy_utils import store_shared_remote_fp32x4
-from atrex._vendor.flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from atrex._vendor.flash_attn.cute import utils
-import atrex._vendor.flash_attn.cute.pipeline as pipeline_custom
+from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.copy_utils import store_shared_remote_fp32x4
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import utils
+import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
-from atrex._vendor.flash_attn.cute.mask import AttentionMask
-from atrex._vendor.flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from atrex._vendor.flash_attn.cute.seqlen_info import SeqlenInfoQK
-from atrex._vendor.flash_attn.cute.block_info import BlockInfo
-from atrex._vendor.flash_attn.cute.block_sparsity import BlockSparseTensors
-from atrex._vendor.flash_attn.cute.block_sparse_utils import (
+from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from atrex._vendor.flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
-from atrex._vendor.flash_attn.cute import mma_sm100_desc as sm100_desc
-from atrex._vendor.flash_attn.cute import blackwell_helpers as sm100_utils
-from atrex._vendor.flash_attn.cute.named_barrier import NamedBarrierFwdSm100
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute import mma_sm100_desc as sm100_desc
+from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
-from atrex._vendor.flash_attn.cute.tile_scheduler import (
-    ClcState,
+from flash_attn.cute.tile_scheduler import (
+    SchedulerState,
     SchedulingMode,
     TileSchedulerArguments,
     TileSchedulerProtocol,
     SingleTileVarlenScheduler,
 )
-from atrex._vendor.flash_attn.cute.fa_logging import fa_log, fa_printf
-from atrex._vendor.flash_attn.cute.utils import smid
-from atrex._vendor.flash_attn.cute.utils import AuxData
+from flash_attn.cute.fa_logging import fa_log, fa_printf
+from flash_attn.cute.utils import smid
+from flash_attn.cute.utils import AuxData
 
 
 class SingleTileVarlenScheduler2CTA(SingleTileVarlenScheduler):
@@ -87,7 +87,7 @@ class SingleTileVarlenScheduler2CTA(SingleTileVarlenScheduler):
     def clc_problem_shape(params):
         return ClcDynamicPersistentTileSchedulerParams(
             problem_shape_ntile_mnl=SingleTileVarlenScheduler.get_grid_shape(params),
-            cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
+            cluster_shape_mnk=(params.decoder.cluster_shape_m, 1, 1),
         )
 
 
@@ -1353,7 +1353,7 @@ class FlashAttentionForwardHd256_2CTA_Sm103:
 
         if const_expr(self.use_clc_scheduler):
             block_idx = cute.arch.block_idx()
-            clc = ClcState.create(
+            clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
                     block_idx,
@@ -1364,7 +1364,7 @@ class FlashAttentionForwardHd256_2CTA_Sm103:
                 consumer_state=clc_consumer_state,
                 producer_state=clc_producer_state,
             )
-            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, ctx=clc)
         else:
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
         assert isinstance(tile_scheduler, TileSchedulerProtocol), f"tile_scheduler is not a TileSchedulerProtocol: {type(tile_scheduler)}"

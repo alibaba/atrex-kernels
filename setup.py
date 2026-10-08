@@ -56,33 +56,4 @@ class build_py(_build_py):
                 ignore=SOURCE_IGNORE,
             )
 
-        flash_attn_root = ROOT / "third_party" / "flash-attention"
-        flash_attn_cute = flash_attn_root / "flash_attn" / "cute"
-        flash_attn_license = flash_attn_root / "LICENSE"
-        missing = [
-            str(path)
-            for path in (flash_attn_cute, flash_attn_license)
-            if not path.exists()
-        ]
-        if missing:
-            raise RuntimeError(
-                "FlashAttention CuTe helpers are required for the NVIDIA "
-                "FlashAttention wheel. Run `git submodule update --init "
-                "-- third_party/flash-attention`. Missing: " + ", ".join(missing)
-            )
-
-        packaged_flash_attn = (
-            Path(self.build_lib) / "atrex" / "_vendor" / "flash_attn"
-        )
-        if packaged_flash_attn.exists():
-            shutil.rmtree(packaged_flash_attn)
-        packaged_flash_attn.mkdir(parents=True)
-        shutil.copytree(
-            flash_attn_cute,
-            packaged_flash_attn / "cute",
-            ignore=SOURCE_IGNORE,
-        )
-        shutil.copy2(flash_attn_license, packaged_flash_attn / "LICENSE")
-
-
 setup(cmdclass={"build_py": build_py})

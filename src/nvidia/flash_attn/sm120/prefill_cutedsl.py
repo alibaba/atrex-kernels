@@ -26,20 +26,20 @@ from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 from quack import copy_utils
 from quack import layout_utils
 
-from atrex._vendor.flash_attn.cute import ampere_helpers as sm80_utils
-from atrex._vendor.flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from atrex._vendor.flash_attn.cute import utils
-from atrex._vendor.flash_attn.cute.mask import AttentionMask
-from atrex._vendor.flash_attn.cute.softmax import Softmax, apply_score_mod_inner
-# ATREX PORT: use the atrex-vendored seqlen_info (adds the cu_seqlens phantom-tile OOB clamp;
-# see seqlen_info_sm120.py). All other flash_attn.cute.* helpers stay on the installed b20 pkg.
+from flash_attn.cute import ampere_helpers as sm80_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import utils
+from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
+# ATREX PORT: keep the local seqlen_info OOB clamp; use the installed FA4 package
+# for the other CuTe helpers.
 from atrex.src.nvidia.flash_attn.sm120.seqlen_info import SeqlenInfoQK
-from atrex._vendor.flash_attn.cute.block_info import BlockInfo
-from atrex._vendor.flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
-from atrex._vendor.flash_attn.cute.named_barrier import NamedBarrierFwd
-from atrex._vendor.flash_attn.cute.block_sparsity import BlockSparseTensors
-from atrex._vendor.flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
-from atrex._vendor.flash_attn.cute.utils import AuxData
+from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.named_barrier import NamedBarrierFwd
+from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_attn.cute.utils import AuxData
 
 
 @dsl_user_op
@@ -1932,8 +1932,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # prefill.  That makes each batch occupy the same contiguous range in
         # the flattened launch, so canceled block coordinates can be decoded
         # directly without rerunning the generic warp-prefix varlen mapper.
-        num_batch = tile_sched_params.num_batch
-        num_head_sched = tile_sched_params.num_head
+        num_batch = tile_sched_params.decoder.num_batch
+        num_head_sched = tile_sched_params.decoder.num_head
         num_m_blocks = cute.ceil_div(
             tile_sched_params.total_q // num_batch, self.tile_m
         )
@@ -2800,6 +2800,6 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
 
 def __getattr__(name):
     if name == "FlashAttentionForwardSm90":
-        from atrex._vendor.flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+        from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
         return FlashAttentionForwardSm90
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

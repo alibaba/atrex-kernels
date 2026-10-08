@@ -2,7 +2,6 @@
 
 import os
 import math
-import inspect
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable, Union
@@ -12,74 +11,41 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
     use_filesystem_cutlass_dsl_version_hash,
 )
-from atrex._vendor.flash_attn.cute.cache_utils import get_jit_cache
-from atrex._vendor.flash_attn.cute.testing import is_fake_mode
+from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.testing import is_fake_mode
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-    from atrex._vendor.flash_attn.cute import cute_dsl_ptxas  # noqa: F401
+    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
 
     # Patch to dump ptx and then use system ptxas to compile to cubin
     cute_dsl_ptxas.patch()
 
 
-from atrex._vendor.flash_attn.cute import utils
-from atrex._vendor.flash_attn.cute import fa_logging
-from atrex._vendor.flash_attn.cute.cute_dsl_utils import (
+from flash_attn.cute import utils
+from flash_attn.cute import fa_logging
+from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     get_broadcast_dims,
     to_cute_aux_tensor,
     to_cute_tensor,
 )
 from atrex.src.nvidia.flash_attn.sm120.prefill_cutedsl import FlashAttentionForwardSm120
-from atrex._vendor.flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
-from atrex._vendor.flash_attn.cute.utils import AuxData
-from atrex._vendor.flash_attn.cute.block_sparsity import (
+from flash_attn.cute.utils import AuxData
+from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
 )
-
-
-def _patch_flash_attn_fmax_for_cutlass_dsl_45x() -> None:
-    """Adapt flash-attn-4 b20's fmax helper to the CuTeDSL 4.5.x ABI.
-
-    The 4.5.x generated NVVM binding takes the result type as its first
-    argument.  Flash-attn-4 b20 was published with the newer two-operand
-    spelling, so using a genuinely isolated 4.5.x installation otherwise
-    fails while lowering the softmax reduction.
-    """
-    parameters = tuple(inspect.signature(nvvm.fmax).parameters)
-    if not parameters or parameters[0] != "res":
-        return
-
-    @dsl_user_op
-    def fmax_45x(a, b, c=None, *, loc=None, ip=None):
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
-
-    utils.fmax = fmax_45x
-
-
-_patch_flash_attn_fmax_for_cutlass_dsl_45x()
 
 
 _EMPTY_AUX_DATA = AuxData(None, None)
@@ -1213,12 +1179,11 @@ _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
 # =====================================================================================
-# ATREX PORT sm120: split-KV combine. Vendored verbatim from the flash-attn cute interface
-# (b20 provides only the FlashAttentionForwardCombine kernel class; the Python wrappers live in
-# the interface). Only reached on the sm120 split-KV path (is_split_kv True).
+# ATREX PORT sm120: split-KV combine using the public FlashAttention CuTe kernel.
+# Only reached on the sm120 split-KV path (is_split_kv True).
 # =====================================================================================
 def _compile_fwd_combine(
-    dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
+    dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
@@ -1229,6 +1194,7 @@ def _compile_fwd_combine(
         dtype=dtype,
         dtype_partial=dtype_partial,
         head_dim=head_dim,
+        num_head=num_head,
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
@@ -1317,6 +1283,7 @@ def _flash_attn_fwd_combine(
         dtype,
         dtype_partial,
         head_dim,
+        out.shape[-2],
         tile_m,
         k_block_size,
         log_max_splits,

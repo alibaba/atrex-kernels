@@ -1,6 +1,5 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
-import inspect
 import math
 import os
 from functools import lru_cache
@@ -12,25 +11,23 @@ from torch._guards import active_fake_mode
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm
 
 from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
     use_filesystem_cutlass_dsl_version_hash,
 )
-from atrex._vendor.flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.cache_utils import get_jit_cache
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
-    from atrex._vendor.flash_attn.cute import cute_dsl_ptxas  # noqa: F401
+    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
 
     # Patch to dump ptx and then use system ptxas to compile to cubin
     cute_dsl_ptxas.patch()
 
 
-from atrex._vendor.flash_attn.cute import utils
-from atrex._vendor.flash_attn.cute import fa_logging
-from atrex._vendor.flash_attn.cute.cute_dsl_utils import (
+from flash_attn.cute import utils
+from flash_attn.cute import fa_logging
+from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     to_cute_aux_tensor,
     to_cute_tensor,
@@ -40,43 +37,12 @@ from atrex.src.nvidia.flash_attn.sm103.prefill_cutedsl import (
     FlashAttentionForwardHd256_2CTA_Sm103,
 )
 
-from atrex._vendor.flash_attn.cute.utils import AuxData
-from atrex._vendor.flash_attn.cute.block_sparsity import (
+from flash_attn.cute.utils import AuxData
+from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
 )
-
-
-def _patch_flash_attn_fmax_for_cutlass_dsl_45x() -> None:
-    """Adapt the private FA4 beta20-derived fmax helper to the CuTeDSL 4.5.x ABI.
-
-    The 4.5.x generated NVVM binding takes the result type as its first
-    argument.  Flash-attn-4 b20 was published with the newer two-operand
-    spelling, so using a genuinely isolated 4.5.x installation otherwise
-    fails while lowering the softmax reduction.
-    """
-    parameters = tuple(inspect.signature(nvvm.fmax).parameters)
-    if not parameters or parameters[0] != "res":
-        return
-
-    @dsl_user_op
-    def fmax_45x(a, b, c=None, *, loc=None, ip=None):
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
-
-    utils.fmax = fmax_45x
-
-
-_patch_flash_attn_fmax_for_cutlass_dsl_45x()
 
 
 def is_fake_mode() -> bool:
