@@ -3,5 +3,4 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "third_party/flash-attention"]
 	path = third_party/flash-attention
-	url = git@gitlab.alibaba-inc.com:aka-reference-projects/flash-attention.git
-	branch = atrex_fa4
+	url = https://github.com/Dao-AILab/flash-attention.git
