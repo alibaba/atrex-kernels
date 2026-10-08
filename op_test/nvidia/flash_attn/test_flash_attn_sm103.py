@@ -903,6 +903,18 @@ def test_aka_bf16_q4_uses_unified_api(monkeypatch, ctx_lens):
     assert selected == [True]
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=5e-2)
 
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        flash_attn_varlen_func(**kwargs)
+        torch.cuda.synchronize()
+    kernels = [
+        event.name for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and not event.name.lower().startswith(("memcpy", "memset"))
+    ]
+    assert kernels and all(name.startswith("atrex_aka_") for name in kernels)
+
     if max(ctx_lens) < 1000:
         warmup = torch.cuda.Stream()
         warmup.wait_stream(torch.cuda.current_stream())
