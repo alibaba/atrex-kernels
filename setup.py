@@ -10,6 +10,7 @@ from setuptools.command.build_py import build_py as _build_py
 ROOT = Path(__file__).resolve().parent
 SOURCE_IGNORE = shutil.ignore_patterns(
     ".DS_Store",
+    "._*",
     "__pycache__",
     "*.pyc",
     "*.pyo",
@@ -43,7 +44,7 @@ class build_py(_build_py):
         if missing:
             raise RuntimeError(
                 "CUTLASS headers are required for the NVFP4 fused MoE wheel. "
-                "Run `git submodule update --init --recursive`. Missing: "
+                "Run `git submodule update --init -- third_party/cutlass`. Missing: "
                 + ", ".join(missing)
             )
         if packaged_cutlass.exists():
@@ -54,6 +55,5 @@ class build_py(_build_py):
                 packaged_cutlass / relative_dir,
                 ignore=SOURCE_IGNORE,
             )
-
 
 setup(cmdclass={"build_py": build_py})

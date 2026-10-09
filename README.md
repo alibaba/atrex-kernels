@@ -28,6 +28,8 @@ updated in the same change. The current files are:
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
 op_test/nvidia/flash_attn/test_flash_attn_sm103.py
+op_test/nvidia/flash_attn/test_flash_attn_sm120.py
+op_test/ppu/flash_attn/test_flash_attn_zwm890p.py
 ```
 
 The SM103 Chunk-GDN path integrates the AKA M64 implementation behind the
@@ -38,11 +40,29 @@ shape and metadata domain. Its private launch interface and profiler-visible
 kernels start with `atrex_aka_`. This SM103 prefill path does not support CUDA
 Graph capture and rejects it before metadata synchronization or kernel launch.
 
-The SM103 FlashAttention path exposes the lower-level FA4 ABI used by vLLM and
-currently dispatches only the AKA BF16 q4 specialization for Qwen3.7-Max TP4:
-16 query heads, one KV head, head dimension 256, page size 128, and batch
-sizes 16 through 28. Unsupported calls are rejected before launch so another
-backend can be added as an explicit fallback without changing the public API.
+FlashAttention exposes the lazy public APIs `atrex.flash_attn_varlen_func` and
+`atrex.can_use_flash_attn_varlen_func` with the vLLM-compatible varlen/paged
+contract. Dispatch follows the input tensor's device: NVIDIA SM103 uses the
+FA4 implementation, NVIDIA SM120 uses FA3, and ZW-M890P uses its FP8 FA2/FA3
+implementation. On SM103, eligible BF16 q4 decode calls use the AKA fast path;
+other supported short-Q/decode and prefill calls use the corresponding Atrex
+kernels. Callers can check eligibility with `can_use_flash_attn_varlen_func`;
+unsupported options are rejected rather than silently ignored.
+
+This is a breaking change for callers of the former lower-level SM103 FA4
+signature: use the varlen/paged arguments (`block_table`, `window_size`,
+`s_aux`, `return_softmax_lse`) and its conditional return shape instead of
+`page_table`, separate window bounds, `learnable_sink`, and `return_lse`.
+Existing callers should migrate with the vLLM integration; retaining the
+previous ATREX revision is the rollback path. The NVIDIA package requires
+`flash-attn-4==4.0.0b19`; target environments should not install the classic
+`flash-attn` distribution alongside it because both provide `flash_attn`.
+
+ZW-M890P retains `prep_kv`: each call allocates packed K and V buffers of
+`requests * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
+optional Split-KV partial buffers. For 64 requests at 16K KV length, packed
+K/V total 512 MiB. Account for this invocation-local scratch when sizing the
+serving KV cache; it is not a persistent per-layer cache.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the

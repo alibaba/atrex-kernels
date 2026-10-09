@@ -1,1 +1,1 @@
-"""NVIDIA SM103 FlashAttention launch policy."""
+"""Atrex hardware-specific operator implementations."""
