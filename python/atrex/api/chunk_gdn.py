@@ -587,7 +587,7 @@ def _dispatch_chunk_gdn_prefill(
     """Dispatch single- and multi-sequence prefill to the selected kernel."""
     if cu_seqlens is None:
         cu_seqlens_cpu = torch.tensor(
-            [0, int(q.shape[1])], dtype=torch.int32
+            [0, int(q.shape[1])], device="cpu", dtype=torch.int32
         )
         cu_seqlens = torch.tensor(
             [0, int(q.shape[1])], device=q.device, dtype=torch.int32
@@ -755,7 +755,7 @@ def chunk_gdn_fwd_cutedsl_prewarm_buckets(
             offsets = [0]
             for length in lengths:
                 offsets.append(offsets[-1] + length)
-            cu_cpu = torch.tensor(offsets, dtype=torch.int32)
+            cu_cpu = torch.tensor(offsets, device="cpu", dtype=torch.int32)
             cu = cu_cpu.to(device=dev)
             init = torch.zeros(
                 (len(lengths), SM103_HV, V_DIM, K_DIM),
@@ -804,7 +804,7 @@ def chunk_gdn_fwd_cutedsl_prewarm_buckets(
             )
             for cu_dtype in (torch.int32, torch.int64):
                 cu = torch.tensor([0, seqlen], device=dev, dtype=cu_dtype)
-                cu_cpu = torch.tensor([0, seqlen], dtype=cu_dtype)
+                cu_cpu = torch.tensor([0, seqlen], device="cpu", dtype=cu_dtype)
                 for with_checkpoints in checkpoint_modes:
                     num_checkpoints = seqlen // 64 if with_checkpoints else 0
                     checkpoint_cu_starts = (
