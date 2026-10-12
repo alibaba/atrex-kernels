@@ -1,0 +1,3 @@
+#define device_kernel atrex_ppu_decode_kernel
+#define prepare_varlen_num_blocks_kernel atrex_ppu_decode_prepare_scheduler
+#include "flash_prepare_scheduler.cu"

@@ -35,3 +35,10 @@ that public revision:
 - flashinfer/cute_dsl/attention/gqa_decode_paged.py
 
 The adapted source retains the original copyright and license notice.
+
+PPU FlashAttention decode
+
+The PPU direct-paged decode implementation incorporates FlashAttention-for-SAIL
+and its ACTLASS/ACTLIZE headers with Atrex decode adaptations. Bundled source
+retains its T-Head, Tri Dao, and NVIDIA notices. The original vendor BSD-3-Clause
+license is included in src/ppu/flash_attn/zwm890p/decode/LICENSE.
