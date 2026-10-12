@@ -24,8 +24,8 @@ def validate(call):
     query_heads = q.shape[1]
     if page_size not in (64, 128, 256):
         raise NotImplementedError("PPU decode supports page sizes 64, 128, and 256")
-    if kv_heads <= 0 or query_heads != 16 * kv_heads:
-        raise NotImplementedError("PPU decode currently supports GQA=16")
+    if kv_heads <= 0 or query_heads not in (8 * kv_heads, 16 * kv_heads):
+        raise NotImplementedError("PPU decode currently supports GQA=8 or GQA=16")
     if query not in (1, 4) or not 0 < batch <= 992 or not batch <= q.shape[0] <= batch * query:
         raise NotImplementedError("PPU decode supports nonempty Q1/Q4 requests and batch <= 992")
     if lengths is None or lengths.shape != (batch,) or table.ndim != 2 or table.shape[0] != batch:

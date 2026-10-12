@@ -149,7 +149,7 @@ def test_eager_scratch_not_retained_per_layer_or_shape():
 def test_nonunit_descale_not_silently_ignored(name):
     from atrex import flash_attn_varlen_func
 
-    case = _case(64, [4, 2], [257, 513])
+    case = _case(64, [65, 3], [257, 513])
     case[name] = torch.full((2, 1), .75, dtype=torch.float32, device="cuda")
     with pytest.raises(NotImplementedError, match="descale"):
         flash_attn_varlen_func(**case)
@@ -166,7 +166,7 @@ def test_unit_descales_and_graph(splits):
 def test_unit_scale_mutation_invalidates_validation():
     from atrex import flash_attn_varlen_func
 
-    case = _case(64, [4, 2], [257, 513])
+    case = _case(64, [65, 3], [257, 513])
     case["q_descale"] = torch.ones((1, 1), dtype=torch.float32, device="cuda").expand(2, 1)
     flash_attn_varlen_func(**case)
     case["q_descale"]._base.fill_(.5)
@@ -178,7 +178,7 @@ def test_unversioned_inference_scale_is_not_cached():
     from atrex import flash_attn_varlen_func
 
     with torch.inference_mode():
-        case = _case(64, [4, 2], [257, 513])
+        case = _case(64, [65, 3], [257, 513])
         case["q_descale"] = torch.ones((2, 1), dtype=torch.float32, device="cuda")
         flash_attn_varlen_func(**case)
         case["q_descale"].fill_(.5)
@@ -227,8 +227,8 @@ def _native_decode_reference(case, splits):
 @pytest.mark.parametrize("query,hq,hkv,path", [
     (1, 32, 2, "decode"), (4, 32, 2, "decode"),
     (1, 16, 1, "decode"), (4, 64, 4, "decode"),
-    (1, 8, 1, "prefill"), (2, 8, 1, "prefill"), (5, 8, 1, "prefill"),
-    (4, 8, 1, "prefill"), (65, 8, 1, "prefill"),
+    (1, 8, 1, "decode"), (2, 8, 1, "prefill"), (5, 8, 1, "prefill"),
+    (4, 8, 1, "decode"), (65, 8, 1, "prefill"),
 ])
 def test_prefill_decode_dispatch(query, hq, hkv, path, monkeypatch):
     from atrex import flash_attn_varlen_func
@@ -284,7 +284,7 @@ def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
 
 
 @pytest.mark.parametrize("query", [1, 4])
-@pytest.mark.parametrize("heads", [(16, 1), (32, 2), (64, 4)])
+@pytest.mark.parametrize("heads", [(8, 1), (16, 1), (32, 2), (64, 4)])
 @pytest.mark.parametrize("page_size", [64, 128, 256])
 def test_decode_runtime_heads_and_pages(query, heads, page_size):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
@@ -299,7 +299,7 @@ def test_decode_runtime_heads_and_pages(query, heads, page_size):
         torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
 
 
-@pytest.mark.parametrize("query", [1, 2, 4, 5])
+@pytest.mark.parametrize("query", [2, 5])
 def test_short_q_prefill_fallback_graph(query):
     _check(_case(128, [query, query], [1025, 2049]), graph=True)
 
@@ -392,10 +392,11 @@ def test_decode_unsupported_options_fail_fast(update):
 
 
 @pytest.mark.parametrize("query", [1, 4])
-def test_decode_graph_replay(query):
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_decode_graph_replay(query, heads):
     from atrex import flash_attn_varlen_func
 
-    case = build_case(64, [query, query], [1025, 2049], hq=32, hkv=2)
+    case = build_case(64, [query, query], [1025, 2049], hq=heads[0], hkv=heads[1])
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
     flash_attn_varlen_func(**case, out=out)
     torch.cuda.synchronize()
@@ -411,8 +412,9 @@ def test_decode_graph_replay(query):
 
 
 @pytest.mark.parametrize("query", [1, 4])
-def test_decode_real_kernel_events(query):
-    case = build_case(64, [query, query], [1025, 2049], hq=32, hkv=2)
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_decode_real_kernel_events(query, heads):
+    case = build_case(64, [query, query], [1025, 2049], hq=heads[0], hkv=heads[1])
     names = profile_case(case)
     assert any("atrex_ppu_decode_prepare_scheduler" in name for name in names)
     assert any("atrex_ppu_decode_kernel" in name for name in names)
@@ -633,6 +635,21 @@ def _benchmark_revision(contract, output_path, splits=0, descales="none"):
         json.dump(dict(contract=contract, atrex_path=atrex.__file__,
                        device=torch.cuda.get_device_name(), torch_version=torch.__version__,
                        cases=records), handle, indent=2)
+
+
+
+
+@pytest.mark.parametrize("query", [1, 4])
+def test_decode_gqa8_expanded_unit_descales(query):
+    from atrex import flash_attn_varlen_func
+
+    q_lens = [1, 1, 1] if query == 1 else [4, 1, 3]
+    case = build_case(64, q_lens, [127, 1025, 2049], hq=8, hkv=1)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = torch.ones((1, 1), device="cuda", dtype=torch.float32).expand(3, 1)
+    expected = _native_decode_reference(case, 0)
+    actual = flash_attn_varlen_func(**case)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
 
 
 if __name__ == '__main__':

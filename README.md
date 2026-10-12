@@ -70,10 +70,10 @@ try decode; only unsupported capabilities (`NotImplementedError`) fall back
 to the original Atrex prefill implementation. Value/launch/compilation errors
 are not swallowed. The dispatch layer does not encode a model's head count
 or page size. Each implementation owns its side-effect-free eligibility.
-The decode backend currently supports GQA=16, head dimension 256, page sizes
+The decode backend currently supports GQA=8 or GQA=16, head dimension 256, page sizes
 64/128/256, and maximum query length 1 or 4. Query/KV head counts and page size
 are read from the caller's tensors and passed into the native entry; verified
-head configurations include 16/1, 32/2, and 64/4. Other short-Q calls run the
+head configurations include 8/1, 16/1, 32/2, and 64/4. Other short-Q calls run the
 existing 8/1-head prefill path when eligible; calls unsupported by both paths
 fail explicitly. The existing prefill runtime and kernel source are unchanged.
 Decode supports FA3, causal full-window attention, BF16 output, and per-request
