@@ -1,7 +1,4 @@
-"""Short-Q decode first, with capability-based Atrex prefill fallback."""
-
-
-_PREFILL_READY_DEVICES = set()
+"""Select native decode or prefill using the same side-effect-free contract."""
 
 
 def _normalized_call(arguments):
@@ -24,53 +21,31 @@ def _is_short_q(call):
     return query is not None and 1 <= query <= 5
 
 
-def validate(arguments, *, eligibility_only=False):
-    call = _normalized_call(arguments)
+def _select(call, *, eligibility_only=False):
     if _is_short_q(call):
         from .decode_runtime import validate as validate_decode
 
         try:
             validate_decode(call)
-            return
+            return "decode"
         except NotImplementedError:
             pass
     from .prefill_contract import validate as validate_prefill
 
     validate_prefill(call, eligibility_only=eligibility_only)
+    return "prefill"
 
 
-def _ensure_prefill_jit(call):
-    from .prefill_contract import validate as validate_prefill
-
-    try:
-        validate_prefill(call)
-    except NotImplementedError:
-        return
-    if call["q"].shape[0] == 0 or call["max_seqlen_k"] == 0:
-        return
-    device = call["q"].device
-    if device in _PREFILL_READY_DEVICES:
-        return
-    import torch
-
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("Prewarm the PPU short-Q fallback before CUDA graph capture")
-    from .runtime import _launch
-
-    _launch.build(device)
-    _PREFILL_READY_DEVICES.add(device)
+def validate(arguments, *, eligibility_only=False):
+    _select(_normalized_call(arguments), eligibility_only=eligibility_only)
 
 
 def forward(*, fa_version=None, **kwargs):
     call = _normalized_call(dict(kwargs, fa_version=fa_version))
-    if _is_short_q(call):
-        _ensure_prefill_jit(call)
+    if _select(call) == "decode":
         from .decode_runtime import forward as decode_forward
 
-        try:
-            return decode_forward(fa_version=fa_version, **kwargs)
-        except NotImplementedError:
-            pass
+        return decode_forward(fa_version=fa_version, **kwargs)
     from .runtime import forward as prefill_forward
 
     return prefill_forward(**kwargs)
