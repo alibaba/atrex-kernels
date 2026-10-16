@@ -26,8 +26,8 @@ def validate(call):
         raise NotImplementedError("PPU decode supports page sizes 64, 128, and 256")
     if kv_heads <= 0 or query_heads not in (8 * kv_heads, 16 * kv_heads):
         raise NotImplementedError("PPU decode currently supports GQA=8 or GQA=16")
-    if query not in (1, 4) or not 0 < batch <= 992 or not batch <= q.shape[0] <= batch * query:
-        raise NotImplementedError("PPU decode supports nonempty Q1/Q4 requests and batch <= 992")
+    if query not in range(1, 6) or not 0 < batch <= 992 or not batch <= q.shape[0] <= batch * query:
+        raise NotImplementedError("PPU decode supports nonempty Q1-Q5 requests and batch <= 992")
     if lengths is None or lengths.shape != (batch,) or table.ndim != 2 or table.shape[0] != batch:
         raise ValueError("Inconsistent PPU decode sequence metadata")
     if not offsets.is_contiguous() or not lengths.is_contiguous() or table.stride(-1) != 1:
@@ -43,8 +43,6 @@ def validate(call):
     splits = call["num_splits"]
     if not isinstance(splits, int) or splits not in range(33):
         raise NotImplementedError("PPU decode supports num_splits from 0 to 32")
-    if query == 4 and (splits > 1 or (splits == 0 and call["max_seqlen_k"] < 1024)):
-        raise NotImplementedError("PPU Q4 decode supports automatic long-KV or num_splits=1")
     for tensor in (q, k, v):
         if tensor.stride(-1) != 1 or any(stride <= 0 for stride in tensor.stride()) or tensor.data_ptr() % 16:
             raise ValueError("PPU decode requires positive strides and aligned pointers")

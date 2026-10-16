@@ -1,4 +1,4 @@
-"""Lazy HGCC builds of native PPU Q1/Q4 decode."""
+"""Lazy HGCC builds of native PPU single- and multi-query decode."""
 
 import ctypes
 from functools import lru_cache

@@ -67,10 +67,10 @@ serving KV cache; it is not a persistent per-layer cache.
 
 ZW-M890P direct-paged decode uses the same API with FA3, FP8 E4M3 inputs,
 BF16 output, causal full-window attention, head dimension 256, GQA 8/16,
-page sizes 64/128/256, and maximum query length 1 or 4. FP32 descales have
+page sizes 64/128/256, and maximum query lengths 1 through 5. FP32 descales have
 shape `[batch,num_kv_heads]` (omitted means one); LSE is not supported.
-Q1 accepts `num_splits=0..32`; Q4 accepts automatic splitting for KV lengths
-of at least 1024, or explicit `num_splits=1`. Ineligible short-Q calls use the unchanged
+All decode paths accept `num_splits=0..32`, without a minimum KV length for
+automatic splitting. Ineligible short-Q calls use the unchanged
 prefill path only when its contract also matches; otherwise they fail explicitly.
 Decode reads `block_table` directly with invocation-local scratch, without KV
 packing or persistent input caches. HGCC lazily compiles `native_decode.cu`

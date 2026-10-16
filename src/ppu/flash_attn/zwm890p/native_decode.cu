@@ -6,6 +6,14 @@ constexpr int NativeKeyRows = 32;
 constexpr int NativeKeyHalves = NativeKeyRows / 16;
 constexpr int NativeTileBytes = NativeKeyRows * 256;
 
+template<int Query, int Group>
+struct NativeGeometry {
+    static constexpr int Rows = Query == 1 ? 16 : ((Query * Group + 15) / 16) * 16;
+    static constexpr int Threads = Query == 1 ? 64 : Rows * 2;
+    static constexpr int KeyOffset = Rows * 256 > NativeTileBytes * 2 ? Rows * 256 : NativeTileBytes * 2;
+    static constexpr int SharedBytes = KeyOffset + NativeTileBytes;
+};
+
 template<bool Value>
 struct NativeFlag {
     static constexpr bool value = Value;
@@ -219,7 +227,7 @@ __device__ __forceinline__ unsigned int native_transpose_source(const unsigned i
 
 template<int Threads>
 __device__ __forceinline__ void native_transpose(const unsigned char* __restrict__ source, unsigned char* __restrict__ destination) {
-    constexpr int CopyThreads = Threads > 128 ? 128 : Threads;
+    constexpr int CopyThreads = Threads >= 128 ? 128 : 64;
     if (threadIdx.x >= CopyThreads) return;
     #pragma unroll
     for (int copy = 0; copy < NativeKeyRows * 4 / CopyThreads; ++copy) {
@@ -402,7 +410,7 @@ template<int Query, int Group>
 __device__ __forceinline__ void native_decode_task(const DecodeParams& params, int split, int head, int request,
                                                   int active_splits, unsigned char* shared_keys,
                                                   unsigned char* shared_values, unsigned char* shared_transposed) {
-    constexpr int Threads = Query == 1 ? 64 : Query * Group * 2;
+    constexpr int Threads = NativeGeometry<Query, Group>::Threads;
     constexpr int OutputTiles = Query == 1 ? 8 : 16;
     constexpr int ActiveRows = Query == 1 && Group == 8 ? 1 : 2;
     int lane = threadIdx.x & 31;
@@ -423,7 +431,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     unsigned int query_fragments[8][4];
     const unsigned char* queries = static_cast<const unsigned char*>(params.queries);
     __syncthreads();
-    constexpr int QueryRows = Query == 1 ? 16 : Query * Group;
+    constexpr int QueryRows = NativeGeometry<Query, Group>::Rows;
     #pragma unroll
     for (int copy = 0; copy < QueryRows * 16 / Threads; ++copy) {
         int vector = threadIdx.x + copy * Threads;
@@ -724,12 +732,12 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params) {
 }
 
 template<int Query, int Group, bool Persistent>
-__global__ __launch_bounds__(Query == 1 ? 64 : Query * Group * 2)
+__global__ __launch_bounds__((NativeGeometry<Query, Group>::Threads))
 void atrex_ppu_native_decode_kernel(DecodeParams params) {
-    __shared__ __align__(128) unsigned char storage[NativeTileBytes * 3];
+    __shared__ __align__(128) unsigned char storage[NativeGeometry<Query, Group>::SharedBytes];
     unsigned char* shared_keys = storage;
     unsigned char* shared_values = storage + NativeTileBytes;
-    unsigned char* shared_transposed = storage + NativeTileBytes * 2;
+    unsigned char* shared_transposed = storage + NativeGeometry<Query, Group>::KeyOffset;
     if constexpr (Persistent) {
         int* plan = static_cast<int*>(params.plan);
         volatile int* task_mailbox = reinterpret_cast<volatile int*>(shared_transposed);
@@ -817,7 +825,7 @@ __global__ void atrex_ppu_native_decode_combine(DecodeParams params) {
 
 template<int Query, int Group>
 int native_launch(DecodeParams params, hggcStream_t stream) {
-    constexpr int Threads = Query == 1 ? 64 : Query * Group * 2;
+    constexpr int Threads = NativeGeometry<Query, Group>::Threads;
     dim3 grid(params.splits, params.kv_heads, params.batch);
     if (params.automatic) {
         params.average_splits = native_average_splits(params);
@@ -902,6 +910,10 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     return native_launch<1, 16>(params, static_cast<hggcStream_t>(stream_pointer));
 #else
     params.splits = splits ? splits : 32;
+    if (params.max_query == 5) {
+        if (metadata[24] / metadata[25] == 8) return native_launch<5, 8>(params, static_cast<hggcStream_t>(stream_pointer));
+        return native_launch<5, 16>(params, static_cast<hggcStream_t>(stream_pointer));
+    }
     if (metadata[24] / metadata[25] == 8) return native_launch<4, 8>(params, static_cast<hggcStream_t>(stream_pointer));
     return native_launch<4, 16>(params, static_cast<hggcStream_t>(stream_pointer));
 #endif
