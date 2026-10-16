@@ -58,11 +58,26 @@ previous ATREX revision is the rollback path. The NVIDIA package requires
 `flash-attn-4==4.0.0b19`; target environments should not install the classic
 `flash-attn` distribution alongside it because both provide `flash_attn`.
 
-ZW-M890P retains `prep_kv`: each call allocates packed K and V buffers of
+ZW-M890P's existing 8-query-head / 1-KV-head prefill path retains `prep_kv`:
+each call allocates packed K and V buffers of
 `requests * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
 optional Split-KV partial buffers. For 64 requests at 16K KV length, packed
 K/V total 512 MiB. Account for this invocation-local scratch when sizing the
 serving KV cache; it is not a persistent per-layer cache.
+
+ZW-M890P direct-paged decode uses the same API with FA3, FP8 E4M3 inputs,
+BF16 output, causal full-window attention, head dimension 256, GQA 8/16,
+page sizes 64/128/256, and maximum query length 1 or 4. FP32 descales have
+shape `[batch,num_kv_heads]` (omitted means one); LSE is not supported.
+Q1 accepts `num_splits=0..32`; Q4 accepts automatic splitting for KV lengths
+of at least 1024, or explicit `num_splits=1`. Ineligible short-Q calls use the unchanged
+prefill path only when its contract also matches; otherwise they fail explicitly.
+Decode reads `block_table` directly with invocation-local scratch, without KV
+packing or persistent input caches. HGCC lazily compiles `native_decode.cu`
+using PPU SDK headers, without PPU CuTe/ACTLASS. Prewarm each required path
+before CUDA Graph capture. Target tests include native-FA3 correctness,
+dispatch, graph replay, real kernel events, and `--decode-benchmark-output`.
+Use `--decode-parity-inputs A1 B1 B2 A2` to check the 5% performance gate.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
