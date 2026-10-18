@@ -113,6 +113,23 @@ def test_original_prep_kv_contract(page_size, contiguous, splits, q_lens, kv_len
     _check(case, splits=splits)
 
 
+@pytest.mark.parametrize("length", [63, 64, 65, 127, 128, 129, 255, 256, 257])
+@pytest.mark.parametrize("page_size", [64, 256])
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+@pytest.mark.parametrize("splits", [1, 4])
+def test_prep_kv_masks_nan_v_padding(length, page_size, heads, splits):
+    case = build_case(page_size, [17, 18], [length, length + 2],
+                      hq=heads[0], hkv=heads[1])
+    for request, kv_len in enumerate((length, length + 2)):
+        tail = kv_len % page_size
+        if tail:
+            page = int(case["block_table"][request, kv_len // page_size])
+            case["v"][page, tail:].view(torch.uint8).fill_(0x7f)
+    expected, _ = reference(case)
+    assert torch.isfinite(expected).all()
+    _check(case, splits=splits)
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("splits", [1, 4])
 def test_graph_replay(page_size, splits):
@@ -809,6 +826,77 @@ def _benchmark_revision(contract, output_path, splits=0, descales="none"):
                        cases=records), handle, indent=2)
 
 
+def _benchmark_prep_kv_tail(output_path):
+    """Same-input full-page/tail A/B, including the public API and prep alone."""
+    import gc
+    import os
+    from pathlib import Path
+    import statistics
+    import atrex
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import runtime
+
+    def measure(call):
+        for _ in range(5):
+            call()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(10):
+                call()
+        for _ in range(10):
+            graph.replay()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        samples = []
+        for _ in range(31):
+            start.record()
+            graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) * 1000 / 10)
+        return dict(median_us=statistics.median(samples), samples_us=samples)
+
+    payload = dict(complete=False, atrex_path=atrex.__file__,
+                   revision=os.environ.get("ATREX_TEST_REVISION"),
+                   device=torch.cuda.get_device_name(), cases=[])
+    for hq, hkv in ((8, 1), (32, 2)):
+        for batch, nq, nk in ((1, 256, 256), (1, 4096, 4096),
+                              (8, 32, 4096), (32, 32, 4096),
+                              (1, 17, 65536), (8, 32, 65536)):
+            for tail in (0, 1):
+                case = build_case(64, [nq] * batch, [nk + tail] * batch,
+                                  hq=hq, hkv=hkv)
+                case["k"], case["v"] = case["k"].contiguous(), case["v"].contiguous()
+                for name in ("q_descale", "k_descale", "v_descale"):
+                    case[name].fill_(1.)
+                out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+                invoke = partial(flash_attn_varlen_func, **case, out=out, num_splits=1)
+                actual = invoke()
+                expected, _ = reference(case)
+                torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
+                pages = (nk + tail + 63) // 64
+                packed_k = torch.empty(batch * hkv * pages * 16384,
+                                       dtype=torch.uint8, device="cuda")
+                packed_v = torch.empty_like(packed_k)
+                kscale = torch.empty(batch * hkv * pages, device="cuda")
+                vamax = torch.empty(batch * hkv * 256, device="cuda")
+                prep = partial(runtime._launch.build(case["q"].device).prep_kv,
+                               case["k"], case["v"], case["block_table"],
+                               case["seqused_k"], packed_k, packed_v, kscale, vamax, pages)
+                row = dict(batch=batch, query=nq, kv=nk + tail, heads=[hq, hkv],
+                           prep=measure(prep), public_api=measure(invoke))
+                payload["cases"].append(row)
+                Path(output_path).write_text(json.dumps(payload, indent=2) + "\n")
+                print(json.dumps({k: v for k, v in row.items()
+                                  if k not in ("prep", "public_api")}), flush=True)
+                del invoke, prep, case, out, actual, expected, packed_k, packed_v, kscale, vamax
+                gc.collect()
+                torch.cuda.empty_cache()
+    payload["complete"] = True
+    Path(output_path).write_text(json.dumps(payload, indent=2) + "\n")
+
+
 
 
 @pytest.mark.parametrize("query", range(1, 6))
@@ -831,6 +919,7 @@ if __name__ == '__main__':
     mode.add_argument('--benchmark-contract', choices=['legacy', 'current'])
     mode.add_argument('--decode-benchmark-output')
     mode.add_argument('--decode-parity-inputs', nargs=4, metavar=('A1', 'B1', 'B2', 'A2'))
+    mode.add_argument('--prep-kv-tail-benchmark-output')
     parser.add_argument('--benchmark-output')
     parser.add_argument('--decode-heads', nargs='+', choices=['8/1', '32/2'], default=['8/1', '32/2'])
     parser.add_argument('--decode-queries', nargs='+', type=int, choices=range(1, 6), default=[1, 4])
@@ -839,6 +928,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.decode_parity_inputs:
         _check_decode_parity(args.decode_parity_inputs)
+    elif args.prep_kv_tail_benchmark_output:
+        _benchmark_prep_kv_tail(args.prep_kv_tail_benchmark_output)
     elif args.decode_benchmark_output:
         _benchmark_decode(args.decode_benchmark_output, args.decode_heads, args.decode_queries)
     elif args.benchmark_contract and args.benchmark_output:

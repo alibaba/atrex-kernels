@@ -932,11 +932,25 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
       reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension) / 2] = code.x;
       reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension + 4) / 2] = code.y;
     }
+    if ((p + 1) * PAGE <= kv_len) {
 #pragma unroll
-    for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
-      const int e = (c * NTHREADS + tid) * 16;
-      *reinterpret_cast<uint4*>(Vs + e) = *reinterpret_cast<const uint4*>(
-          vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
+      for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
+        const int e = (c * NTHREADS + tid) * 16;
+        *reinterpret_cast<uint4*>(Vs + e) = *reinterpret_cast<const uint4*>(
+            vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
+      }
+    } else {
+      // Mask before PV: zero attention weights do not suppress NaN V padding.
+#pragma unroll
+      for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
+        const int e = (c * NTHREADS + tid) * 16;
+        uint4 value = make_uint4(0, 0, 0, 0);
+        if (p * PAGE + e / HEAD_DIM < kv_len) {
+          value = *reinterpret_cast<const uint4*>(
+              vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
+        }
+        *reinterpret_cast<uint4*>(Vs + e) = value;
+      }
     }
     __syncthreads();
     u32 pack[16];
