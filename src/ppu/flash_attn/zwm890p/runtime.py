@@ -6,7 +6,11 @@ from atrex.core.compile_cu import cuda_kernel
 
 
 @cuda_kernel(
-    sources=("ppu/flash_attn/zwm890p/kernel.cu",),
+    sources=(
+        "ppu/flash_attn/zwm890p/kernel.cu",
+        "ppu/flash_attn/zwm890p/prefill_general.cu",
+    ),
+    include_dirs=("ppu/flash_attn/zwm890p/include",),
     module_name="atrex_ppu_flash_attn_prepared",
     function_name="attn",
 )

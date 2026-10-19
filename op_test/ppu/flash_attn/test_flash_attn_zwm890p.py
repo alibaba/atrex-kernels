@@ -142,6 +142,37 @@ def test_real_kernel_events():
     names = profile_case(_case(64, [65, 3], [257, 513], contiguous=True))
     assert any("atrex_ppu_prep_raw" in name for name in names)
     assert any("atrex_ppu_attn" in name for name in names)
+    assert not any("atrex_ppu_attn_general" in name for name in names)
+
+
+def test_prefill_fast_path_source_matches_main():
+    import hashlib
+
+    from atrex.core.compile_cu import _atrex_source_root
+    from atrex.src.ppu.flash_attn.zwm890p import runtime
+
+    root = _atrex_source_root() / "ppu/flash_attn/zwm890p"
+    source = (root / "kernel.cu").read_text()
+    expected = (
+        ("template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>",
+         "// ==================================================================================== KERNEL 3",
+         "9a3f45b8c00c7c87bbed21c8a741e4b8dcfe2d3d24f454b6cdbab2d3cedcc8e5"),
+        ("template <bool GROUPED>\nvoid launch_attn", "\nvoid combine(",
+         "0b7459b26861ad2caae904ce40bc9d0884c0b8929e298b839b72f347aa83bf91"),
+    )
+    for first, last, digest in expected:
+        start = source.index(first)
+        segment = source[start:source.index(last, start)].rstrip() + "\n"
+        assert hashlib.sha256(segment.encode()).hexdigest() == digest
+    general = (root / "prefill_general.cu").read_text()
+    assert "void atrex_ppu_attn_general(" in general
+    assert "void atrex_ppu_attn(" not in general
+    assert "bool GENERAL" not in source
+    assert runtime._launch.jit_spec.sources == (
+        "ppu/flash_attn/zwm890p/kernel.cu",
+        "ppu/flash_attn/zwm890p/prefill_general.cu",
+    )
+    assert runtime._launch.jit_spec.include_dirs == ("ppu/flash_attn/zwm890p/include",)
 
 
 def test_eager_scratch_not_retained_per_layer_or_shape():
@@ -549,7 +580,7 @@ def test_general_prefill_real_kernel_events():
     case["v"] = case["v"].contiguous()
     names = profile_case(case)
     assert any("atrex_ppu_prep_raw" in name for name in names)
-    assert any("atrex_ppu_attn" in name and "true" in name for name in names)
+    assert any("atrex_ppu_attn_general" in name for name in names)
     assert not any("atrex_ppu_native_decode_kernel" in name for name in names)
 
 

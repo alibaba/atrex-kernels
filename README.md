@@ -61,7 +61,11 @@ previous ATREX revision is the rollback path. The NVIDIA package requires
 ZW-M890P prefill supports contiguous D256 FP8 Q, paged K/V with page sizes
 divisible by 64, and GQA ratios divisible by four (including heads 8/1 and 32/2).
 It consumes optional FP32 `[batch,num_kv_heads]` descales on every call/replay.
-The original 8/1, implicit-unit-scale specialization is retained. Prefill uses `prep_kv`:
+The original 8/1, implicit-unit-scale kernel signature, body, and launcher are
+retained from main (`43798a6f`). Other heads/scales use the independent
+`atrex_ppu_attn_general` kernel in a separate CUDA translation unit. Both share
+the same local layout/instruction helpers; this adds no third-party dependency.
+Prefill uses `prep_kv`:
 each call allocates packed K and V buffers of
 `requests * num_kv_heads * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
 optional Split-KV partial buffers. For 64 requests at 16K KV length, packed
