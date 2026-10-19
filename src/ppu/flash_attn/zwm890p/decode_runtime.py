@@ -104,7 +104,7 @@ def forward(
               compute_units, query_heads, kv_heads]
     metadata = (ctypes.c_int64 * len(values))(*values)
     status = library.atrex_ppu_decode(
-        pointers, metadata, softmax_scale, num_splits, 5 if max_seqlen_q == 1 else 4,
+        pointers, metadata, softmax_scale, num_splits,
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     if status:

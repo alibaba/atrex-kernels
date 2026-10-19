@@ -28,10 +28,6 @@ def _page_view(tensor):
     """Original zero-copy view of interleaved blocks as 64-token pages."""
     num_blocks, block_size, num_heads, head_dim = map(int, tensor.shape)
     block_elements = block_size * num_heads * head_dim
-    if tuple(tensor.stride()[1:]) != (num_heads * head_dim, head_dim, 1):
-        raise NotImplementedError("Original PPU prep_kv requires contiguous rows within each block")
-    if tensor.stride(0) <= 0 or tensor.stride(0) % block_elements:
-        raise NotImplementedError("Original PPU prep_kv requires an integral block stride")
     interleave = tensor.stride(0) // block_elements
     subpages = block_size // 64
     virtual_stride = interleave * subpages
@@ -74,39 +70,24 @@ def forward(
     from .prefill_contract import validate
 
     validate(_normalized_call(locals()))
-    if k.shape[1] < 64 or k.shape[1] % 64:
-        raise NotImplementedError("Original PPU prep_kv requires page_size to be a multiple of 64")
-    for tensor in (k, v):
-        if tensor.stride(-1) != 1 or any(s <= 0 for s in tensor.stride()):
-            raise ValueError("PPU KV requires positive strides and contiguous head dimensions")
-        if tensor.numel() and tensor.data_ptr() % 16:
-            raise ValueError("Original PPU prep_kv requires 16-byte aligned cache pointers")
     key_view, virtual_stride, subpages = _page_view(k)
-    value_view, value_stride, value_subpages = _page_view(v)
-    if (virtual_stride, subpages) != (value_stride, value_subpages):
-        raise NotImplementedError("Original PPU prep_kv requires matching K/V block layouts")
-    if not causal or window_size_left is not None or window_size_right is not None:
-        raise NotImplementedError("PPU attention currently supports causal full-window attention")
-    if softcap or learnable_sink is not None:
-        raise NotImplementedError("PPU attention does not support softcap or sinks")
-    if cu_seqlens_k is not None or page_table is None or seqused_k is None:
+    value_view = _page_view(v)[0]
+    if cu_seqlens_k is not None:
         raise NotImplementedError("PPU attention requires paged KV and seqused_k")
     requests = cu_seqlens_q.numel() - 1
     if cu_seqlens_q.ndim != 1 or requests < 0:
         raise ValueError("Invalid cu_seqlens_q")
-    if seqused_k.shape != (requests,) or page_table.ndim != 2 or page_table.shape[0] != requests:
+    if page_table.ndim != 2:
         raise ValueError("Sequence metadata batch dimensions must match")
     for tensor in (cu_seqlens_q, seqused_k, page_table):
         if tensor.dtype != torch.int32 or tensor.device != q.device or tensor.stride(-1) != 1:
             raise ValueError("Sequence metadata must be device int32 with contiguous rows")
     if not cu_seqlens_q.is_contiguous() or not seqused_k.is_contiguous():
         raise ValueError("Sequence lengths must be contiguous")
-    if max_seqlen_k < 0 or max_seqlen_k > page_table.shape[1] * k.shape[1]:
+    if max_seqlen_k < 0:
         raise ValueError("Page table does not cover max_seqlen_k")
     if max_seqlen_q < 0:
         raise ValueError("max_seqlen_q must be nonnegative")
-    if return_lse:
-        raise NotImplementedError("Original PPU kernel does not return softmax LSE")
     if out is None:
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     elif out.shape != q.shape or out.dtype != torch.bfloat16 or out.device != q.device or not out.is_contiguous():

@@ -851,7 +851,7 @@ int native_launch(DecodeParams params, hggcStream_t stream) {
 }
 
 extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
-                                int splits, int variant, void* stream_pointer) {
+                                int splits, void* stream_pointer) {
     DecodeParams params{};
     if (metadata[0] < 0 || metadata[0] > INT32_MAX) return static_cast<int>(hggcErrorInvalidValue);
     if (metadata[1] < 0 || metadata[1] > INT32_MAX) return static_cast<int>(hggcErrorInvalidValue);

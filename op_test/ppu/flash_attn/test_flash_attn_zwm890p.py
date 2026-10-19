@@ -433,6 +433,28 @@ def test_shared_decode_sources_and_independent_specializations():
     assert decode_build.DEFINES["q1"] != decode_build.DEFINES["q4"]
 
 
+@pytest.mark.parametrize("query", range(1, 6))
+def test_decode_selects_compiled_query_variant(query, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import decode_build
+
+    original_load = decode_build.load_library
+    loaded = []
+
+    def load(variant, device):
+        loaded.append(variant)
+        library = original_load(variant, device)
+        assert len(library.atrex_ppu_decode.argtypes) == 5
+        return library
+
+    monkeypatch.setattr(decode_build, "load_library", load)
+    case = build_case(64, [query, query], [127, 257], hq=32, hkv=2)
+    actual = flash_attn_varlen_func(**case, num_splits=1)
+    expected = _native_decode_reference(case, 1)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+    assert loaded == ["q1" if query == 1 else "q4"]
+
+
 def test_eligibility_does_not_compile_or_launch(monkeypatch):
     from atrex import can_use_flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import launch

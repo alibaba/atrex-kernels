@@ -73,7 +73,7 @@ def _build(variant, device_index):
     library = ctypes.CDLL(str(library_path))
     library.atrex_ppu_decode.argtypes = [
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int64),
-        ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
     ]
     library.atrex_ppu_decode.restype = ctypes.c_int
     resource = library.atrex_ppu_decode_resources
