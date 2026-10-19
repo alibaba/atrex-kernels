@@ -130,6 +130,89 @@ def test_prep_kv_masks_nan_v_padding(length, page_size, heads, splits):
     _check(case, splits=splits)
 
 
+def _prep_layout_indices():
+    token = torch.arange(64, dtype=torch.int64)[:, None]
+    channel = torch.arange(256, dtype=torch.int64)[None, :]
+    group = 2 * ((token & 15) >> 2) + (token & 1)
+    local_key = 72 * group + 2 * ((channel & 31) >> 3) + ((channel >> 1) & 1)
+    local_key += torch.where((channel & 4) != 0,
+                             torch.where((group & 1) != 0, -8, 8), 0)
+    local_key += ((token >> 1) & 1) * 512
+    key_index = (2 * (token >> 5) + (channel >> 7)) * 2048
+    key_index += ((token >> 4) & 1) * 1024
+    key_index += local_key ^ (((channel >> 5) & 3) * 16)
+    key_index = key_index * 2 + (channel & 1)
+    slot = 32 * (token >> 5) + 8 * ((token >> 2) & 3) + 4 * ((token >> 4) & 1) + (token & 3)
+    group = 2 * ((channel & 15) >> 2) + (channel & 1)
+    local_value = 32 * group + 8 * (group >> 1) + 2 * ((slot & 31) >> 3) + ((slot >> 1) & 1)
+    local_value += torch.where((slot & 4) != 0,
+                               torch.where(((group >> 1) & 1) != 0, -8, 8), 0)
+    local_value += ((channel >> 1) & 1) * 512
+    value_index = ((channel >> 4) >> 1) * 1024 + ((channel >> 4) & 1) * 256
+    value_index = (value_index + (local_value ^ ((slot >> 5) * 16))) * 2 + (slot & 1)
+    return key_index.flatten(), value_index.flatten()
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 3])
+@pytest.mark.parametrize("page_size", [64, 128, 256])
+def test_prep_kv_bit_exact_and_graph_lengths(kv_heads, page_size):
+    from atrex.src.ppu.flash_attn.zwm890p import runtime
+
+    lengths = [0, 63, 65, 129, 511]
+    case = build_case(page_size, [1] * len(lengths), lengths, hq=kv_heads * 8, hkv=kv_heads)
+    shape = case["k"].shape
+    bits = torch.arange(case["k"].numel(), dtype=torch.int64).reshape(shape)
+    key_bits = ((bits * 13 + (bits // 256) * 17) & 255).to(torch.uint8)
+    value_bits = ((bits * 29 + (bits // 256) * 31) & 255).to(torch.uint8)
+    table = case["block_table"].cpu()
+    for request, length in enumerate(lengths):
+        if length % page_size:
+            physical = int(table[request, length // page_size])
+            value_bits[physical, length % page_size:].fill_(0x7f)
+    case["k"].view(torch.uint8).copy_(key_bits.to("cuda"))
+    case["v"].view(torch.uint8).copy_(value_bits.to("cuda"))
+    key_view, virtual_stride, subpages = runtime._page_view(case["k"])
+    value_view = runtime._page_view(case["v"])[0]
+    remapped = runtime._remap_block_table(case["block_table"], virtual_stride, subpages)
+    max_pages = 8
+    packed_key = torch.full((len(lengths) * kv_heads * max_pages * 16384,), 0xa5,
+                            dtype=torch.uint8, device="cuda")
+    packed_value = torch.full_like(packed_key, 0xa5)
+    key_scale = torch.empty(len(lengths) * kv_heads * max_pages, device="cuda")
+    value_max = torch.empty(len(lengths) * kv_heads * 256, device="cuda")
+    native = runtime._launch.build(case["q"].device)
+    invoke = partial(native.prep_kv, key_view, value_view, remapped, case["seqused_k"],
+                     packed_key, packed_value, key_scale, value_max, max_pages)
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+    key_index, value_index = _prep_layout_indices()
+    assert torch.equal(key_index.sort().values, torch.arange(16384))
+    assert torch.equal(value_index.sort().values, torch.arange(16384))
+    for current in (lengths, [0, 64, 128, 130, 512]):
+        case["seqused_k"].copy_(torch.tensor(current, dtype=torch.int32, device="cuda"))
+        packed_key.fill_(0xa5)
+        packed_value.fill_(0xa5)
+        graph.replay()
+        expected_key = torch.full((len(lengths), kv_heads, max_pages, 16384), 0xa5, dtype=torch.uint8)
+        expected_value = torch.full_like(expected_key, 0xa5)
+        for request, length in enumerate(current):
+            for page in range((length + 63) // 64):
+                physical = int(table[request, page // subpages])
+                start = (page % subpages) * 64
+                for head in range(kv_heads):
+                    key_page = key_bits[physical, start:start + 64, head]
+                    value_page = value_bits[physical, start:start + 64, head].clone()
+                    value_page[max(0, length - page * 64):].zero_()
+                    expected_key[request, head, page].index_copy_(0, key_index, key_page.flatten())
+                    expected_value[request, head, page].index_copy_(0, value_index, value_page.flatten())
+        assert torch.equal(packed_key.cpu(), expected_key.flatten())
+        assert torch.equal(packed_value.cpu(), expected_value.flatten())
+    assert torch.equal(case["k"].view(torch.uint8).cpu(), key_bits)
+    assert torch.equal(case["v"].view(torch.uint8).cpu(), value_bits)
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("splits", [1, 4])
 def test_graph_replay(page_size, splits):

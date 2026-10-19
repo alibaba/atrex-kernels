@@ -255,6 +255,31 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep(
 
 // Raw-FP8 prep performs layout conversion only. Identity K/V scales are folded
 // into the attention math, so no scale metadata is materialised here.
+__device__ __forceinline__ u32 prep_v_word(
+    const unsigned char* values, int channel, int word_index) {
+  const int first_kv = 32 * (word_index >> 3) + 16 * (word_index & 1) +
+                       4 * ((word_index >> 1) & 3);
+  const unsigned char* source = values + first_kv * HEAD_DIM + channel;
+  return pack4(source[0], source[HEAD_DIM], source[2 * HEAD_DIM], source[3 * HEAD_DIM]);
+}
+
+__device__ __forceinline__ void prep_store_v_page(
+    unsigned char* destination, const unsigned char* values, int channel) {
+  const int local_row = channel & 15;
+  const int row_quarter = local_row >> 2;
+  int base = (channel >> 5) * 1024 + ((channel >> 4) & 1) * 256;
+  base += 64 * row_quarter + 32 * (local_row & 1) + 512 * ((local_row >> 1) & 1);
+#pragma unroll
+  for (int chunk = 0; chunk < 8; ++chunk) {
+    int first_word = 8 * (chunk >> 2) + 4 * (chunk & 1) + ((chunk >> 1) & 1);
+    first_word ^= (row_quarter & 1) | ((row_quarter & 2) << 2);
+    const u32 first = prep_v_word(values, channel, first_word);
+    const u32 second = prep_v_word(values, channel, first_word + 2);
+    *reinterpret_cast<uint2*>(destination + 2 * (base + 4 * chunk)) =
+        make_uint2(first, second);
+  }
+}
+
 template <bool MULTI_HEAD = false>
 __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
     const unsigned char* __restrict__ key_cache,
@@ -308,16 +333,7 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
       }
     }
     __syncthreads();
-    u32 pack[16];
-#pragma unroll
-    for (int j = 0; j < 16; ++j) pack[j] = 0u;
-#pragma unroll
-    for (int j = 0; j < PAGE; ++j) {
-      const u32 code = (u32)Vs[j * HEAD_DIM + tid];
-      const int slot = slot_of_kv(j);
-      pack[slot >> 2] |= code << (8 * (slot & 3));
-    }
-    store_v_ldmatrix_row(vdst, tid, pack);
+    prep_store_v_page(vdst, Vs, tid);
     __syncthreads();
   }
 }
