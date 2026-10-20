@@ -559,6 +559,13 @@ def test_decode_selects_compiled_query_variant(query, monkeypatch):
         loaded.append(variant)
         library = original_load(variant, device)
         assert len(library.atrex_ppu_decode.argtypes) == 5
+        original_launch = library.atrex_ppu_decode
+
+        def invoke(pointers, *args):
+            assert len(pointers) == 13
+            return original_launch(pointers, *args)
+
+        monkeypatch.setattr(library, "atrex_ppu_decode", invoke)
         return library
 
     monkeypatch.setattr(decode_build, "load_library", load)
@@ -573,11 +580,22 @@ def test_eligibility_does_not_compile_or_launch(monkeypatch):
     from atrex import can_use_flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import launch
     from atrex.src.ppu.flash_attn.zwm890p import decode_build
+    from atrex.src.ppu.flash_attn.zwm890p import runtime
+    import atrex.api.flash_attn as api
 
     def unexpected(*args, **kwargs):
         raise AssertionError("Eligibility must not compile or execute kernels")
 
     monkeypatch.setattr(decode_build, "load_library", unexpected)
+    monkeypatch.setattr(runtime._launch, "build", unexpected)
+    monkeypatch.setattr(launch, "forward", unexpected)
+    original_validate = api._validate_flash_attn_call
+
+    def validate(call):
+        assert "_eligibility_only" not in call
+        return original_validate(call)
+
+    monkeypatch.setattr(api, "_validate_flash_attn_call", validate)
     assert can_use_flash_attn_varlen_func(**build_case(128, [4, 4], [1025, 2049], hq=64, hkv=4))
     assert can_use_flash_attn_varlen_func(**_case(64, [4, 4], [1025, 2049]))
     assert can_use_flash_attn_varlen_func(**build_case(64, [256, 1], [257, 127], hq=32, hkv=2))

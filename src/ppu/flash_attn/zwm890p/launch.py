@@ -11,7 +11,6 @@ def _normalized_call(arguments):
             -1 if call["window_size_left"] is None else call["window_size_left"],
             -1 if call["window_size_right"] is None else call["window_size_right"],
         )
-        call["fa_version"] = call.get("fa_version")
         call["logits_soft_cap"] = None
     return call
 
@@ -21,7 +20,7 @@ def _is_short_q(call):
     return query is not None and 1 <= query <= 5
 
 
-def _select(call, *, eligibility_only=False):
+def _select(call):
     if _is_short_q(call):
         from .decode_runtime import validate as validate_decode
 
@@ -32,12 +31,12 @@ def _select(call, *, eligibility_only=False):
             pass
     from .prefill_contract import validate as validate_prefill
 
-    validate_prefill(call, eligibility_only=eligibility_only)
+    validate_prefill(call)
     return "prefill"
 
 
-def validate(arguments, *, eligibility_only=False):
-    _select(_normalized_call(arguments), eligibility_only=eligibility_only)
+def validate(arguments):
+    _select(_normalized_call(arguments))
 
 
 def forward(*, fa_version=None, **kwargs):

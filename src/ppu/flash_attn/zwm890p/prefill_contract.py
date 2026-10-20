@@ -5,7 +5,7 @@ import math
 import torch
 
 
-def validate(call, *, eligibility_only=False):
+def validate(call):
     q, k, v = (call[name] for name in ("q", "k", "v"))
     table, lengths = call["block_table"], call["seqused_k"]
     batch = call["cu_seqlens_q"].numel() - 1

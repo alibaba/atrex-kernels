@@ -95,7 +95,7 @@ def forward(
         partial_lse = torch.empty((selected_splits, query_heads, total), device=q.device, dtype=torch.float32)
     plan = torch.empty(4 + batch + batch * kv_heads * selected_splits, device=q.device, dtype=torch.int32) if num_splits == 0 else None
     tensors = (q, k, v, out, cu_seqlens_q, seqused_k, page_table,
-               q_descale, k_descale, v_descale, None, partial, partial_lse, None, plan)
+               q_descale, k_descale, v_descale, partial, partial_lse, plan)
     pointers = (ctypes.c_void_p * len(tensors))(*(tensor.data_ptr() if tensor is not None else 0 for tensor in tensors))
     values = [batch, total, max_seqlen_q, page_table.shape[1] * page_size, k.shape[0], page_size,
               page_table.stride(0), q.stride(0), q.stride(1), *k.stride()[:3],

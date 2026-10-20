@@ -872,9 +872,9 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     params.query_descales = static_cast<const float*>(pointers[7]);
     params.key_descales = static_cast<const float*>(pointers[8]);
     params.value_descales = static_cast<const float*>(pointers[9]);
-    params.partial_output = static_cast<float*>(pointers[11]);
-    params.partial_lse = static_cast<float*>(pointers[12]);
-    params.plan = static_cast<int*>(pointers[14]);
+    params.partial_output = static_cast<float*>(pointers[10]);
+    params.partial_lse = static_cast<float*>(pointers[11]);
+    params.plan = static_cast<int*>(pointers[12]);
     params.batch = metadata[0];
     params.total_q = metadata[1];
     params.max_query = metadata[2];
@@ -904,12 +904,11 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     params.scale = scale;
     params.page_shift = __builtin_ctz(static_cast<unsigned int>(metadata[5]));
     params.automatic = splits == 0;
-#if DECODE_Q1_ONLY
     params.splits = splits ? splits : 32;
+#if DECODE_Q1_ONLY
     if (metadata[24] / metadata[25] == 8) return native_launch<1, 8>(params, static_cast<hggcStream_t>(stream_pointer));
     return native_launch<1, 16>(params, static_cast<hggcStream_t>(stream_pointer));
 #else
-    params.splits = splits ? splits : 32;
     if (params.max_query == 5) {
         if (metadata[24] / metadata[25] == 8) return native_launch<5, 8>(params, static_cast<hggcStream_t>(stream_pointer));
         return native_launch<5, 16>(params, static_cast<hggcStream_t>(stream_pointer));
