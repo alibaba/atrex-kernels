@@ -82,29 +82,9 @@ prefill path only when its contract also matches; otherwise they fail explicitly
 Decode reads `block_table` directly with invocation-local scratch, without KV
 packing or persistent input caches. HGCC lazily compiles `native_decode.cu`
 using PPU SDK headers, without PPU CuTe/ACTLASS. Prewarm each required path
-before CUDA Graph capture. Target tests include native-FA3 correctness,
-dispatch, graph replay, real kernel events, and `--decode-benchmark-output`.
-ABBA collection and checking require `--benchmark-identity identity.json`.
-Pin `baseline.ref` to `main`, full baseline/candidate `revision` values,
-distinct absolute installed `package` directories, and `sources` SHA256 maps
-keyed by repository-relative `python/atrex/...` and `src/ppu/...` files.
-Also pin the operator test file's `benchmark_sha256` and `benchmark` settings
-(`head_pairs`, `queries`, `batches`, `include_prefill`, `descales`). Collection
-uses `--benchmark-phase A1|B1|B2|A2` and verifies the imported installation and
-source bytes before GPU work. The checker enforces A1/A2=main, B1/B2=candidate,
-the pinned case coverage, and the 5% latency / 1.5% repeat-spread gates:
-
-```bash
-python op_test/ppu/flash_attn/test_flash_attn_zwm890p.py \
-  --decode-parity-inputs A1.json B1.json B2.json A2.json \
-  --benchmark-identity identity.json
-```
-
-For the common main-compatible suite, collect each phase with
-`--decode-heads 8/1 --decode-queries 1 2 3 4 5 --decode-batches 8 16 32
---decode-include-prefill --decode-descales none`. This covers 30 short-Q and
-11 prefill cases using implicit unit descales. Shapes that main rejects are
-capability extensions, not valid main-latency comparisons.
+before CUDA Graph capture. Target tests cover native-FA3 correctness,
+dispatch and fail-fast behavior, graph replay, scratch reuse, KV tail
+sanitization, and real kernel events.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
