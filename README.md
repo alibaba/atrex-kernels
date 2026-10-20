@@ -58,11 +58,33 @@ previous ATREX revision is the rollback path. The NVIDIA package requires
 `flash-attn-4==4.0.0b19`; target environments should not install the classic
 `flash-attn` distribution alongside it because both provide `flash_attn`.
 
-ZW-M890P retains `prep_kv`: each call allocates packed K and V buffers of
-`requests * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
+ZW-M890P prefill supports contiguous D256 FP8 Q, paged K/V with page sizes
+divisible by 64, and GQA ratios divisible by four (including heads 8/1 and 32/2).
+It consumes optional FP32 `[batch,num_kv_heads]` descales on every call/replay.
+The original 8/1, implicit-unit-scale kernel signature, body, and launcher are
+retained from main (`43798a6f`). Other heads/scales use the independent
+`atrex_ppu_attn_general` kernel in a separate CUDA translation unit. Both share
+the same local layout/instruction helpers; this adds no third-party dependency.
+Prefill uses `prep_kv`:
+each call allocates packed K and V buffers of
+`requests * num_kv_heads * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
 optional Split-KV partial buffers. For 64 requests at 16K KV length, packed
-K/V total 512 MiB. Account for this invocation-local scratch when sizing the
+K/V total 512 MiB for one KV head. Account for this invocation-local scratch when sizing the
 serving KV cache; it is not a persistent per-layer cache.
+
+ZW-M890P direct-paged decode uses the same API with FA3, FP8 E4M3 inputs,
+BF16 output, causal full-window attention, head dimension 256, GQA 8/16,
+page sizes 64/128/256, and maximum query lengths 1 through 5. FP32 descales have
+shape `[batch,num_kv_heads]` (omitted means one); LSE is not supported.
+All decode paths accept `num_splits=0..32`, without a minimum KV length for
+automatic splitting. Ineligible short-Q calls use the native
+prefill path only when its contract also matches; otherwise they fail explicitly.
+Decode reads `block_table` directly with invocation-local scratch, without KV
+packing or persistent input caches. HGCC lazily compiles `native_decode.cu`
+using PPU SDK headers, without PPU CuTe/ACTLASS. Prewarm each required path
+before CUDA Graph capture. Target tests cover standalone FP32 correctness,
+dispatch and fail-fast behavior, graph replay, scratch reuse, KV tail
+sanitization, and real kernel events.
 
 All applicable tests must pass on their target hardware before the operator is
 accepted. See the
