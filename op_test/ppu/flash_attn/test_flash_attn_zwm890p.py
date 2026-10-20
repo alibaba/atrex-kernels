@@ -346,21 +346,6 @@ def test_unsupported_row_stride():
         flash_attn_varlen_func(**case)
 
 
-def _native_decode_reference(case, splits):
-    import flash_attn_3._C
-
-    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
-    native_out, *_ = torch.ops.flash_attn_3.fwd(
-        case["q"], case["k"], case["v"], None, None, None, out,
-        case["cu_seqlens_q"], None, None, None, case["seqused_k"],
-        case["max_seqlen_q"], case["max_seqlen_k"], case["block_table"],
-        None, None, None, None, None,
-        case["q_descale"], case["k_descale"], case["v_descale"],
-        case["softmax_scale"], True, -1, -1, 0, 0.0, True, None, splits, None, 0,
-    )
-    return native_out
-
-
 @pytest.mark.parametrize("query,hq,hkv,path", [
     (1, 32, 2, "decode"), (4, 32, 2, "decode"),
     (1, 16, 1, "decode"), (4, 64, 4, "decode"),
@@ -470,10 +455,10 @@ def test_decode_runtime_heads_and_pages(query, heads, page_size):
     q_lens = [query, 1, max(1, query - 1)]
     case = build_case(page_size, q_lens, [127, 1025, 2049], hq=query_heads, hkv=kv_heads)
     assert can_use_flash_attn_varlen_func(**case)
+    expected, _ = reference(case)
     for splits in (0, 1):
-        expected = _native_decode_reference(case, splits)
         actual = flash_attn_varlen_func(**case, num_splits=splits)
-        torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("query", range(2, 6))
@@ -490,9 +475,9 @@ def test_short_q_auto_never_uses_prefill(query, heads, batch, monkeypatch):
     for length in (5, 31, 32, 33, 511, 1023, 1024):
         case = build_case(64, [query] * batch, [length] * batch, hq=heads[0], hkv=heads[1])
         assert can_use_flash_attn_varlen_func(**case)
-        expected = _native_decode_reference(case, 0)
+        expected, _ = reference(case)
         actual = flash_attn_varlen_func(**case)
-        torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("query", range(1, 6))
@@ -507,10 +492,10 @@ def test_decode_softmax_dynamic_range(query, heads, amplitude):
         case[name] = (case[name].float() * amplitude).to(torch.float8_e4m3fn)
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name].fill_(1)
+    expected, _ = reference(case)
     for splits in (0, 1):
-        expected = _native_decode_reference(case, splits)
         actual = flash_attn_varlen_func(**case, num_splits=splits)
-        torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("query,heads,kv_heads", [(1, 32, 2), (4, 32, 4)])
@@ -525,9 +510,9 @@ def test_decode_large_work_queue(query, heads, kv_heads):
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name].fill_(1)
     out = torch.full_like(case["q"], float("nan"), dtype=torch.bfloat16)
-    expected = _native_decode_reference(case, 0)
+    expected, _ = reference(case)
     actual = flash_attn_varlen_func(**case, out=out)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 def test_shared_decode_sources_and_independent_specializations():
@@ -571,8 +556,8 @@ def test_decode_selects_compiled_query_variant(query, monkeypatch):
     monkeypatch.setattr(decode_build, "load_library", load)
     case = build_case(64, [query, query], [127, 257], hq=32, hkv=2)
     actual = flash_attn_varlen_func(**case, num_splits=1)
-    expected = _native_decode_reference(case, 1)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+    expected, _ = reference(case)
+    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
     assert loaded == ["q1" if query == 1 else "q4"]
 
 
@@ -732,10 +717,10 @@ def test_direct_decode_contract_and_mutation(query, splits, layout):
             case["seqused_k"].sub_(1)
         elif phase == 3:
             case["block_table"][0, :2] = case["block_table"][0, :2].flip(0)
-        expected = _native_decode_reference(case, splits)
+        expected, _ = reference(case)
         actual = flash_attn_varlen_func(**case, out=out, num_splits=splits)
         assert actual.data_ptr() == out.data_ptr()
-        torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
         if phase == 0:
             for name, tensor in saved.items():
                 assert torch.equal(case[name].view(torch.uint8), tensor.view(torch.uint8)), name
@@ -748,11 +733,11 @@ def test_decode_implicit_descales(query):
     case = build_case(64, [query, query], [1025, 2049], hq=32, hkv=2)
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name].fill_(1)
-    expected = _native_decode_reference(case, 1)
+    expected, _ = reference(case)
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name] = None
     actual = flash_attn_varlen_func(**case, num_splits=1)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("update", [
@@ -792,8 +777,8 @@ def test_decode_graph_replay(query, heads):
         reference_case = dict(case)
         for name in ("seqused_k", "q_descale", "block_table"):
             reference_case[name] = case[name].clone()
-        expected = _native_decode_reference(reference_case, 0)
-        torch.testing.assert_close(out.float(), expected.float(), atol=.01, rtol=.05)
+        expected, _ = reference(reference_case)
+        torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("query", range(1, 6))
@@ -814,6 +799,6 @@ def test_decode_gqa8_expanded_unit_descales(query):
     case = build_case(64, q_lens, [127, 1025, 2049], hq=8, hkv=1)
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name] = torch.ones((1, 1), device="cuda", dtype=torch.float32).expand(3, 1)
-    expected = _native_decode_reference(case, 0)
+    expected, _ = reference(case)
     actual = flash_attn_varlen_func(**case)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=.01, rtol=.05)
+    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)

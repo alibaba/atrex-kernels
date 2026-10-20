@@ -82,7 +82,7 @@ prefill path only when its contract also matches; otherwise they fail explicitly
 Decode reads `block_table` directly with invocation-local scratch, without KV
 packing or persistent input caches. HGCC lazily compiles `native_decode.cu`
 using PPU SDK headers, without PPU CuTe/ACTLASS. Prewarm each required path
-before CUDA Graph capture. Target tests cover native-FA3 correctness,
+before CUDA Graph capture. Target tests cover standalone FP32 correctness,
 dispatch and fail-fast behavior, graph replay, scratch reuse, KV tail
 sanitization, and real kernel events.
 
