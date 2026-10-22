@@ -1,4 +1,4 @@
-"""SM120 launch policy migrated from l20n-fa4 (68fd128c)."""
+"""SM120 attention launch policy."""
 
 _SM120_RUNTIME_BALANCED_MAX_BATCH = 64
 _SM120_RUNTIME_BALANCED_Q1_GRID = 96
@@ -8,7 +8,7 @@ _SM120_FP8_DECODE_GRID = 192
 _SM120_FP8_DECODE_B4_Q1_GRID = 200
 
 def _sm120_forward():
-    """Lazily load the L20N SM120 forward implementation."""
+    """Lazily load the SM120 forward implementation."""
     from atrex.src.nvidia.flash_attn.sm120.runtime import _flash_attn_fwd
 
     return _flash_attn_fwd
@@ -115,6 +115,7 @@ def _sm120_short_q_splits(
     occupancy_splits = (2 * sm_count + base_ctas - 1) // base_ctas
     return max(1, min(32, occupancy_splits, kv_tiles))
 
+
 def _sm120_fp8_prefill_splits(
     total_q,
     num_q_heads,
@@ -168,14 +169,116 @@ def _sm120_paged_tile_n(page_size: int) -> int:
             return tile_n
     return 0
 
-def _run_sm120(**kwargs):
-    """Run the L20N path and preserve the public ``(out, lse)`` ABI.
 
-    Host dispatch is based only on graph-static metadata and follows two
+def _can_run_fp8_prefill_tma(kwargs):
+    """Select page64/page128 E4M3 prefill with max-Q greater than four."""
+    import torch
+
+    q, k, v = (kwargs.get(name) for name in ("q", "k", "v"))
+    cu = kwargs.get("cu_seqlens_q")
+    seq = kwargs.get("seqused_k")
+    pages = kwargs.get("page_table")
+    out = kwargs.get("out")
+    supported_arguments = {
+        "q", "k", "v", "out", "cu_seqlens_q", "cu_seqlens_k", "seqused_k",
+        "max_seqlen_q", "max_seqlen_k", "page_table", "softmax_scale", "causal",
+        "softcap", "window_size_left", "window_size_right", "learnable_sink",
+        "return_lse", "q_descale", "k_descale", "v_descale", "num_splits",
+    }
+    if any(
+        value is not None
+        for name, value in kwargs.items()
+        if name not in supported_arguments
+    ):
+        return False
+    if (
+        q is None or k is None or v is None
+        or q.dtype != torch.float8_e4m3fn
+        or k.dtype != q.dtype or v.dtype != q.dtype
+        or q.ndim != 3 or k.ndim != 4 or v.shape != k.shape
+        or k.shape[0] == 0
+        or q.shape[-1] != 256 or k.shape[-1] != 256 or k.shape[1] not in (64, 128)
+        or not q.is_contiguous() or q.data_ptr() % 16
+        or (
+            out is not None
+            and (
+                not out.is_contiguous() or out.data_ptr() % 16
+                or out.shape != q.shape or out.device != q.device
+                or out.dtype != torch.bfloat16
+            )
+        )
+        or not kwargs.get("causal")
+        or (
+            kwargs.get("softmax_scale") is not None
+            and kwargs["softmax_scale"] <= 0
+        )
+        or (kwargs.get("max_seqlen_q") or 0) <= 4
+        or (kwargs.get("max_seqlen_q") or 0) * q.shape[1] * 256 >= 2**31
+        or kwargs.get("num_splits", 0) not in (0, 1)
+        or kwargs.get("return_lse") or kwargs.get("softcap")
+        or kwargs.get("window_size_left") is not None
+        or kwargs.get("window_size_right") is not None
+        or kwargs.get("learnable_sink") is not None
+        or kwargs.get("qv") is not None
+        or kwargs.get("cu_seqlens_k") is not None
+        or cu is None or seq is None or pages is None
+        or not all(t.is_contiguous() for t in (cu, seq, pages))
+        or cu.numel() <= 1 or q.numel() == 0
+    ):
+        return False
+    hkv = k.shape[2]
+    if hkv <= 0 or q.shape[1] % hkv:
+        return False
+    kv_strides = (k.stride(1), k.stride(2))
+    if kv_strides != (v.stride(1), v.stride(2)):
+        return False
+    if kv_strides == (hkv * 256, 256):
+        min_page_stride = k.shape[1] * hkv * 256
+    elif (
+        kv_strides == (512, k.shape[1] * 512)
+        or (hkv == 1 and kv_strides == (512, 256))
+    ):
+        # vLLM develop exposes [P,page,Hkv,D] views of [P,Hkv,page,2*D].
+        # Its singleton-stride canonicalization uses head stride D for Hkv=1.
+        min_page_stride = k.shape[1] * hkv * 512
+    else:
+        return False
+    for tensor in (k, v):
+        if (
+            tensor.stride(3) != 1
+            or tensor.stride(0) < min_page_stride
+            or tensor.stride(0) % 16 or tensor.data_ptr() % 16
+        ):
+            return False
+    batch = cu.numel() - 1
+    if (
+        cu.ndim != 1 or cu.shape != (batch + 1,)
+        or seq.ndim != 1 or seq.shape != (batch,)
+        or pages.ndim != 2 or pages.shape[0] != batch
+        or not all(t.dtype == torch.int32 and t.device == q.device for t in (cu, seq, pages))
+    ):
+        return False
+    return all(
+        kwargs.get(name) is None
+        or (
+            kwargs[name].dtype == torch.float32
+            and kwargs[name].device == q.device
+            and kwargs[name].shape == (batch, hkv)
+            and all(stride >= 0 for stride in kwargs[name].stride())
+        )
+        for name in ("q_descale", "k_descale", "v_descale")
+    )
+
+
+def _run_sm120(**kwargs):
+    """Run the SM120 path and preserve the public ``(out, lse)`` ABI.
+
+    Host dispatch is based only on graph-static metadata and follows three
     routes:
 
     * Q1/Q2/Q3/Q4 short-Q -> native causal packed-GQA + SplitKV;
-    * prefill and other attention shapes -> the general causal-varlen kernel.
+    * eligible HD256 E4M3 prefill with Q>=5 -> TMA;
+    * other attention shapes -> the general causal-varlen kernel.
 
     All routes keep Q, output and paged-KV storage owned by the caller.
     """
@@ -190,6 +293,8 @@ def _run_sm120(**kwargs):
     page_table = kwargs.get("page_table")
     max_seqlen_q = kwargs.get("max_seqlen_q")
     requested_splits = kwargs.get("num_splits") or 0
+    num_splits_dynamic = kwargs.get("num_splits_dynamic")
+    work_map = kwargs.get("work_map")
 
     # Keep speculative verification as one native causal attention problem.
     # Q positions and grouped query heads are packed together inside the
@@ -198,8 +303,13 @@ def _run_sm120(**kwargs):
     # make blocks_per_page zero in the SM120 paged-KV mapper.
     can_run_native_short_q = (
         max_seqlen_q in (1, 2, 3, 4)
-        and kwargs.get("causal")
         and q is not None
+        and (
+            kwargs.get("causal") or (
+                q.shape[-1] == 128
+                and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            )
+        )
         and k is not None
         and v is not None
         and cu_seqlens_q is not None
@@ -244,6 +354,8 @@ def _run_sm120(**kwargs):
                 and num_kv_heads == 1
                 and (page_size == 64 or (is_fp8 and page_size == 128))
                 and q.shape[0] == num_sequences * max_seqlen_q
+                and num_splits_dynamic is None
+                and work_map is None
             )
             runtime_balanced_grid_size = 0
             if runtime_balanced_splits:
@@ -279,11 +391,86 @@ def _run_sm120(**kwargs):
                     is_fp8=is_fp8,
                 )
             )
+            hd128_decode_options = {}
+            if (
+                is_fp8
+                and q.shape[-1] == 128
+                and q.shape[1] == 10
+                and num_kv_heads == 2
+                and not kwargs.get("causal")
+                and num_sequences in (1, 4, 16, 64, 128)
+                and max_seqlen_q in (1, 4)
+                and page_size == 64
+                and max_k >= 32 * 1024
+                and requested_splits == 0
+                and num_splits_dynamic is None
+                and work_map is None
+            ):
+                # HD128 needs fewer threads than the HD256 FP8 schedule.
+                # Same-GPU sweeps include the whole SplitKV call: B64/Q4
+                # K256K falls from 10.50ms to 7.05ms with M32/N64/T64.
+                target_ctas = 2 * sm_count if num_sequences == 1 else 192
+                num_splits = max(
+                    1, (target_ctas + num_sequences * 2 - 1) // (num_sequences * 2)
+                )
+                hd128_decode_options = dict(
+                    tile_mn=(32, 64),
+                    _sm120_num_stages=1 if num_sequences >= 64 else 2,
+                    _sm120_q_in_regs=False,
+                    _sm120_num_threads=64,
+                )
+            if (
+                not is_fp8
+                and q.shape[-1] == 128
+                and q.shape[1] == 10
+                and num_kv_heads == 2
+                and not kwargs.get("causal")
+                and num_sequences in (1, 4)
+                and max_seqlen_q in (1, 4)
+                and page_size == 64
+                and max_k >= 32 * 1024
+                and requested_splits == 0
+                and num_splits_dynamic is None
+                and work_map is None
+            ):
+                # Use a smaller Q tile and two pipelined K/V stages. Same-GPU
+                # sweeps cover K64K/256K/512K for Q1/Q4 at both batch sizes.
+                # B1/Q1 K64K: 51.3 -> 20.6us; B4/Q4: 249 -> 229us.
+                target_ctas = (
+                    2 * sm_count if num_sequences == 1 else min(192, 2 * sm_count)
+                )
+                num_splits = max(
+                    1, (target_ctas + num_sequences * 2 - 1) // (num_sequences * 2)
+                )
+                hd128_decode_options = dict(
+                    tile_mn=(32, 32),
+                    _sm120_num_stages=2,
+                    _sm120_q_in_regs=True,
+                    _sm120_num_threads=64,
+                )
+            if (
+                not is_fp8
+                and q.shape[-1] == 128
+                and q.shape[1] == 10
+                and num_kv_heads == 2
+                and not kwargs.get("causal")
+                and num_sequences in (16, 64)
+                and max_seqlen_q in (1, 4)
+                and page_size == 64
+                and max_k <= 64 * 1024
+                and requested_splits == 0
+                and num_splits_dynamic is None
+                and work_map is None
+            ):
+                # Short-context HD128: excessive split waves cost more than
+                # the added parallelism. Same-GPU sweeps: B16 1.33 -> 1.10ms
+                # with two splits; B64/Q1 4.96 -> 4.47ms with one split.
+                num_splits = 2 if num_sequences == 16 else 1
             if runtime_balanced_splits and max_seqlen_q == 1:
                 tile_n = 32
             tile_m = (
                 64
-                if is_fp8
+                if is_fp8 or not kwargs.get("causal")
                 else 32
                 if (page_size == 128 and max_seqlen_q == 4)
                 or (runtime_balanced_splits and max_seqlen_q == 1)
@@ -302,12 +489,18 @@ def _run_sm120(**kwargs):
                 _allow_pack_gqa_split=True,
                 _arch=120,
             )
+            short_q_kwargs.update(hd128_decode_options)
             result = _sm120_forward()(**short_q_kwargs)
             return result[0], result[1]
 
-    # General route for causal prefill, prefix-cache work and attention groups
-    # not covered by the native short-Q specialization. A caller value of
-    # num_splits=0 delegates the graph-static FP8 split policy to Atrex.
+    # Keep HD128's tuned path and all short-Q launches unchanged.
+    if q is not None and q.shape[-1] == 256 and _can_run_fp8_prefill_tma(kwargs):
+        from .runtime import _forward_tma_prefill as tma_prefill
+
+        return tma_prefill(**kwargs)
+
+    # Preserve automatic SplitKV for FP8 prefill compatibility calls outside
+    # the TMA contract. Explicit requests and noncausal behavior stay intact.
     sm120_kwargs = dict(kwargs)
     if (
         requested_splits == 0

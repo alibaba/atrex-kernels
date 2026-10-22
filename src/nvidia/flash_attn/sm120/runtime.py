@@ -31,7 +31,6 @@ from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
-    get_broadcast_dims,
     to_cute_aux_tensor,
     to_cute_tensor,
 )
@@ -41,10 +40,8 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
-    get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
-    normalize_block_sparse_config_bwd,
 )
 
 
@@ -95,40 +92,6 @@ def _sm120_paged_tile_n(page_size: int, candidates: tuple[int, ...]) -> int:
         )
     return tile_n
 
-
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
-    """Return FwdConfig for SM90 forward.
-
-    Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
-    for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
-
-    When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
-    optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
-    """
-    if head_dim <= 64:
-        # C++: 192×192 non-causal, 192×128 causal/local.
-        # Python: 192×128 RS+OL is consistently best across seqlens.
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, True, True)
-        return FwdConfig(192, 128, True, True)
-    elif head_dim <= 96:
-        # C++: 192×144 noRS+OL for all cases.
-        # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
-        # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
-        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
-            return FwdConfig(128, 128, False, True)
-        if is_causal or is_local:
-            return FwdConfig(192, 128, False, True)
-        else:
-            return FwdConfig(192, 144, False, True)
-    elif head_dim <= 128:
-        return FwdConfig(128, 128, True, True)
-    elif head_dim <= 192:
-        tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
-        return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
-        tile_n = 64 if is_local else 80
-        return FwdConfig(128, tile_n, True, True)
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -184,6 +147,7 @@ def _flash_attn_fwd(
     seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    min_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -210,10 +174,20 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    # ATREX PORT sm120: explicit params (not module globals) for the split-KV/compact-grid path.
+    # num_splits_dynamic: int32 CUDA tensor [num_batch], per-sequence split count (DYNSPLIT).
+    # work_map: int32 CUDA tensor [rows,4] = (m_block, head, batch, split), or the Q1/HKV1
+    # compact form [rows,1] = ((batch << 16) | split), host work map (COMPACTGRID);
+    #   when given the grid launches exactly `rows` CTAs. Both sm120-only; ignored on other arches.
+    num_splits_dynamic: Optional[torch.Tensor] = None,
+    work_map: Optional[torch.Tensor] = None,
     _runtime_balanced_splits: bool = False,
     _runtime_balanced_grid_size: int = 0,
     _runtime_balanced_batch_size: int = 0,
     _allow_pack_gqa_split: bool = False,
+    _sm120_num_stages: Optional[int] = None,
+    _sm120_q_in_regs: Optional[bool] = None,
+    _sm120_num_threads: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -229,12 +203,14 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    if qv is not None:
+        raise NotImplementedError("Atrex SM120 attention does not support auxiliary Q/MLA")
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
-    q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
-    assert q is not None or qv is not None
+    q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    assert q is not None
     assert v is not None
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
-    q_shape = q.shape if q is not None else qv.shape
+    q_shape = q.shape
     num_head, head_dim = q_shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q_shape[:2]
@@ -244,7 +220,7 @@ def _flash_attn_fwd(
         seqlen_q = None
         total_q = q_shape[0]
     if total_q == 0:
-        q_dtype = q.dtype if q is not None else qv.dtype
+        q_dtype = q.dtype
         out_dtype = (
             torch.bfloat16
             if q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -302,7 +278,7 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
 
-    q_dtype = q.dtype if q is not None else qv.dtype
+    q_dtype = q.dtype
     assert k is None or k.dtype == v.dtype, (
         f"K/V dtype mismatch: {k.dtype} != {v.dtype}"
     )
@@ -353,10 +329,7 @@ def _flash_attn_fwd(
         )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     if softmax_scale is None:
-        softmax_scale = (
-            1.0 / math.sqrt(head_dim) if qv is None or q is None
-            else 1.0 / math.sqrt(head_dim + head_dim_v)
-        )
+        softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
@@ -364,28 +337,26 @@ def _flash_attn_fwd(
         pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
+    requires_grad = any(t is not None and t.requires_grad for t in [q, k, v])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     # SM120 uses warp-level mma.sync for BF16 and FP8 E4M3/E5M2.
     if not (
-        head_dim == 256
-        and head_dim_v == 256
+        (head_dim == head_dim_v == 256
+         or (head_dim == head_dim_v == 128 and v.dtype in (
+             torch.bfloat16, torch.float8_e4m3fn
+         )))
         and v.dtype
         in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
     ):
         raise NotImplementedError(
-            "Atrex SM120 attention supports BF16/FP8 HD256"
+            "Atrex SM120 attention supports BF16/FP8 E4M3 HD128 and BF16/FP8 HD256"
         )
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
-    if qv is None:
-        lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
-    else:
-        # num_head contiguous better for MQA in MLA absorbed
-        lse_shape = (batch_size, seqlen_q, num_head) if cu_seqlens_q is None else (total_q, num_head)
+    lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
 
     if out is None:
         out = torch.empty(
@@ -460,6 +431,25 @@ def _flash_attn_fwd(
                 decode_tile_n = _sm120_paged_tile_n(page_size, (32, 16))
             fwd_cfg = FwdConfig(64, decode_tile_n, True, True)
             sm120_num_stages = 2
+            if (
+                head_dim == 128
+                and num_head == 10
+                and num_head_kv == 2
+                and max_seqlen_q is not None
+                and max_seqlen_q >= 256
+                and total_q >= 8192
+            ):
+                # HD128 HQ10/HKV2 Q8K/K64K: 13.54ms -> 11.87ms in the
+                # same-GPU sweep; two smaller-SMEM CTAs feed warp MMA.
+                if is_fp8:
+                    # Two M16 fragments per warp reuse the same K/V tile.
+                    # M256/N64 with two stages reduces long-context traffic.
+                    prefill_tile_n = _sm120_paged_tile_n(page_size, (64, 32))
+                    fwd_cfg = FwdConfig(256, prefill_tile_n, True, True)
+                    num_threads = 256
+                else:
+                    fwd_cfg = FwdConfig(128, decode_tile_n, True, True)
+                sm120_num_stages = 2 if is_fp8 else 1
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
         if (
@@ -471,6 +461,17 @@ def _flash_attn_fwd(
         ):
             sm120_num_stages = 2
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if head_dim == 128:
+        if _sm120_num_stages is not None:
+            if _sm120_num_stages < 1:
+                raise ValueError("SM120 stages must be positive")
+            sm120_num_stages = _sm120_num_stages
+        if _sm120_q_in_regs is not None:
+            sm120_q_in_regs = _sm120_q_in_regs
+        if _sm120_num_threads is not None:
+            if _sm120_num_threads not in (64, 128, 256):
+                raise ValueError("SM120 attention supports 64, 128 or 256 threads")
+            num_threads = _sm120_num_threads
     if page_size is not None and page_size % tile_n != 0:
         raise ValueError(
             f"Atrex FA SM120 requires page_size ({page_size}) to be divisible "
@@ -482,11 +483,41 @@ def _flash_attn_fwd(
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     # Prefill is causal varlen; decode is non-causal packed GQA with SplitKV.
-    assert not local, "Atrex SM120 does not support local/sliding-window attention"
+    assert not local, "Atrex FA4 sm120 does not support local/sliding-window attention"
     assert cu_seqlens_k is not None or page_table is not None, (
-        "Atrex SM120 requires varlen or paged K/V"
+        "Atrex FA4 sm120 requires varlen or paged K/V"
     )
     assert num_splits <= 256, "num_splits must be <= 256 (combine kernel limit)"
+    if num_splits_dynamic is not None:
+        _validate_tensor(
+            num_splits_dynamic,
+            "num_splits_dynamic",
+            (batch_size,),
+            torch.int32,
+            device,
+        )
+    if work_map is not None:
+        if (
+            work_map.device != device
+            or work_map.dtype != torch.int32
+            or work_map.ndim != 2
+            or work_map.shape[1] not in (1, 4)
+            or not work_map.is_contiguous()
+        ):
+            raise ValueError(
+                "SM120 work_map must be contiguous int32 CUDA [rows, 1|4]"
+            )
+        if work_map.shape[1] == 1 and not (
+            num_splits_dynamic is not None
+            and cu_seqlens_q is not None
+            and max_seqlen_q in (1, 4)
+            and total_q == batch_size * max_seqlen_q
+            and num_head_kv == 1
+        ):
+            raise ValueError(
+                "the compact short-Q work map requires ragged Q1/Q4, one KV head, "
+                "and dynamic split counts"
+            )
     # Split-KV and packed GQA can coexist only through the opt-in scatter path.
     is_split_kv = num_splits > 1
     _pgsplit = (
@@ -499,7 +530,7 @@ def _flash_attn_fwd(
     use_2cta_instrs = False
     input_variant = "fp8" if is_fp8 else "bf16"
     fwd_kernel_variant = (
-        f"hd256_{input_variant}_sm120_v1{'_split' if is_split_kv else ''}"
+        f"hd{head_dim}_{input_variant}_sm120_v1{'_split' if is_split_kv else ''}"
         f"{'_pg' if (is_split_kv and pack_gqa) else ''}"
     )
 
@@ -552,58 +583,20 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
 
-    if qv is not None:
-        assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
-        assert q is None or qv.shape[:-1] == q.shape[:-1]
-        assert qv.shape[-1] == head_dim_v
-        assert head_dim_v == 512
-        assert q is None or head_dim == 64
-        assert not local, "local not yet supported with qv"
-        assert q_descale is None and k_descale is None and v_descale is None, (
-            "q_descale/k_descale/v_descale are not yet supported with qv"
-        )
-        assert tile_n == 128
+    assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
+    gather_kv_length = None
+    sparse_kv = None
+    disable_sparse_kv_bitmask = None
+    p = row_max = None
 
-        assert not is_split_kv, "split kv not supported with qv"
-        assert learnable_sink is None
-        assert softcap is None
-        assert score_mod is None
-        assert mask_mod is None
-
-        if page_table is not None:
-            assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
-
-        qv = maybe_contiguous(qv)
-
-        gather_kv_length = 2048  # dummy value
-        sparse_kv = gather_kv_indices is not None
-        # always use kv bitmask by default (handles -1 sentinel)
-        disable_sparse_kv_bitmask = False
-        if sparse_kv:
-            assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
-            gather_kv_length = gather_kv_indices.shape[-1]
-            assert gather_kv_length % 128 == 0
-
-        if requires_grad and sparse_kv:
-            if cu_seqlens_q is None:
-                p = torch.empty(batch_size, seqlen_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
-                row_max = torch.empty(batch_size, seqlen_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
-            else:
-                p = torch.empty(total_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
-                row_max = torch.empty(total_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
-        else:
-            p = row_max = None
-    else:
-        assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
-        gather_kv_length = None
-        sparse_kv = None
-        disable_sparse_kv_bitmask = None
-        p = row_max = None
-
-    # Split-KV partials are invocation-local. PyTorch reuses eager allocations,
-    # while CUDA graphs retain them in the graph-private pool.
+    # ATREX PORT sm120: fp32 partial buffers for the split-KV combine. Partials MUST be fp32 (the
+    # combine kernel's bf16-partial path faults on this build). Keep them invocation-local so eager
+    # execution can reuse storage through PyTorch's caching allocator and CUDA graphs can own the
+    # storage through their private pools. The kernels write every launched split; compact grids
+    # initialize LSE for slots that are not launched, and the dynamic short-Q reducer never reads
+    # O for a split outside the current request's runtime count.
     out_partial = lse_partial = runtime_num_splits = None
-    kernel_num_splits_dynamic = None
+    kernel_num_splits_dynamic = num_splits_dynamic
     if is_split_kv:
         out_partial = torch.empty(
             num_splits,
@@ -624,6 +617,16 @@ def _flash_attn_fwd(
                 batch_size, dtype=torch.int32, device=device
             )
             kernel_num_splits_dynamic = runtime_num_splits
+        use_short_q_dynamic_reducer = (
+            cu_seqlens_q is not None
+            and max_seqlen_q in (1, 2, 3, 4)
+            and total_q == batch_size * max_seqlen_q
+            and lse is None
+            and num_splits <= 256
+            and kernel_num_splits_dynamic is not None
+        )
+        if work_map is not None and not use_short_q_dynamic_reducer:
+            lse_partial.fill_(float("-inf"))
 
     compile_key = (
         device.index,
@@ -658,13 +661,18 @@ def _flash_attn_fwd(
         tile_n,
         q_stage,
         num_threads,
+        sm120_num_stages,
+        sm120_q_in_regs,
         is_split_kv,
         pack_gqa,
         use_lpt,
         arch,
         page_size,
-        # Dynamic splits change the compiled kernel's optional tensor signature.
+        # ATREX PORT sm120: DYNSPLIT / COMPACTGRID are constexpr in the kernel; omitting them would
+        # let a compact-grid launch reuse a non-compact cubin (wrong grid decode). page-aligned
+        # Paged-vs-not is already keyed by page_size above.
         kernel_num_splits_dynamic is not None if is_split_kv else False,
+        work_map.shape[1] if work_map is not None else 0,
         _runtime_balanced_splits,
         _runtime_balanced_grid_size,
         _runtime_balanced_batch_size,
@@ -682,6 +690,15 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
     )
+
+    if arch == 120 and is_fp8 and head_dim == 256:
+        # CuTe specializes zero strides in the normalized descale tensors.
+        # Presence alone cannot distinguish a broadcast batch from compact
+        # per-sequence scales with otherwise identical launch metadata.
+        compile_key += tuple(
+            None if tensor is None else tuple(tensor.stride())
+            for tensor in (q_descale, k_descale, v_descale)
+        )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -701,12 +718,17 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        # Runtime-balanced short-Q launches provide per-sequence split counts.
+        # ATREX PORT sm120: per-sequence split counts (DYNSPLIT) and host work map (COMPACTGRID).
         nsd_tensor = (
             to_cute_tensor(
                 kernel_num_splits_dynamic, assumed_align=4, leading_dim=0
             )
             if kernel_num_splits_dynamic is not None
+            else None
+        )
+        wm_tensor = (
+            to_cute_tensor(work_map, assumed_align=4, leading_dim=1)
+            if work_map is not None
             else None
         )
         q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -729,11 +751,6 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
-
-        qv_tensor = to_cute_tensor(qv)
-        gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
-        p_tensor = to_cute_tensor(p)
-        row_max_tensor = to_cute_tensor(row_max)
 
         if not FlashAttentionForwardSm120.can_implement(
             dtype,
@@ -773,140 +790,97 @@ def _flash_attn_fwd(
             is_split_kv=is_split_kv,
             page_size=page_size if page_table is not None else None,
             dynamic_splits=kernel_num_splits_dynamic is not None,
+            compact_grid=work_map is not None,
+            compact_short_q=work_map is not None and work_map.shape[1] == 1,
             runtime_balanced_splits=_runtime_balanced_splits,
             runtime_balanced_grid_size=_runtime_balanced_grid_size,
             runtime_balanced_batch_size=_runtime_balanced_batch_size,
         )
         fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
-        if qv is not None:
-            with use_filesystem_cutlass_dsl_version_hash():
-                compiled_kernel = cute.compile(
-                    fa_fwd,
-                    q_tensor,
-                    qv_tensor,
-                    k_tensor,
-                    v_tensor,
-                    o_tensor,
-                    lse_tensor,
-                    softmax_scale,
-                    p_tensor,
-                    row_max_tensor,
-                    cu_seqlens_q_tensor,
-                    cu_seqlens_k_tensor,
-                    seqused_q_tensor,
-                    seqused_k_tensor,
-                    gather_kv_indices_tensor,
-                    page_table_tensor,
-                    window_size_left,
-                    window_size_right,
-                    current_stream,
-                    options="--enable-tvm-ffi",
-                )
-            _flash_attn_fwd.compile_cache[compile_key] = compiled_kernel
-        else:
-            compile_args = [
-                fa_fwd,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                page_table_tensor,
-                nsd_tensor,
-                q_descale_tensor,
-                k_descale_tensor,
-                v_descale_tensor,
-                window_size_left,
-                window_size_right,
-                learnable_sink_tensor,
-            ]
-            compile_args.extend([
-                sparse_tensors,
-                AuxData(cute_aux_tensors, aux_scalars),
-            ])
-            compile_args.append(current_stream)
-            with use_filesystem_cutlass_dsl_version_hash():
-                compiled_kernel = cute.compile(
-                    *compile_args, options="--enable-tvm-ffi"
-                )
-            _flash_attn_fwd.compile_cache[compile_key] = compiled_kernel
+        compile_args = [
+            fa_fwd,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
+            page_table_tensor,
+            nsd_tensor,
+            wm_tensor,
+            q_descale_tensor,
+            k_descale_tensor,
+            v_descale_tensor,
+            window_size_left,
+            window_size_right,
+            learnable_sink_tensor,
+        ]
+        compile_args.extend([
+            sparse_tensors,
+            AuxData(cute_aux_tensors, aux_scalars),
+        ])
+        compile_args.append(current_stream)
+        with use_filesystem_cutlass_dsl_version_hash():
+            compiled_kernel = cute.compile(
+                *compile_args, options="--enable-tvm-ffi"
+            )
+        _flash_attn_fwd.compile_cache[compile_key] = compiled_kernel
 
     if not is_fake_mode():
-        q_call, k_call, v_call, qv_call = [
+        q_call, k_call, v_call = [
             t.detach() if t is not None else None
-            for t in (q, k, v, qv)
+            for t in (q, k, v)
         ]
         if is_fp8:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
-            q_call, k_call, v_call, qv_call = [
+            q_call, k_call, v_call = [
                 t.view(torch.uint8)
                 if t is not None
                 and t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
                 else t
-                for t in (q_call, k_call, v_call, qv_call)
+                for t in (q_call, k_call, v_call)
             ]
-        if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key](
-                q_call,
-                qv_call,
-                k_call,
-                v_call,
-                out.detach(),
-                lse,
-                softmax_scale,
-                p,
-                row_max,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                gather_kv_indices,
-                page_table,
-                window_size_left,
-                window_size_right,
+        call_args = [
+            q_call,
+            k_call,
+            v_call,
+            out.detach() if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            kernel_num_splits_dynamic,
+            work_map,
+            q_descale,
+            k_descale,
+            v_descale,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+        ]
+        call_args.extend([
+            (
+                normalized_block_sparse_tensors.mask_block_cnt,
+                normalized_block_sparse_tensors.mask_block_idx,
+                normalized_block_sparse_tensors.full_block_cnt,
+                normalized_block_sparse_tensors.full_block_idx,
+                normalized_block_sparse_tensors.cu_total_m_blocks,
+                normalized_block_sparse_tensors.cu_block_idx_offsets,
+                normalized_block_sparse_tensors.dq_write_order,
+                normalized_block_sparse_tensors.dq_write_order_full,
             )
-        else:
-            call_args = [
-                q_call,
-                k_call,
-                v_call,
-                out.detach() if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
-                softmax_scale,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                kernel_num_splits_dynamic,
-                q_descale,
-                k_descale,
-                v_descale,
-                window_size_left,
-                window_size_right,
-                learnable_sink,
-            ]
-            call_args.extend([
-                (
-                    normalized_block_sparse_tensors.mask_block_cnt,
-                    normalized_block_sparse_tensors.mask_block_idx,
-                    normalized_block_sparse_tensors.full_block_cnt,
-                    normalized_block_sparse_tensors.full_block_idx,
-                    normalized_block_sparse_tensors.cu_total_m_blocks,
-                    normalized_block_sparse_tensors.cu_block_idx_offsets,
-                    normalized_block_sparse_tensors.dq_write_order,
-                    normalized_block_sparse_tensors.dq_write_order_full,
-                )
-                if normalized_block_sparse_tensors is not None
-                else None,
-                AuxData(aux_tensors, aux_scalars),
-            ])
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            if normalized_block_sparse_tensors is not None
+            else None,
+            AuxData(aux_tensors, aux_scalars),
+        ])
+        _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         use_short_q_reducer = (
             cu_seqlens_q is not None
@@ -914,6 +888,7 @@ def _flash_attn_fwd(
             and total_q == batch_size * max_seqlen_q
             and lse is None
             and num_splits <= 256
+            and (work_map is None or kernel_num_splits_dynamic is not None)
         )
         if use_short_q_reducer:
             from atrex.src.nvidia.flash_attn.sm120.decode_reduce import sm120_q1_reduce
@@ -924,6 +899,14 @@ def _flash_attn_fwd(
                 out,
                 kernel_num_splits_dynamic,
                 max_seqlen_q,
+                # Split HD128 output columns across more SMs for the small
+                # FP8 cache: the original reducer launches only 10 Q1 CTAs.
+                parallel_columns=(
+                    is_fp8 and head_dim == 128 and num_head == 10
+                    and num_head_kv == 2 and batch_size == 1
+                    and max_seqlen_k is not None and max_seqlen_k <= 65536
+                    and num_splits >= 32 and kernel_num_splits_dynamic is None
+                ),
             )
         else:
             _flash_attn_fwd_combine(
@@ -940,7 +923,11 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
-# Split-KV combine uses the public FlashAttention CuTe kernel.
+# =====================================================================================
+# ATREX PORT sm120: split-KV combine. Vendored verbatim from the flash-attn cute interface
+# (flash-attn-4 provides the FlashAttentionForwardCombine kernel class; its Python wrappers live in
+# the interface). Only reached on the sm120 split-KV path (is_split_kv True).
+# =====================================================================================
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
@@ -1063,3 +1050,217 @@ def _flash_attn_fwd_combine(
 
 
 _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
+
+
+# HD256 FP8 TMA prefill. The existing HD128/BF16/decode implementation above
+# is unchanged. NVIDIA-derived kernel body: BSD-3-Clause; ATREX wrappers:
+# Apache-2.0. See NOTICE for the original source revision and license terms.
+import functools as _tma_functools
+from cutlass.cute.runtime import make_fake_compact_tensor as _tma_make_fake_compact_tensor
+from cutlass.cute.runtime import make_fake_stream as _tma_make_fake_stream
+from .prefill_cutedsl import _tma_FlashAttentionForwardSm120Fp8Tma
+
+# prefill_tma_runtime.py — Copyright 2026 Alibaba Group; SPDX-License-Identifier: Apache-2.0
+def _select_tma_prefill_config(max_q, batch, hq, hkv, sm_count, max_kv=0):
+    """Choose short-Q tiling, GQA reuse and bounded SplitKV parallelism."""
+    if max_q >= 4096:
+        return 128, False, 1
+
+    def waves(rows, heads, tile):
+        blocks = batch * heads * ((rows + tile - 1) // tile)
+        return (blocks + sm_count - 1) // sm_count
+
+    group = hq // hkv
+    plain_waves = waves(max_q, hq, 128)
+    packed_waves = waves(max_q * group, hkv, 128)
+    pack_gqa = group > 1 and packed_waves < plain_waves
+    rows, heads = (max_q * group, hkv) if pack_gqa else (max_q, hq)
+    target_waves = waves(rows, heads, 128)
+    q_tile = next(
+        tile for tile in ((32, 64, 128) if pack_gqa else (16, 32, 64, 128))
+        if waves(rows, heads, tile) <= target_waves
+    )
+    short_kv = 0 < max_kv <= 16384
+    medium_kv = max_q >= 128 and 6144 <= max_kv <= 16384
+    if short_kv and max_q >= 128:
+        q_tile = 128
+    blocks = batch * heads * ((rows + q_tile - 1) // q_tile)
+    num_splits = 1
+    # Packed groups with enough parallelism already approach the bandwidth
+    # limit. Split only their poorly filled second wave; low-batch unpacked
+    # tiles also benefit from partitioning a long KV scan.
+    if not pack_gqa or sm_count < blocks < 2 * sm_count:
+        limit = min(
+            32,
+            max(1, 5 * sm_count // blocks),
+            max(1, ((max_kv + 127) // 128) // 4),
+        )
+        if short_kv and q_tile >= 64:
+            # Restrict candidates before comparing waves per split. Clipping a
+            # winner afterwards can retain more partials for the same waves.
+            wave_budget = 5 if medium_kv else 1
+            limit = min(limit, max(1, wave_budget * sm_count // blocks))
+            if wave_budget > 1:
+                limit = min(limit, 4)
+        best_waves = (blocks + sm_count - 1) // sm_count
+        # Three partitions fill two waves for 64 CTAs on 110 SMs; four
+        # partitions need three waves plus the same combine launch.
+        candidates = (2, 3, 4) if medium_kv else (2, 4, 8, 16, 32)
+        for splits in candidates:
+            if splits > limit:
+                break
+            split_waves = (blocks * splits + sm_count - 1) // sm_count
+            if split_waves * num_splits < best_waves * splits:
+                num_splits, best_waves = splits, split_waves
+    return q_tile, pack_gqa, num_splits
+
+
+def _select_tma_prefill_launch_config(max_q, batch, hq, hkv, sm_count, max_kv=0):
+    """Use narrow TMA tiles for short-KV, unsplit prefill."""
+    q_tile, pack_gqa, num_splits = _select_tma_prefill_config(
+        max_q, batch, hq, hkv, sm_count, max_kv,
+    )
+    kv_tile = 128
+    if (max_q < 4096 and 0 < max_kv <= 7168 and q_tile == 128
+            and not pack_gqa and num_splits == 1):
+        q_tile, kv_tile = 64, 64
+    return q_tile, pack_gqa, num_splits, kv_tile
+
+
+@_tma_functools.cache
+def _compile_tma_prefill(
+    hq, hkv, page_size, kv_strides,
+    q_descale_strides, k_descale_strides, v_descale_strides,
+    q_tile, pack_gqa, num_splits, device_index, kv_tile=128,
+):
+    # Device belongs in the cache key even though compilation uses the current
+    # CUDA device selected by the public API. Lengths remain runtime metadata.
+    kernel = _tma_FlashAttentionForwardSm120Fp8Tma(
+        in_dtype=cutlass.Float8E4M3FN,
+        out_dtype=cutlass.BFloat16 if num_splits == 1 else cutlass.Float32,
+        is_causal=True,
+        head_tile=256,
+        kv_tile=kv_tile,
+        q_tile=q_tile,
+        use_paged_kv=True,
+        num_tokens_per_page=page_size,
+        balanced_scheduler=True,
+        pack_gqa=pack_gqa,
+        num_splits=num_splits,
+    )
+    total_q, batch, pages, capacity, cu_size = (cute.sym_int() for _ in range(5))
+    q = _tma_make_fake_compact_tensor(
+        cutlass.Float8E4M3FN, (total_q, hq, 256),
+        stride_order=(2, 1, 0), assumed_align=16,
+    )
+    out = _tma_make_fake_compact_tensor(
+        cutlass.BFloat16 if num_splits == 1 else cutlass.Float32,
+        (total_q if num_splits == 1 else cute.sym_int(), hq, 256),
+        stride_order=(2, 1, 0), assumed_align=16,
+    )
+    lse = (
+        _tma_make_fake_compact_tensor(
+            cutlass.Float32, (num_splits * hq, total_q),
+            stride_order=(1, 0), assumed_align=4,
+        )
+        if num_splits > 1 else None
+    )
+
+    def kv():
+        # K/V share inner strides but retain independent symbolic page strides.
+        # Both NHD pools and vLLM's interleaved HND views stay caller-owned.
+        return cute.runtime.make_fake_tensor(
+            cutlass.Float8E4M3FN, (pages, page_size, hkv, 256),
+            stride=(cute.sym_int(divisibility=16), *kv_strides, 1), assumed_align=16,
+        )
+
+    seq = _tma_make_fake_compact_tensor(cutlass.Int32, (batch,), assumed_align=4)
+    cu = _tma_make_fake_compact_tensor(cutlass.Int32, (cu_size,), assumed_align=4)
+    table = _tma_make_fake_compact_tensor(
+        cutlass.Int32, (batch, capacity), stride_order=(1, 0), assumed_align=4,
+    )
+
+    def descale(strides):
+        if strides is None:
+            return None
+        if strides == (hkv, 1):
+            # Preserve the existing compact specialization for NHD benchmarks.
+            return _tma_make_fake_compact_tensor(
+                cutlass.Float32, (batch, hkv),
+                stride_order=(1, 0), assumed_align=4,
+            )
+        # Static zero strides preserve expanded per-tensor/per-head descales.
+        return cute.runtime.make_fake_tensor(
+            cutlass.Float32, (batch, hkv), stride=strides, assumed_align=4,
+        )
+
+    kernel.atrex_fp8_prefill_nhd_tma_kernel.set_name_prefix("atrex")
+    with use_filesystem_cutlass_dsl_version_hash():
+        return cute.compile(
+            kernel, q, kv(), kv(), out, lse,
+            cutlass.Float32(1.0), cutlass.Float32(1.0),
+            None,  # All attention tiles execute; no skip-softmax approximation.
+            _tma_make_fake_stream(use_tvm_ffi_env_stream=True),
+            seq, cu, table, None, cutlass.Int32(1), False,
+            descale(q_descale_strides), descale(k_descale_strides), descale(v_descale_strides),
+            options="--enable-tvm-ffi",
+        )
+
+
+def _forward_tma_prefill(**kwargs):
+    """Run the page64/page128 causal prefill specialization."""
+    q, k, v = (kwargs[name] for name in ("q", "k", "v"))
+    out = kwargs.get("out")
+    if out is None:
+        out = torch.empty_like(q, dtype=torch.bfloat16)
+    q_scale, k_scale, v_scale = (
+        kwargs.get(name) for name in ("q_descale", "k_descale", "v_descale")
+    )
+    # Long prefill always uses this configuration. Avoid looking up hardware
+    # and sequence metadata that the selector would immediately discard.
+    q_tile, pack_gqa, num_splits, kv_tile = 128, False, 1, 128
+    if kwargs["max_seqlen_q"] < 4096:
+        q_tile, pack_gqa, num_splits, kv_tile = _select_tma_prefill_launch_config(
+            kwargs["max_seqlen_q"], kwargs["cu_seqlens_q"].numel() - 1,
+            q.shape[1], k.shape[2],
+            torch.cuda.get_device_properties(q.device).multi_processor_count,
+            kwargs.get("max_seqlen_k") or kwargs["page_table"].shape[1] * k.shape[1],
+        )
+    if kwargs.get("num_splits") == 1:
+        num_splits = 1
+    out_partial = lse_partial = None
+    kernel_out, kernel_lse = out, None
+    if num_splits > 1:
+        # The established combine path requires FP32 partials on this build.
+        # Keep both allocations local so CUDA graphs own their captured storage.
+        out_partial = torch.empty(
+            (num_splits, *q.shape), dtype=torch.float32, device=q.device,
+        )
+        lse_partial = torch.empty(
+            (num_splits, q.shape[1], q.shape[0]),
+            dtype=torch.float32, device=q.device,
+        )
+        kernel_out = out_partial.view(-1, q.shape[1], q.shape[2])
+        kernel_lse = lse_partial.view(-1, q.shape[0])
+    compiled = _compile_tma_prefill(
+        q.shape[1], k.shape[2], k.shape[1], (k.stride(1), k.stride(2)),
+        None if q_scale is None else q_scale.stride(),
+        None if k_scale is None else k_scale.stride(),
+        None if v_scale is None else v_scale.stride(),
+        q_tile, pack_gqa, num_splits, q.device.index or 0, kv_tile=kv_tile,
+    )
+    # The TVM-FFI runtime supplies the current stream through EnvStream.
+    compiled(
+        q, k, v, kernel_out, kernel_lse,
+        cutlass.Float32(kwargs["softmax_scale"] * math.log2(math.e)),
+        cutlass.Float32(1.0), None,
+        kwargs["seqused_k"], kwargs["cu_seqlens_q"], kwargs["page_table"],
+        None, cutlass.Int32(kwargs["max_seqlen_q"]), False,
+        q_scale, k_scale, v_scale,
+    )
+    if num_splits > 1:
+        _flash_attn_fwd_combine(
+            out_partial, lse_partial.transpose(-1, -2), out,
+            cu_seqlens=kwargs["cu_seqlens_q"],
+        )
+    return out, None

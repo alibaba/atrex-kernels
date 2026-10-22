@@ -49,6 +49,16 @@ other supported short-Q/decode and prefill calls use the corresponding Atrex
 kernels. Callers can check eligibility with `can_use_flash_attn_varlen_func`;
 unsupported options are rejected rather than silently ignored.
 
+SM120 also supports HD128 BF16 and FP8 E4M3 noncausal paged attention. HD128
+FP8 accepts page sizes 64/128/1664/3328 and BF16 output. Eligible HD256 E4M3
+causal paged prefill uses TMA when the maximum query length exceeds four,
+the page size is 64/128, and no LSE, window, sink, or softcap is requested.
+The specialization accepts contiguous NHD and vLLM HND K/V views with FP32
+`[batch,num_kv_heads]` descales, including broadcast views. Q1–4 decode keeps
+the native packed-GQA/SplitKV implementation; other supported calls retain
+the native compatibility path. Compilation remains lazy: prewarm each
+specialization before CUDA Graph capture.
+
 This is a breaking change for callers of the former lower-level SM103 FA4
 signature: use the varlen/paged arguments (`block_table`, `window_size`,
 `s_aux`, `return_softmax_lse`) and its conditional return shape instead of
