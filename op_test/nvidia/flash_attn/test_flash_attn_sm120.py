@@ -1,17 +1,7 @@
-"""Tests for the SM120 (Blackwell GeForce / L20N) hd256 CuTeDSL flash-attention op.
+"""Basic SM120 FlashAttention tests through the installed public API.
 
-Covers the full_attention layers of the Qwen3.5 hybrid models on sm120:
-  - Qwen3.5-35B : q16 / kv2 / hd256 (QPK=8)
-  - Qwen3.5-27B : q24 / kv4 / hd256 (QPK=6)
-Exercises BF16 and FP8 inputs through the public `atrex.flash_attn_varlen_func` entry, which dispatches SM120 to
-the vendored SM80-class kernel. Correctness is checked against an fp32 reference
-from the same inputs. BF16 -> cos>0.999, rel_l1<0.01 (cosine is the primary gate).
-
-Exercises: prefill (causal varlen), paged decode (packed-GQA batched + SplitKV), and the ragged
-decode compact-grid path.
-
-Run directly:
-    python op_test/nvidia/flash_attn/test_flash_attn_sm120.py
+Cover HD128/HD256 BF16/FP8 prefill and decode against FP32 references,
+including TMA routing, CUDA Graph replay, and native compatibility.
 """
 
 import math
@@ -23,8 +13,16 @@ from op_test.utils.flash_attn_contract import build_case, profile_case, referenc
 
 
 def _requires_sm120():
+    from importlib.metadata import distribution
+    from pathlib import Path
+
+    import atrex
+
     assert torch.cuda.is_available(), "SM120 GPU is required"
     assert torch.cuda.get_device_capability() == (12, 0)
+    assert Path(atrex.__file__).resolve() == Path(
+        distribution("atrex").locate_file("atrex/__init__.py")
+    ).resolve(), "Test the installed wheel, not an unpacked source package"
     from atrex import flash_attn_varlen_func  # noqa: F401
 
 
@@ -163,6 +161,135 @@ def test_sm120_fp8_decode_split_policy(batch, hkv, q_len, expected):
         query_length=q_len,
         is_fp8=True,
     ) == expected
+
+
+def _assert_paged_output(case, actual):
+    expected, _ = reference(case)
+    assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
+    rel_l1, cosine, _ = _metrics(actual.float(), expected)
+    assert cosine > 0.999
+    assert rel_l1 < (0.04 if case["q"].dtype == torch.float8_e4m3fn else 0.01)
+
+
+def _check_mutable_graph(case, *, splits=0):
+    from atrex import flash_attn_varlen_func
+
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    call = dict(case, out=out, num_splits=splits)
+    for _ in range(3):
+        actual = flash_attn_varlen_func(**call)
+    assert actual.data_ptr() == out.data_ptr()
+    _assert_paged_output(case, actual)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = flash_attn_varlen_func(**call)
+    case["seqused_k"].sub_(1)
+    case["q"].copy_((-case["q"].float()).to(case["q"].dtype))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert actual.data_ptr() == out.data_ptr()
+    _assert_paged_output(case, actual)
+    return call
+
+
+@pytest.mark.parametrize(
+    "page_size,q_len,fp8,splits",
+    [(16, 65, False, 0), (64, 4, False, 4),
+     (64, 65, True, 0), (128, 4, True, 4)],
+)
+def test_sm120_hd128_paged(page_size, q_len, fp8, splits):
+    from atrex import can_use_flash_attn_varlen_func
+
+    _requires_sm120()
+    case = build_case(page_size, [q_len, 3], [513, 257],
+                      hq=10, hkv=2, head_dim=128, fp8=fp8)
+    case["causal"] = False
+    assert can_use_flash_attn_varlen_func(**case)
+    call = _check_mutable_graph(case, splits=splits)
+    if fp8:
+        names = profile_case(call)
+        assert any("atrex_sm120_prefill_kernel" in name for name in names), names
+
+
+def test_sm120_hd128_fp8_tuned_decode(monkeypatch):
+    from atrex.src.nvidia.flash_attn.sm120 import decode_reduce
+
+    _requires_sm120()
+    case = build_case(64, [4], [32768], hq=10, hkv=2, head_dim=128)
+    case["causal"] = False
+    original, observed = decode_reduce.sm120_q1_reduce, []
+
+    def record_reduce(*args, **kwargs):
+        observed.append(kwargs["parallel_columns"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(decode_reduce, "sm120_q1_reduce", record_reduce)
+    _check_mutable_graph(case)
+    assert observed and all(observed), observed
+
+
+@pytest.mark.parametrize("page_size,q_len,layout", [(64, 5, "nhd"), (128, 257, "vllm")])
+def test_sm120_hd256_fp8_tma(page_size, q_len, layout):
+    _requires_sm120()
+    case = build_case(page_size, [q_len, 3], [1025, 257], hq=16, hkv=2)
+    case["block_table"] = case["block_table"].contiguous()
+    if layout == "vllm":
+        pages = case["k"].shape[0]
+        cache = torch.empty((pages, 2, page_size, 512), device="cuda", dtype=case["q"].dtype)
+        k, v = cache.transpose(1, 2).split(256, dim=-1)
+        k.copy_(case["k"])
+        v.copy_(case["v"])
+        case.update(k=k, v=v)
+        for name in ("q_descale", "k_descale", "v_descale"):
+            case[name] = case[name][0, 0].expand(2, 2)
+    call = _check_mutable_graph(case)
+    names = profile_case(call)
+    assert any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
+    assert not any("atrex_sm120_prefill_kernel" in name for name in names), names
+
+
+def test_sm120_fp8_tma_split_empty_kv():
+    from atrex import flash_attn_varlen_func
+
+    _requires_sm120()
+    case = build_case(64, [128, 128], [0, 4096], hq=16, hkv=2)
+    case["block_table"] = case["block_table"].contiguous()
+    actual = flash_attn_varlen_func(**case)
+    assert torch.count_nonzero(actual[:128]) == 0
+    _assert_paged_output(case, actual)
+    names = profile_case(case)
+    assert any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
+    assert any("combine" in name for name in names), names
+
+
+def test_sm120_fp8_lse_compatibility():
+    from op_test.utils.flash_attn_contract import check_case
+
+    _requires_sm120()
+    case = build_case(64, [256], [4096], hq=16, hkv=2)
+    case["block_table"] = case["block_table"].contiguous()
+    check_case(case)
+    names = profile_case(dict(case, return_softmax_lse=True))
+    assert any("atrex_sm120_prefill_kernel" in name for name in names), names
+    assert any("combine" in name for name in names), names
+    assert not any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("q_len", [4, 65])
+def test_sm120_fp8_descale_cache_layout(q_len, head_dim):
+    """Reuse the same shape with broadcast and compact scale strides."""
+    from atrex import flash_attn_varlen_func
+
+    _requires_sm120()
+    base = build_case(64, [q_len, 3], [513, 257], hq=16, hkv=2, head_dim=head_dim)
+    base["causal"] = head_dim == 256
+    base["block_table"] = base["block_table"].contiguous()
+    broadcast = dict(base)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        broadcast[name] = base[name][:1].expand(2, 2)
+    for case in (broadcast, base, broadcast):
+        _assert_paged_output(case, flash_attn_varlen_func(**case))
 
 
 def _fp32_prefill_ref(q, k, v, cu, seqs, scale):
@@ -327,7 +454,7 @@ def test_sm120_paged_prefill_fp8(dtype, min_cos, max_rel_l1, page_size):
 
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize("q_len,kv_len", [(256, 256), (256, 4096)])
-def test_sm120_paged_prefill_fp8_auto_schedule(page_size, q_len, kv_len):
+def test_sm120_paged_prefill_fp8_tma_default_schedule(page_size, q_len, kv_len):
     _requires_sm120()
     from atrex import flash_attn_varlen_func
 
@@ -497,29 +624,20 @@ def test_sm120_paged_prefill_fp8_b64_varlen(page_size):
 
 @pytest.mark.parametrize("page_size", [64, 128])
 def test_sm120_paged_prefill_fp8_b64_cuda_graph(page_size):
-    """B64 paged FP8 prefill matches the static path across graph replays."""
+    """B64 TMA prefill reads changing KV lengths on every graph replay."""
     _requires_sm120()
     from atrex import flash_attn_varlen_func
-    from atrex.src.nvidia.flash_attn.sm120.runtime import _flash_attn_fwd
 
     torch.manual_seed(17)
     dev, batch, q_len, max_k = "cuda", 64, 8, 1024
     hq, hkv, dim = 16, 2, 256
     pages_per_request = math.ceil(max_k / page_size)
-    q = (torch.randn(batch * q_len, hq, dim, device=dev) * 0.5).to(
-        torch.float8_e4m3fn
-    )
+    q = (torch.randn(batch * q_len, hq, dim, device=dev) * 0.5).to(torch.float8_e4m3fn)
     k = (
-        torch.randn(
-            batch * pages_per_request, page_size, hkv, dim, device=dev
-        )
-        * 0.5
+        torch.randn(batch * pages_per_request, page_size, hkv, dim, device=dev) * 0.5
     ).to(torch.float8_e4m3fn)
     v = (
-        torch.randn(
-            batch * pages_per_request, page_size, hkv, dim, device=dev
-        )
-        * 0.5
+        torch.randn(batch * pages_per_request, page_size, hkv, dim, device=dev) * 0.5
     ).to(torch.float8_e4m3fn)
     cu_q = torch.arange(batch + 1, device=dev, dtype=torch.int32) * q_len
     seqused_k = torch.empty(batch, device=dev, dtype=torch.int32)
@@ -529,55 +647,35 @@ def test_sm120_paged_prefill_fp8_b64_cuda_graph(page_size):
     descale = torch.ones(batch, hkv, device=dev)
     scale = 1.0 / math.sqrt(dim)
     out = torch.empty_like(q, dtype=torch.bfloat16)
-    static_out = torch.empty_like(out)
+    kwargs = dict(
+        q=q, k=k, v=v, cu_seqlens_q=cu_q, seqused_k=seqused_k,
+        block_table=page_table, max_seqlen_q=q_len, max_seqlen_k=256 * 1024,
+        softmax_scale=scale, causal=True, num_splits=0,
+        q_descale=descale, k_descale=descale, v_descale=descale, out=out,
+    )
 
     def run_public():
-        return flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_q,
-            seqused_k=seqused_k,
-            block_table=page_table,
-            max_seqlen_q=q_len,
-            max_seqlen_k=256 * 1024,
-            softmax_scale=scale,
-            causal=True,
-            num_splits=0,
-            q_descale=descale,
-            k_descale=descale,
-            v_descale=descale,
-            out=out,
-        )
+        return flash_attn_varlen_func(**kwargs)
 
-    def run_static():
-        return _flash_attn_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_q,
-            seqused_k=seqused_k,
-            page_table=page_table,
-            max_seqlen_q=q_len,
-            max_seqlen_k=256 * 1024,
-            softmax_scale=scale,
-            causal=True,
-            num_splits=1,
-            pack_gqa=True,
-            q_descale=descale,
-            k_descale=descale,
-            v_descale=descale,
-            out=static_out,
+    def check_reference(actual):
+        assert actual.data_ptr() == out.data_ptr()
+        assert torch.isfinite(actual).all()
+        expected = _fp32_paged_prefill_ref(
+            q, k, v, cu_q, [q_len] * batch, seqused_k.cpu().tolist(),
+            page_table, page_size, scale, descale, descale, descale,
         )
+        rel_l1, cosine, max_abs = _metrics(actual.float(), expected)
+        assert cosine > 0.999, (cosine, rel_l1, max_abs)
+        assert rel_l1 < 0.04, (cosine, rel_l1, max_abs)
 
-    first_lengths = torch.tensor(
-        [32] * 32 + [1024] * 32, device=dev, dtype=torch.int32
-    )
+    first_lengths = torch.tensor([32] * 32 + [1024] * 32, device=dev, dtype=torch.int32)
     seqused_k.copy_(first_lengths)
-    run_static()
-    run_public()
+    actual = run_public()
     torch.cuda.synchronize()
-    assert torch.equal(out, static_out)
+    check_reference(actual)
+    names = profile_case(kwargs)
+    assert any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
+    assert not any("atrex_sm120_prefill_kernel" in name for name in names), names
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -588,11 +686,10 @@ def test_sm120_paged_prefill_fp8_b64_cuda_graph(page_size):
         torch.full((batch,), 256, device=dev, dtype=torch.int32),
     ):
         seqused_k.copy_(lengths)
+        out.fill_(float("nan"))
         graph.replay()
-        run_static()
         torch.cuda.synchronize()
-        assert replay_out.data_ptr() == out.data_ptr()
-        assert torch.equal(replay_out, static_out)
+        check_reference(replay_out)
 
 
 # ----------------------------------------------------------------------------- decode
@@ -890,114 +987,5 @@ def test_sm120_real_kernel_events(q_lens, kv_lens, num_splits, required_helper):
         assert any(required_helper in name.lower() for name in custom), custom
 
 
-def _benchmark_revision(api_contract, output_path):
-    """Private L20N migration benchmark for same-job ABBA comparison.
-
-    ``legacy`` is the source ``l20n-fa4`` public contract and ``current`` is
-    the unified dev contract. Only their intentional argument/return rename is
-    adapted. Both modes use identical FP8 tensors, descales, graph capture,
-    warmup, measurement order, and production-shaped prefill/decode cases.
-    """
-    import json
-    from pathlib import Path
-    import statistics
-    import time
-    import atrex
-
-    _requires_sm120()
-    workloads = [
-        ("prefill-b1-q256-k4096", [256], [4096]),
-        ("prefill-b1-q2048-k2048", [2048], [2048]),
-        ("prefill-b8-q128-k4096", [128] * 8, [4096] * 8),
-        ("decode-b1-q1-k16384", [1], [16384]),
-        ("decode-b16-q1-k16384", [1] * 16, [16384] * 16),
-        ("mtp-b8-q4-k4096", [4] * 8, [4096] * 8),
-    ]
-    records = []
-    for name, q_lens, kv_lens in workloads:
-        case = build_case(64, q_lens, kv_lens, hq=16, hkv=2, fp8=True)
-        out = torch.empty_like(case["q"], dtype=torch.bfloat16)
-        kwargs = dict(case, out=out, num_splits=0)
-        if api_contract == "legacy":
-            kwargs["page_table"] = kwargs.pop("block_table")
-            kwargs["return_lse"] = False
-        else:
-            kwargs["return_softmax_lse"] = False
-
-        def invoke():
-            result = atrex.flash_attn_varlen_func(**kwargs)
-            return result[0] if api_contract == "legacy" else result
-
-        actual = invoke()
-        expected, _ = reference(case)
-        torch.testing.assert_close(actual.float(), expected, atol=3e-2, rtol=5e-2)
-        del expected
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(5):
-                invoke()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(20):
-                invoke()
-        for _ in range(5):
-            graph.replay()
-        torch.cuda.synchronize()
-        warm_until = time.monotonic() + 0.5
-        while time.monotonic() < warm_until:
-            graph.replay()
-            torch.cuda.synchronize()
-        samples = []
-        for _ in range(31):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            graph.replay()
-            end.record()
-            end.synchronize()
-            samples.append(start.elapsed_time(end) / 20)
-        record = dict(
-            name=name,
-            batch=len(q_lens),
-            max_q=max(q_lens),
-            max_k=max(kv_lens),
-            page_size=64,
-            median_ms=statistics.median(samples),
-            samples_ms=samples,
-        )
-        records.append(record)
-        print({key: value for key, value in record.items()
-               if key != "samples_ms"}, flush=True)
-    with Path(output_path).open("x") as handle:
-        json.dump(
-            dict(
-                atrex_path=atrex.__file__,
-                contract=api_contract,
-                device=torch.cuda.get_device_name(),
-                capability=torch.cuda.get_device_capability(),
-                torch_version=torch.__version__,
-                cases=records,
-            ),
-            handle,
-            indent=2,
-        )
-
-
 if __name__ == "__main__":
-    import argparse
-    import sys
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--benchmark-contract", choices=["legacy", "current"]
-    )
-    parser.add_argument("--benchmark-output")
-    args = parser.parse_args()
-    if args.benchmark_contract is None:
-        sys.exit(pytest.main([__file__, "-v", "-s"]))
-    if args.benchmark_output is None:
-        parser.error("--benchmark-output is required with --benchmark-contract")
-    _benchmark_revision(args.benchmark_contract, args.benchmark_output)
+    raise SystemExit(pytest.main([__file__, "-v", "-s"]))

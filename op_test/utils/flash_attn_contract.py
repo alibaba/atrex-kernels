@@ -38,16 +38,16 @@ def error_metrics(actual, expected):
 
 
 def build_case(page_size, q_lens, kv_lens, *, layout="interleaved", fp8=True,
-               hq=8, hkv=1):
+               hq=8, hkv=1, head_dim=256):
     torch.manual_seed(1729)
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
     counts = [math.ceil(n / page_size) for n in kv_lens]
     pages = sum(counts)
     if layout == "interleaved":
-        cache = (torch.randn(pages, 2, page_size, hkv, 256, device="cuda") * .4).to(dtype)
+        cache = (torch.randn(pages, 2, page_size, hkv, head_dim, device="cuda") * .4).to(dtype)
         k, v = cache[:, 0], cache[:, 1]
     elif layout == "strided":
-        cache = (torch.randn(pages, 2, page_size * 2, hkv, 256, device="cuda") * .4).to(dtype)
+        cache = (torch.randn(pages, 2, page_size * 2, hkv, head_dim, device="cuda") * .4).to(dtype)
         k, v = cache[:, 0, ::2], cache[:, 1, ::2]
     else:
         raise ValueError(layout)
@@ -62,7 +62,7 @@ def build_case(page_size, q_lens, kv_lens, *, layout="interleaved", fp8=True,
     offsets = [0]
     for n in q_lens:
         offsets.append(offsets[-1] + n)
-    q = (torch.randn(offsets[-1], hq, 256, device="cuda") * .4).to(dtype)
+    q = (torch.randn(offsets[-1], hq, head_dim, device="cuda") * .4).to(dtype)
     scales = [torch.tensor(values, dtype=torch.float32, device="cuda").reshape(-1, 1)
               + torch.arange(hkv, dtype=torch.float32, device="cuda")[None, :] * .0625
               for values in ([.75 + .125*i for i in range(len(counts))],
@@ -72,7 +72,7 @@ def build_case(page_size, q_lens, kv_lens, *, layout="interleaved", fp8=True,
                 cu_seqlens_q=torch.tensor(offsets, dtype=torch.int32, device="cuda"),
                 seqused_k=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 max_seqlen_q=max(q_lens), max_seqlen_k=max(kv_lens),
-                softmax_scale=256**-.5, causal=True,
+                softmax_scale=head_dim**-.5, causal=True,
                 q_descale=scales[0] if fp8 else None,
                 k_descale=scales[1] if fp8 else None,
                 v_descale=scales[2] if fp8 else None)
@@ -92,8 +92,8 @@ def reference(case):
             continue
         ids = case["block_table"][r, :math.ceil(length/k.shape[1])].long()
         qr = q[cu[r]:cu[r+1]].float()
-        kr = k[ids].reshape(-1, hkv, 256)[:length].float().repeat_interleave(group, dim=1)
-        vr = v[ids].reshape(-1, hkv, 256)[:length].float().repeat_interleave(group, dim=1)
+        kr = k[ids].reshape(-1, hkv, q.shape[-1])[:length].float().repeat_interleave(group, dim=1)
+        vr = v[ids].reshape(-1, hkv, q.shape[-1])[:length].float().repeat_interleave(group, dim=1)
         for name in ("q_descale", "k_descale", "v_descale"):
             if case[name] is not None:
                 scale = case[name][r].repeat_interleave(group).reshape(1, hq, 1)
@@ -103,7 +103,8 @@ def reference(case):
         scores = torch.einsum("qhd,khd->hqk", qr, kr) * case["softmax_scale"]
         rows = torch.arange(nq, device=q.device) + length - nq
         cols = torch.arange(length, device=q.device)
-        scores.masked_fill_(cols[None, :] > rows[:, None], -torch.inf)
+        if case["causal"]:
+            scores.masked_fill_(cols[None, :] > rows[:, None], -torch.inf)
         lse[:, cu[r]:cu[r+1]] = torch.logsumexp(scores, dim=-1)
         probability = torch.nan_to_num(torch.softmax(scores, dim=-1))
         result[cu[r]:cu[r+1]] = torch.einsum("hqk,khd->qhd", probability, vr)

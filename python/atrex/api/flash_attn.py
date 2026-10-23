@@ -163,8 +163,23 @@ def _validate_flash_attn_call(call):
         raise NotImplementedError("Atrex attention requires matching Q/K/V dtypes")
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
         raise NotImplementedError(f"Unsupported attention dtype {q.dtype}")
-    if q.shape[-1] != 256 or k.shape[-1] != 256 or v.shape[-1] != 256:
-        raise NotImplementedError("Atrex attention currently requires head_dim=256")
+    target = detect_device_target(q.device)
+    head_dim = q.shape[-1]
+    supported_head_dims = (
+        (128, 256)
+        if (target.family, target.arch) == ("nvidia", "sm120")
+        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        else (256,)
+    )
+    if (
+        head_dim not in supported_head_dims
+        or k.shape[-1] != head_dim
+        or v.shape[-1] != head_dim
+    ):
+        raise NotImplementedError(
+            f"Atrex {target.family}/{target.arch} attention requires matching "
+            f"head dimensions in {supported_head_dims}"
+        )
     if k.shape[:-1] != v.shape[:-1]:
         raise ValueError("Incompatible K/V dimensions")
     if k.shape[-2] <= 0 or q.shape[-2] % k.shape[-2]:
@@ -204,8 +219,23 @@ def _validate_flash_attn_call(call):
         if softcap not in (0, 0.0, logits_soft_cap):
             raise ValueError("softcap and logits_soft_cap disagree")
         softcap = logits_soft_cap
-    target = detect_device_target(q.device)
     target_key = (target.family, target.arch)
+    if (
+        target_key == ("nvidia", "sm120")
+        and head_dim == 128
+        and q.dtype == torch.float8_e4m3fn
+        and (
+            call["causal"] or block_table is None
+            or not isinstance(call["max_seqlen_q"], int)
+            or call["max_seqlen_q"] <= 0
+            or k.shape[1] not in (64, 128, 1664, 3328)
+            or softcap or call["s_aux"] is not None
+        )
+    ):
+        raise NotImplementedError(
+            "Atrex SM120 FP8 HD128 requires noncausal paged attention, "
+            "page_size=64/128/1664/3328 without softcap or sinks"
+        )
     supported_versions = _TARGET_FA_VERSIONS.get(target_key)
     if supported_versions is None:
         raise NotImplementedError(

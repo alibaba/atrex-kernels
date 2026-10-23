@@ -43,3 +43,49 @@ headers, with FlashAttention-for-SAIL as a reference. PPU CuTe/ACTLASS/ACTLIZE
 headers are not bundled or required by this implementation. The reference
 vendor BSD-3-Clause license is retained in
 src/ppu/flash_attn/zwm890p/decode/LICENSE.
+
+FlashInfer SM120 FP8 Prefill
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+Source: https://github.com/flashinfer-ai/flashinfer at commit
+e44067b1fbfce66f547d48c41976b1a57366b8f8
+Original path:
+flashinfer/cute_dsl/attention/fmha/sm120/fmha_prefill_fp8_tma.py
+
+The NVIDIA SM120 FP8 prefill implementation adapts the upstream kernel class
+and body, including the TMA K/V pipeline, warp MMA, online softmax, scheduler,
+and output epilogue. ATREX adaptations provide NHD paged-KV storage, runtime
+[B,Hkv] descales, ATREX API integration, natural-log head-major LSE, and
+invalid-tail handling. The adapted source retains the upstream BSD notice and
+copyright attribution. The BSD-3-Clause terms for this component follow.
+
+The upstream helper section bearing a separate NVIDIA proprietary notice is
+excluded from the adapted module. Local PTX/CuTe helpers are maintained in
+separately attributed ATREX sections alongside the kernel body. The exact
+source revision and adaptation patch are retained as provenance; this notice
+does not claim the retained kernel body
+was independently authored by ATREX.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
