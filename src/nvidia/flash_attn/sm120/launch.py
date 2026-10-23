@@ -219,7 +219,6 @@ def _can_run_fp8_prefill_tma(kwargs):
         or kwargs.get("window_size_left") is not None
         or kwargs.get("window_size_right") is not None
         or kwargs.get("learnable_sink") is not None
-        or kwargs.get("qv") is not None
         or kwargs.get("cu_seqlens_k") is not None
         or cu is None or seq is None or pages is None
         or not all(t.is_contiguous() for t in (cu, seq, pages))
@@ -276,9 +275,9 @@ def _run_sm120(**kwargs):
     Host dispatch is based only on graph-static metadata and follows three
     routes:
 
-    * Q1/Q2/Q3/Q4 short-Q -> native causal packed-GQA + SplitKV;
+    * eligible Q1/Q2/Q3/Q4 short-Q -> native packed-GQA + SplitKV;
     * eligible HD256 E4M3 prefill with Q>=5 -> TMA;
-    * other attention shapes -> the general causal-varlen kernel.
+    * other supported attention calls -> the native compatibility path.
 
     All routes keep Q, output and paged-KV storage owned by the caller.
     """
@@ -296,7 +295,7 @@ def _run_sm120(**kwargs):
     num_splits_dynamic = kwargs.get("num_splits_dynamic")
     work_map = kwargs.get("work_map")
 
-    # Keep speculative verification as one native causal attention problem.
+    # Keep short-Q and speculative verification as one native attention problem.
     # Q positions and grouped query heads are packed together inside the
     # kernel, matching the SM103 short-Q design without using its SM103-only
     # tcgen05/TMEM instructions.  page32 requires tile_n=32: tile_n=64 would

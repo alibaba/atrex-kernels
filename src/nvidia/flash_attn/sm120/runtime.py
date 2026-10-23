@@ -147,7 +147,6 @@ def _flash_attn_fwd(
     seqused_k: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
-    min_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -438,6 +437,7 @@ def _flash_attn_fwd(
                 and max_seqlen_q is not None
                 and max_seqlen_q >= 256
                 and total_q >= 8192
+                and (not is_fp8 or page_size is not None)
             ):
                 # HD128 HQ10/HKV2 Q8K/K64K: 13.54ms -> 11.87ms in the
                 # same-GPU sweep; two smaller-SMEM CTAs feed warp MMA.
@@ -691,7 +691,7 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
     )
 
-    if arch == 120 and is_fp8 and head_dim == 256:
+    if arch == 120 and is_fp8:
         # CuTe specializes zero strides in the normalized descale tensors.
         # Presence alone cannot distinguish a broadcast batch from compact
         # per-sequence scales with otherwise identical launch metadata.
@@ -1052,8 +1052,9 @@ def _flash_attn_fwd_combine(
 _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
 
 
-# HD256 FP8 TMA prefill. The existing HD128/BF16/decode implementation above
-# is unchanged. NVIDIA-derived kernel body: BSD-3-Clause; ATREX wrappers:
+# HD256 FP8 TMA prefill. Keep both routes in the SM120 runtime module; private
+# _tma_ helpers delimit the adapted implementation without adding a parallel
+# public API. NVIDIA-derived kernel body: BSD-3-Clause; ATREX wrappers:
 # Apache-2.0. See NOTICE for the original source revision and license terms.
 import functools as _tma_functools
 from cutlass.cute.runtime import make_fake_compact_tensor as _tma_make_fake_compact_tensor

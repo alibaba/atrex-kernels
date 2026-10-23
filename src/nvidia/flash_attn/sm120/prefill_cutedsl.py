@@ -6,7 +6,6 @@
 # Built on Cute-DSL example: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/ampere/flash_attention_v2.py
 
 import math
-import os
 from types import SimpleNamespace
 from typing import Type, Callable, Optional
 from functools import partial
@@ -2322,9 +2321,10 @@ def __getattr__(name):
         return FlashAttentionForwardSm90
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-# HD256 FP8 TMA prefill. The existing HD128/BF16/decode implementation above
-# is unchanged. NVIDIA-derived kernel body: BSD-3-Clause; ATREX wrappers:
-# Apache-2.0. See NOTICE for the original source revision and license terms.
+# HD256 FP8 TMA prefill. Keep the native and TMA routes in this target module;
+# private _tma_ helpers separate the adapted FlashInfer section from the native
+# implementation above. NVIDIA-derived kernel body: BSD-3-Clause; ATREX
+# wrappers: Apache-2.0. See NOTICE for the source revision and license terms.
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright 2026 Alibaba Group
 from enum import Enum as _tma_Enum
@@ -3612,7 +3612,7 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         :param k: Key tensor.
         :param v: Value tensor.
         :param o: Output tensor.
-        :param lse: Optional packed log2 LSE tensor ``[Hq,total_q] or [B,Hq,Q]``.
+        :param lse: Optional natural-log LSE tensor ``[Hq,total_q] or [B,Hq,Q]``.
         :param tma_k_desc: Tensor map descriptor for K.
         :param tma_v_desc: Tensor map descriptor for V.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``, pre-folded host-side.
@@ -3627,7 +3627,6 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         tidx, _, _ = cute.arch.thread_idx()
         block_x, block_y, block_z = cute.arch.block_idx()
         q_head_idx = block_x
-        q_tile_idx = block_y
         # Causal Q tiles have monotonically increasing K/V work. Schedule
         # the longest rows first so the final waves do not consist only of
         # the most expensive CTAs. This preserves the logical tile mapping
@@ -4256,7 +4255,7 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         :param v: Packed or paged value with the same shape and tail-padding
             contract as K.
         :param o: Packed output ``(total_q, Hq, D)``.
-        :param lse: Optional head-major float32 natural-log LSE ``(total_q,Hq)``.
+        :param lse: Optional head-major float32 natural-log LSE ``(Hq,total_q)``.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
         :param output_scale: Scalar multiplier applied to normalized output.
         :param skip_softmax_threshold: Reserved compatibility argument; must be None.

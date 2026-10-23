@@ -211,6 +211,23 @@ def test_sm120_hd128_paged(page_size, q_len, fp8, splits):
         assert any("atrex_sm120_prefill_kernel" in name for name in names), names
 
 
+def test_sm120_hd128_fp8_tuned_decode(monkeypatch):
+    from atrex.src.nvidia.flash_attn.sm120 import decode_reduce
+
+    _requires_sm120()
+    case = build_case(64, [4], [32768], hq=10, hkv=2, head_dim=128)
+    case["causal"] = False
+    original, observed = decode_reduce.sm120_q1_reduce, []
+
+    def record_reduce(*args, **kwargs):
+        observed.append(kwargs["parallel_columns"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(decode_reduce, "sm120_q1_reduce", record_reduce)
+    _check_mutable_graph(case)
+    assert observed and all(observed), observed
+
+
 @pytest.mark.parametrize("page_size,q_len,layout", [(64, 5, "nhd"), (128, 257, "vllm")])
 def test_sm120_hd256_fp8_tma(page_size, q_len, layout):
     _requires_sm120()
@@ -231,6 +248,20 @@ def test_sm120_hd256_fp8_tma(page_size, q_len, layout):
     assert not any("atrex_sm120_prefill_kernel" in name for name in names), names
 
 
+def test_sm120_fp8_tma_split_empty_kv():
+    from atrex import flash_attn_varlen_func
+
+    _requires_sm120()
+    case = build_case(64, [128, 128], [0, 4096], hq=16, hkv=2)
+    case["block_table"] = case["block_table"].contiguous()
+    actual = flash_attn_varlen_func(**case)
+    assert torch.count_nonzero(actual[:128]) == 0
+    _assert_paged_output(case, actual)
+    names = profile_case(case)
+    assert any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
+    assert any("combine" in name for name in names), names
+
+
 def test_sm120_fp8_lse_compatibility():
     from op_test.utils.flash_attn_contract import check_case
 
@@ -244,13 +275,15 @@ def test_sm120_fp8_lse_compatibility():
     assert not any("atrex_fp8_prefill_nhd_tma_kernel" in name for name in names), names
 
 
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("q_len", [4, 65])
-def test_sm120_fp8_descale_cache_layout(q_len):
+def test_sm120_fp8_descale_cache_layout(q_len, head_dim):
     """Reuse the same shape with broadcast and compact scale strides."""
     from atrex import flash_attn_varlen_func
 
     _requires_sm120()
-    base = build_case(64, [q_len, 3], [513, 257], hq=16, hkv=2)
+    base = build_case(64, [q_len, 3], [513, 257], hq=16, hkv=2, head_dim=head_dim)
+    base["causal"] = head_dim == 256
     base["block_table"] = base["block_table"].contiguous()
     broadcast = dict(base)
     for name in ("q_descale", "k_descale", "v_descale"):
