@@ -17,14 +17,18 @@ from atrex.src.nvidia.flash_attn.common_utils.cutlass_dsl_cache import (
 )
 
 
-HEAD_DIM = 256
 LOG2_E = math.log2(math.e)
 
 
 class _Sm120Q1Reduce:
-    def __init__(self, num_splits: int, tokens_per_sequence: int):
+    def __init__(
+        self, num_splits: int, tokens_per_sequence: int, head_dim: int,
+        parallel_columns: bool,
+    ):
         self.num_splits = num_splits
         self.tokens_per_sequence = tokens_per_sequence
+        self.head_dim = head_dim
+        self.column_tile = 32 if head_dim == 128 and parallel_columns else head_dim
 
     @cute.jit
     def __call__(
@@ -50,8 +54,8 @@ class _Sm120Q1Reduce:
             mO,
             SharedStorage,
         ).launch(
-            grid=(rows, 1, 1),
-            block=(HEAD_DIM, 1, 1),
+            grid=(rows * (self.head_dim // self.column_tile), 1, 1),
+            block=(self.column_tile, 1, 1),
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
@@ -67,6 +71,11 @@ class _Sm120Q1Reduce:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
+        column = tidx
+        if cutlass.const_expr(self.head_dim == 128):
+            tile = row
+            row = tile // (self.head_dim // self.column_tile)
+            column += (tile % (self.head_dim // self.column_tile)) * self.column_tile
         lane = tidx % 32
         num_heads = mO_partial.shape[2]
         token = row // num_heads
@@ -124,47 +133,47 @@ class _Sm120Q1Reduce:
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
             elif num_splits <= 40:
                 for split in cutlass.range_constexpr(min(self.num_splits, 40)):
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
             elif num_splits <= 48:
                 for split in cutlass.range_constexpr(min(self.num_splits, 48)):
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
             elif num_splits <= 64:
                 for split in cutlass.range_constexpr(min(self.num_splits, 64)):
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
             elif num_splits <= 80:
                 for split in cutlass.range_constexpr(min(self.num_splits, 80)):
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
             else:
                 for split in cutlass.range_constexpr(self.num_splits):
                     if split < num_splits:
                         output += (
                             weights[split]
-                            * mO_partial[split, token, head, tidx]
+                            * mO_partial[split, token, head, column]
                         )
         else:
             for split in cutlass.range_constexpr(self.num_splits):
-                output += weights[split] * mO_partial[split, token, head, tidx]
-        mO[token, head, tidx] = (output * inv_sum[0]).to(BFloat16)
+                output += weights[split] * mO_partial[split, token, head, column]
+        mO[token, head, column] = (output * inv_sum[0]).to(BFloat16)
 
 
 @functools.cache
@@ -174,13 +183,15 @@ def _compile(
     device_index: int,
     dynamic_splits: bool,
     tokens_per_sequence: int,
+    head_dim: int,
+    parallel_columns: bool,
 ):
     del device_index
     sym_total_q = cute.sym_int()
     sym_batch = cute.sym_int()
     o_partial = cute.runtime.make_fake_compact_tensor(
         Float32,
-        (num_splits, sym_total_q, num_heads, HEAD_DIM),
+        (num_splits, sym_total_q, num_heads, head_dim),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
     )
@@ -192,7 +203,7 @@ def _compile(
     )
     output = cute.runtime.make_fake_compact_tensor(
         BFloat16,
-        (sym_total_q, num_heads, HEAD_DIM),
+        (sym_total_q, num_heads, head_dim),
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
@@ -206,7 +217,7 @@ def _compile(
         else None
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    reducer = _Sm120Q1Reduce(num_splits, tokens_per_sequence)
+    reducer = _Sm120Q1Reduce(num_splits, tokens_per_sequence, head_dim, parallel_columns)
     reducer.atrex_sm120_decode_reduce_kernel.set_name_prefix("atrex")
     with use_filesystem_cutlass_dsl_version_hash():
         return cute.compile(
@@ -226,9 +237,10 @@ def sm120_q1_reduce(
     output: torch.Tensor,
     num_splits_dynamic: torch.Tensor | None = None,
     tokens_per_sequence: int = 1,
+    parallel_columns: bool = False,
 ) -> None:
     num_splits, total_q, num_heads, head_dim = o_partial.shape
-    if head_dim != HEAD_DIM or output.shape != (total_q, num_heads, HEAD_DIM):
+    if head_dim not in (128, 256) or output.shape != (total_q, num_heads, head_dim):
         raise ValueError("invalid SM120 Q1 reduction shape")
     if lse_partial.shape != (num_splits, num_heads, total_q):
         raise ValueError("invalid SM120 Q1 LSE partial shape")
@@ -248,6 +260,8 @@ def sm120_q1_reduce(
         device_index,
         num_splits_dynamic is not None,
         tokens_per_sequence,
+        head_dim,
+        parallel_columns,
     )(
         o_partial,
         lse_partial,
