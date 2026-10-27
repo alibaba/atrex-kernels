@@ -739,8 +739,12 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
+        # Singleton dimensions can be contiguous without having unit stride.
         q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
+            to_cute_tensor(
+                t, assumed_align=4,
+                leading_dim=1 if t is not None and t.stride(-1) == 1 else None,
+            )
             for t in (q_descale, k_descale, v_descale)
         )
         sparse_tensors = None
