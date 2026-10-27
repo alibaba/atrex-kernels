@@ -474,7 +474,7 @@ def test_sm120_paged_prefill_fp8(dtype, min_cos, max_rel_l1, page_size):
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("q_len,kv_len", [(256, 256), (256, 4096)])
+@pytest.mark.parametrize("q_len,kv_len", [(1, 4096), (256, 256), (256, 4096)])
 def test_sm120_paged_prefill_fp8_tma_default_schedule(page_size, q_len, kv_len):
     _requires_sm120()
     from atrex import flash_attn_varlen_func
