@@ -64,9 +64,13 @@ signature: use the varlen/paged arguments (`block_table`, `window_size`,
 `s_aux`, `return_softmax_lse`) and its conditional return shape instead of
 `page_table`, separate window bounds, `learnable_sink`, and `return_lse`.
 Existing callers should migrate with the vLLM integration; retaining the
-previous ATREX revision is the rollback path. The NVIDIA package requires
-`flash-attn-4==4.0.0b19`; target environments should not install the classic
-`flash-attn` distribution alongside it because both provide `flash_attn`.
+previous ATREX revision is the rollback path. The wheel privately packages official
+FlashAttention 4.0.0b20 helpers from commit
+`73c992c8ca746935548df620ef3c1b6238fe6e68` (`fa4-v4.0.0.beta20`).
+Builds initialize the pinned `third_party/flash-attention` submodule. Only the
+wheel's copied imports use `atrex._vendor.flash_attn`; repository kernel sources
+remain unchanged. ATREX keeps CuTeDSL 4.6.2 and Quack 0.6.4 and does not depend on
+the public FA wheel, whose beta20 metadata pins a different compiler version.
 
 ZW-M890P prefill supports contiguous D256 FP8 Q, paged K/V with page sizes
 divisible by 64, and GQA ratios divisible by four (including heads 8/1 and 32/2).

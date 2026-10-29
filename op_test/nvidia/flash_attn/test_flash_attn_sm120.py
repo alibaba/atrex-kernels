@@ -23,6 +23,10 @@ def _requires_sm120():
     assert Path(atrex.__file__).resolve() == Path(
         distribution("atrex").locate_file("atrex/__init__.py")
     ).resolve(), "Test the installed wheel, not an unpacked source package"
+    from atrex._vendor import flash_attn as helpers
+
+    assert helpers.__version__ == "4.0.0b20"
+    assert helpers.__source_commit__ == "73c992c8ca746935548df620ef3c1b6238fe6e68"
     from atrex import flash_attn_varlen_func  # noqa: F401
 
 
