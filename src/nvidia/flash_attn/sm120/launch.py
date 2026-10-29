@@ -489,6 +489,51 @@ def _run_sm120(**kwargs):
                 _arch=120,
             )
             short_q_kwargs.update(hd128_decode_options)
+            if (
+                num_sequences == 1 and max_seqlen_q == 1 and q.shape[0] == 1
+                and q.shape[-1] == 256 and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+                and num_kv_heads in (1, 2) and q.shape[-2] == 8 * num_kv_heads
+                and page_size in (64, 128) and max_k >= 4096
+                and requested_splits == 0 and num_splits_dynamic is None and work_map is None
+                and kwargs.get("score_mod") is None and kwargs.get("mask_mod") is None
+                and kwargs.get("block_sparse_tensors") is None and kwargs.get("lse") is None
+            ):
+                vo_tile_n = 128 if max_k <= 4096 else 64
+                vo_splits = (32 if max_k <= 4096 else 128 if num_kv_heads == 1
+                             else 256 if max_k <= 131072 else 96)
+                short_q_kwargs.update(
+                    tile_mn=(16, vo_tile_n),
+                    num_splits=min(vo_splits, (max_k + vo_tile_n - 1) // vo_tile_n),
+                    _sm120_hd256_vo_split=True,
+                    _sm120_hd256_vo_uniform_q1=True,
+                    _runtime_balanced_splits=False,
+                    _runtime_balanced_grid_size=0,
+                )
+            elif (
+                num_sequences in (16, 64) and max_seqlen_q == 1
+                and q.shape[0] == num_sequences and q.shape[-1] == 256
+                and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+                and num_kv_heads == 2 and q.shape[-2] == 8 * num_kv_heads
+                and page_size in (64, 128) and max_k >= 128 * 1024
+                and requested_splits == 0 and num_splits_dynamic is None and work_map is None
+                and kwargs.get("score_mod") is None and kwargs.get("mask_mod") is None
+                and kwargs.get("block_sparse_tensors") is None and kwargs.get("lse") is None
+            ):
+                # Keep the existing FP8 two-wave SplitKV policy. More independent
+                # KV heads need less per-CTA parallelism, so use two warps once
+                # their unsplit grid already fills the device.
+                vo_tile_n = 32 if num_sequences * num_kv_heads >= sm_count else 64
+                short_q_kwargs.update(
+                    tile_mn=(16, vo_tile_n),
+                    num_splits=_sm120_short_q_splits(
+                        num_sequences, num_kv_heads, max_k, sm_count,
+                        vo_tile_n, page_size, 1, is_fp8=True,
+                    ),
+                    _sm120_hd256_vo_split=True,
+                    _sm120_hd256_vo_uniform_q1=True,
+                    _runtime_balanced_splits=False,
+                    _runtime_balanced_grid_size=0,
+                )
             result = _sm120_forward()(**short_q_kwargs)
             return result[0], result[1]
 

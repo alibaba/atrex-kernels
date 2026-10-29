@@ -28,7 +28,7 @@ class _Sm120Q1Reduce:
         self.num_splits = num_splits
         self.tokens_per_sequence = tokens_per_sequence
         self.head_dim = head_dim
-        self.column_tile = 32 if head_dim == 128 and parallel_columns else head_dim
+        self.column_tile = 32 if head_dim in (128, 256) and parallel_columns else head_dim
 
     @cute.jit
     def __call__(
@@ -72,7 +72,7 @@ class _Sm120Q1Reduce:
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         column = tidx
-        if cutlass.const_expr(self.head_dim == 128):
+        if cutlass.const_expr(self.head_dim == 128 or self.column_tile < self.head_dim):
             tile = row
             row = tile // (self.head_dim // self.column_tile)
             column += (tile % (self.head_dim // self.column_tile)) * self.column_tile

@@ -276,20 +276,41 @@ def test_sm120_fp8_lse_compatibility():
 
 
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("q_len", [4, 65])
-def test_sm120_fp8_descale_cache_layout(q_len, head_dim):
-    """Reuse the same shape with broadcast and compact scale strides."""
+@pytest.mark.parametrize("q_len", [1, 4, 65])
+@pytest.mark.parametrize("batch,hkv", [(2, 2), (1, 1), (2, 1)])
+def test_sm120_fp8_descale_cache_layout(q_len, head_dim, batch, hkv):
+    """Alternate broadcast, compact, and non-unit singleton scale strides."""
     from atrex import flash_attn_varlen_func
 
     _requires_sm120()
-    base = build_case(64, [q_len, 3], [513, 257], hq=16, hkv=2, head_dim=head_dim)
+    base = build_case(64, [q_len] + [min(q_len, 3)] * (batch - 1),
+                      [513, 257][:batch], hq=16, hkv=hkv, head_dim=head_dim)
     base["causal"] = head_dim == 256
     base["block_table"] = base["block_table"].contiguous()
     broadcast = dict(base)
-    for name in ("q_descale", "k_descale", "v_descale"):
-        broadcast[name] = base[name][:1].expand(2, 2)
-    for case in (broadcast, base, broadcast):
+    scalar_broadcast = dict(base)
+    names = ("q_descale", "k_descale", "v_descale")
+    for name in names:
+        broadcast[name] = base[name][:1].expand(batch, hkv)
+        scalar_broadcast[name] = base[name][0, 0].expand(batch, hkv)
+        assert scalar_broadcast[name].stride() == (0, 0)
+    layouts = [scalar_broadcast, broadcast, base]
+    if hkv == 1:
+        singleton_broadcast, singleton_compact = dict(base), dict(base)
+        for name in names:
+            singleton_broadcast[name] = base[name][0, 0].as_strided((batch, 1), (0, 2))
+            singleton_compact[name] = base[name].as_strided((batch, 1), (1, 2))
+            assert singleton_compact[name].is_contiguous()
+        layouts.extend((singleton_broadcast, singleton_compact))
+    for case in layouts * 2:
+        before = [(case[name].data_ptr(), case[name].stride(),
+                   case[name].storage_offset(), case[name].clone())
+                  for name in names]
         _assert_paged_output(case, flash_attn_varlen_func(**case))
+        for name, (pointer, strides, offset, values) in zip(names, before):
+            assert case[name].data_ptr() == pointer and case[name].stride() == strides
+            assert case[name].storage_offset() == offset
+            assert torch.equal(case[name], values)
 
 
 def _fp32_prefill_ref(q, k, v, cu, seqs, scale):
@@ -453,7 +474,7 @@ def test_sm120_paged_prefill_fp8(dtype, min_cos, max_rel_l1, page_size):
 
 
 @pytest.mark.parametrize("page_size", [64, 128])
-@pytest.mark.parametrize("q_len,kv_len", [(256, 256), (256, 4096)])
+@pytest.mark.parametrize("q_len,kv_len", [(1, 4096), (256, 256), (256, 4096)])
 def test_sm120_paged_prefill_fp8_tma_default_schedule(page_size, q_len, kv_len):
     _requires_sm120()
     from atrex import flash_attn_varlen_func

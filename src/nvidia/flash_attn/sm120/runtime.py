@@ -34,7 +34,9 @@ from flash_attn.cute.cute_dsl_utils import (
     to_cute_aux_tensor,
     to_cute_tensor,
 )
-from atrex.src.nvidia.flash_attn.sm120.prefill_cutedsl import FlashAttentionForwardSm120
+from atrex.src.nvidia.flash_attn.sm120.prefill_cutedsl import (
+    FlashAttentionForwardSm120, FlashAttentionForwardSm120Hd256Fp8Decode,
+)
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 from flash_attn.cute.utils import AuxData
@@ -187,6 +189,8 @@ def _flash_attn_fwd(
     _sm120_num_stages: Optional[int] = None,
     _sm120_q_in_regs: Optional[bool] = None,
     _sm120_num_threads: Optional[int] = None,
+    _sm120_hd256_vo_split: bool = False,
+    _sm120_hd256_vo_uniform_q1: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -472,7 +476,34 @@ def _flash_attn_fwd(
             if _sm120_num_threads not in (64, 128, 256):
                 raise ValueError("SM120 attention supports 64, 128 or 256 threads")
             num_threads = _sm120_num_threads
-    if page_size is not None and page_size % tile_n != 0:
+    if _sm120_hd256_vo_uniform_q1 and not _sm120_hd256_vo_split:
+        raise ValueError("Uniform Q1 grid requires the HD256 FP8 VO kernel")
+    if _sm120_hd256_vo_split:
+        if not (
+            q_dtype == v.dtype == torch.float8_e4m3fn
+            and head_dim == head_dim_v == 256 and causal and not local
+            and batch_size == total_q and max_seqlen_q == 1
+            and batch_size in (1, 16, 64) and 1 <= qhead_per_kvhead <= 16
+            and page_table is not None and page_size in (64, 128)
+            and cu_seqlens_q is not None and seqused_k is not None
+            and pack_gqa and _allow_pack_gqa_split and num_splits >= 1
+            and (batch_size == 1 or _sm120_hd256_vo_uniform_q1)
+            and (num_splits > 1 or _sm120_hd256_vo_uniform_q1)
+            and tile_mn in ((16, 32), (16, 64), (16, 128))
+            and num_splits_dynamic is None and work_map is None
+            and not _runtime_balanced_splits and lse is None
+            and score_mod is None and mask_mod is None and softcap is None
+            and block_sparse_tensors is None and learnable_sink is None
+        ):
+            raise ValueError("Unsupported SM120 HD256 FP8 VO decode configuration")
+        num_threads = (64 if tile_n == 32 else 128) if _sm120_num_threads is None else _sm120_num_threads
+        sm120_num_stages = 1 if _sm120_num_stages is None else _sm120_num_stages
+        sm120_q_in_regs = False
+        if (tile_n, num_threads) not in ((32, 64), (64, 128), (128, 128)) or sm120_num_stages not in (1, 2):
+            raise ValueError("Unsupported HD256 FP8 VO tile, threads or stages")
+    if page_size is not None and page_size % tile_n != 0 and not (
+        _sm120_hd256_vo_split and page_size == 64 and tile_n == 128
+    ):
         raise ValueError(
             f"Atrex FA SM120 requires page_size ({page_size}) to be divisible "
             f"by tile_n ({tile_n})"
@@ -663,6 +694,8 @@ def _flash_attn_fwd(
         num_threads,
         sm120_num_stages,
         sm120_q_in_regs,
+        _sm120_hd256_vo_split,
+        _sm120_hd256_vo_uniform_q1,
         is_split_kv,
         pack_gqa,
         use_lpt,
@@ -739,8 +772,12 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
+        # Singleton dimensions can be contiguous without having unit stride.
         q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
+            to_cute_tensor(
+                t, assumed_align=4,
+                leading_dim=1 if t is not None and t.stride(-1) == 1 else None,
+            )
             for t in (q_descale, k_descale, v_descale)
         )
         sparse_tensors = None
@@ -752,7 +789,9 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-        if not FlashAttentionForwardSm120.can_implement(
+        forward_class = (FlashAttentionForwardSm120Hd256Fp8Decode
+                         if _sm120_hd256_vo_split else FlashAttentionForwardSm120)
+        if not forward_class.can_implement(
             dtype,
             head_dim,
             head_dim_v,
@@ -770,7 +809,7 @@ def _flash_attn_fwd(
                 f"threads={num_threads}, causal={causal}, "
                 f"Q_in_regs={sm120_q_in_regs}"
             )
-        fa_fwd = FlashAttentionForwardSm120(
+        fa_fwd = forward_class(
             dtype,
             head_dim,
             head_dim_v,
@@ -796,6 +835,8 @@ def _flash_attn_fwd(
             runtime_balanced_grid_size=_runtime_balanced_grid_size,
             runtime_balanced_batch_size=_runtime_balanced_batch_size,
         )
+        if _sm120_hd256_vo_split:
+            fa_fwd.vo_uniform_q1_grid = _sm120_hd256_vo_uniform_q1
         fa_fwd.atrex_sm120_prefill_kernel.set_name_prefix("atrex")
         compile_args = [
             fa_fwd,
@@ -902,10 +943,13 @@ def _flash_attn_fwd(
                 # Split HD128 output columns across more SMs for the small
                 # FP8 cache: the original reducer launches only 10 Q1 CTAs.
                 parallel_columns=(
-                    is_fp8 and head_dim == 128 and num_head == 10
-                    and num_head_kv == 2 and batch_size == 1
-                    and max_seqlen_k is not None and max_seqlen_k <= 65536
-                    and num_splits >= 32 and kernel_num_splits_dynamic is None
+                    (
+                        is_fp8 and head_dim == 128 and num_head == 10
+                        and num_head_kv == 2 and batch_size == 1
+                        and max_seqlen_k is not None and max_seqlen_k <= 65536
+                        and num_splits >= 32 and kernel_num_splits_dynamic is None
+                    )
+                    or (_sm120_hd256_vo_split and batch_size == 1 and num_splits >= 32)
                 ),
             )
         else:
@@ -1217,12 +1261,18 @@ def _forward_tma_prefill(**kwargs):
     q_scale, k_scale, v_scale = (
         kwargs.get(name) for name in ("q_descale", "k_descale", "v_descale")
     )
-    # Long prefill always uses this configuration. Avoid looking up hardware
-    # and sequence metadata that the selector would immediately discard.
+    # Long prefill keeps fixed tiles and split count. Pack tail Q only
+    # when it removes CTAs, using caller shape metadata without device reads.
     q_tile, pack_gqa, num_splits, kv_tile = 128, False, 1, 128
-    if kwargs["max_seqlen_q"] < 4096:
+    max_q = kwargs["max_seqlen_q"]
+    if max_q >= 4096 and q.shape[1] > k.shape[2]:
+        group = q.shape[1] // k.shape[2]
+        packed_blocks = k.shape[2] * ((max_q * group + q_tile - 1) // q_tile)
+        plain_blocks = q.shape[1] * ((max_q + q_tile - 1) // q_tile)
+        pack_gqa = packed_blocks < plain_blocks
+    if max_q < 4096:
         q_tile, pack_gqa, num_splits, kv_tile = _select_tma_prefill_launch_config(
-            kwargs["max_seqlen_q"], kwargs["cu_seqlens_q"].numel() - 1,
+            max_q, kwargs["cu_seqlens_q"].numel() - 1,
             q.shape[1], k.shape[2],
             torch.cuda.get_device_properties(q.device).multi_processor_count,
             kwargs.get("max_seqlen_k") or kwargs["page_table"].shape[1] * k.shape[1],

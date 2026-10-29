@@ -222,6 +222,8 @@ class FlashAttentionForwardBase:
         # decoding it from a rectangular blockIdx, so only useful CTAs are launched.
         self.compact_grid = compact_grid
         self.compact_short_q = compact_short_q
+        self.hd256_vo_split = False
+        self.vo_uniform_q1_grid = False
         self.runtime_balanced_splits = runtime_balanced_splits
         self.runtime_balanced_grid_size = runtime_balanced_grid_size
         self.runtime_balanced_batch_size = runtime_balanced_batch_size
@@ -1113,7 +1115,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         # TileScheduler for varlen, simple grid for non-varlen
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+        if const_expr(self.vo_uniform_q1_grid):
+            TileScheduler = _Sm120UniformQ1Scheduler
+        elif const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
         else:
             TileScheduler = SingleTileScheduler
@@ -1484,8 +1488,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile MMA compute thread partitions and allocate accumulators
         # ///////////////////////////////////////////////////////////////////////////////
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
-        thr_mma_pv = tiled_mma_pv.get_slice(tidx)
+        mma_tidx = tidx % 32 if const_expr(self.hd256_vo_split) else tidx
+        thr_mma_qk = tiled_mma_qk.get_slice(mma_tidx)
+        thr_mma_pv = tiled_mma_pv.get_slice(mma_tidx)
         if const_expr(self.is_fp8):
             tSrQ = (
                 cute.make_rmem_tensor((4, self.tile_hdim // 32), Int32)
@@ -1500,7 +1505,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
             tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
             tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
-        acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
+        output_columns = self.tile_hdimv // (self.num_threads // 32) if const_expr(self.hd256_vo_split) else self.tile_hdimv
+        acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, output_columns))
         acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
@@ -1605,6 +1611,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sK=sK,
             sV=sV,
             sP=sP,
+            sMD=storage.sMD.get_tensor((self.num_threads,)) if const_expr(self.hd256_vo_split) else None,
         )
         load_K = partial(
             self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k,
@@ -2328,9 +2335,13 @@ def __getattr__(name):
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright 2026 Alibaba Group
 from enum import Enum as _tma_Enum
+from inspect import signature as _tma_signature
 from cutlass import Boolean as _tma_Boolean
 from cutlass._mlir.dialects import nvvm as _tma_nvvm
 from cutlass.cute.arch.nvvm_wrappers import shuffle_sync_op as _tma_shuffle_sync_op
+
+# Newer NVVM bindings take the result type as a keyword sequence.
+_TMA_LDMATRIX_RESULTS = "results" in _tma_signature(_tma_nvvm.ldmatrix).parameters
 
 # prefill_tma_primitives.py — Copyright 2026 Alibaba Group; SPDX-License-Identifier: Apache-2.0
 class _tma_Shfl(_tma_Enum):
@@ -2357,6 +2368,18 @@ def _tma_shfl_sync(thread_mask, val, offset, mask_and_clamp=0x1F,
         val, offset, mask=thread_mask, mask_and_clamp=mask_and_clamp,
         kind=getattr(_tma_nvvm.ShflKind, kind.value), loc=loc, ip=ip,
     )
+
+
+@dsl_user_op
+def _tma_rematerialize_lane(*, loc=None, ip=None):
+    # Re-read lane mapping at each operand consumption point instead of
+    # carrying address components across the pipeline barrier wait.
+    result = llvm.inline_asm(
+        T.i32(), [], "mov.u32 $0, %laneid;", "=r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return Int32(result) & Int32(31)
 
 
 @dsl_user_op
@@ -2444,22 +2467,24 @@ def _tma_ldmatrix_instruction(nregs, layout, shape="m8n8", src_format="b16"):
 @dsl_user_op
 def _tma_ldmatrix(ptr, nregs: cutlass.Constexpr, layout=_tma_MMALayout.ROW,
              *, shape="m8n8", src_format="b16", loc=None, ip=None):
-    instruction = _tma_ldmatrix_instruction(nregs, layout, shape, src_format)
-    outputs = ", ".join(f"${i}" for i in range(nregs))
+    _tma_ldmatrix_instruction(nregs, layout, shape, src_format)
     result_type = (T.i32() if nregs == 1 else
                    ir.Type.parse("!llvm.struct<(" + ",".join(["i32"] * nregs) + ")>"))
-    result = llvm.inline_asm(
-        result_type, [_tma__shared_address(ptr, loc=loc, ip=ip)],
-        instruction + " {" + outputs + "}, [$" + str(nregs) + "];",
-        ",".join(["=r"] * nregs + ["r"]),
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    result_type_kwargs = (
+        {"results": [result_type]} if _TMA_LDMATRIX_RESULTS else {"res": result_type}
+    )
+    result = _tma_nvvm.ldmatrix(
+        ptr=ptr.ir_value(loc=loc, ip=ip), num=nregs,
+        layout=_tma_nvvm.MMALayout.col if layout is _tma_MMALayout.COL else _tma_nvvm.MMALayout.row,
+        shape=None if shape == "m8n8" else _tma_nvvm.LoadShape.M16N16,
+        src_format=None if src_format == "b16" else _tma_nvvm.LoadSrcFormat.B8,
+        **result_type_kwargs,
+        loc=loc, ip=ip,
     )
     if nregs == 1:
         return (Int32(result),)
     return tuple(Int32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
                  for i in range(nregs))
-
 
 @dsl_user_op
 def _tma_stmatrix(ptr, values, layout=_tma_MMALayout.ROW, *, loc=None, ip=None):
@@ -2605,6 +2630,20 @@ def _tma_atrex_smem_column(row: cutlass.Int32, col: cutlass.Int32,
     segment_start = (col // segment_elems) * segment_elems
     xor_elems = ((row >> row_shift) & ((1 << row_bits) - 1)) * (16 // elem_bytes)
     return segment_start + ((col - segment_start) ^ xor_elems)
+
+
+@cute.jit
+def _tma_atrex_transpose_o_quad(w0, w1, w2, w3, lane_mod4: cutlass.Int32):
+    # Exchange lane bits with packed-word bits; preserve each BF16 bit pattern.
+    odd = (lane_mod4 & cutlass.Int32(1)) != 0
+    a = _tma_shfl_sync(0xFFFFFFFF, w0 if odd else w1, 1, kind=_tma_Shfl.BFLY)
+    b = _tma_shfl_sync(0xFFFFFFFF, w2 if odd else w3, 1, kind=_tma_Shfl.BFLY)
+    x0, x1 = (a if odd else w0), (w1 if odd else a)
+    x2, x3 = (b if odd else w2), (w3 if odd else b)
+    high = (lane_mod4 & cutlass.Int32(2)) != 0
+    c = _tma_shfl_sync(0xFFFFFFFF, x0 if high else x2, 2, kind=_tma_Shfl.BFLY)
+    d = _tma_shfl_sync(0xFFFFFFFF, x1 if high else x3, 2, kind=_tma_Shfl.BFLY)
+    return (c if high else x0), (d if high else x1), (x2 if high else c), (x3 if high else d)
 
 
 @cute.jit
@@ -3066,8 +3105,18 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         for i in cutlass.range_constexpr(self.qk_k_frags * 4):
             s_regs[i] = cutlass.Float32(0.0)
 
-        k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
-        k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
+        if cutlass.const_expr(
+            self.pack_gqa and self.q_tile == 128 and self.kv_tile == 128
+            and self.num_splits == 1
+        ):
+            lane = _tma_rematerialize_lane()
+            lane_div8 = lane // 8
+            lane_mod8 = lane % 8
+        else:
+            lane_div8 = basic_params.lane_div8
+            lane_mod8 = basic_params.lane_mod8
+        k_row_in_frag_pair = (lane_div8 // 2) * 8 + lane_mod8
+        k_col_in_frag_pair = (lane_div8 % 2) * 16
 
         def load_k_fragments(dst, d_offset: cutlass.Constexpr[int]):
             for k_pair in cutlass.range_constexpr(self.qk_k_frags // 2):
@@ -3089,11 +3138,12 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         load_k_fragments(k_cur, 0)
 
         for d_frag in cutlass.range_constexpr(self.qk_d_frags):
-            # The last wraparound load is discarded; identical unrolled
-            # iterations keep the register-load/MMA pipeline branch-free.
-            d_next = ((d_frag + 1) % self.qk_d_frags) * self.MMA_TILER[2]
-            k_next = [None] * self.qk_k_frags
-            load_k_fragments(k_next, d_next)
+            # The final K prefetch has no consumer. Keep all useful
+            # prefetch/MMA pairs in their existing order and omit that load.
+            if cutlass.const_expr(d_frag + 1 < self.qk_d_frags):
+                d_next = (d_frag + 1) * self.MMA_TILER[2]
+                k_next = [None] * self.qk_k_frags
+                load_k_fragments(k_next, d_next)
             q_off = d_frag * 4
             for k_frag in cutlass.range_constexpr(self.qk_k_frags):
                 s_off = k_frag * 4
@@ -3114,7 +3164,8 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 s_regs[s_off + 1] = array462_mma_673[1]
                 s_regs[s_off + 2] = array462_mma_673[2]
                 s_regs[s_off + 3] = array462_mma_673[3]
-            k_cur = k_next
+            if cutlass.const_expr(d_frag + 1 < self.qk_d_frags):
+                k_cur = k_next
 
         return s_regs
 
@@ -3308,12 +3359,21 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
         :param sV: Shared-memory pointer to this tile's V operand.
         """
         o_regs = mma_params.o_regs
+        if cutlass.const_expr(
+            self.pack_gqa and self.q_tile == 128 and self.kv_tile == 128
+            and self.num_splits == 1
+        ):
+            lane = _tma_rematerialize_lane()
+            lane_mod4 = lane % 4
+        else:
+            lane = basic_params.lane
+            lane_mod4 = basic_params.lane_mod4
 
         def load_v_fragment_pair(
             v_seq_offset: cutlass.Constexpr[int],
             d_pair: cutlass.Constexpr[int],
         ):
-            v_lane = basic_params.lane
+            v_lane = lane
             v_row = v_seq_offset + v_lane
             v_col = d_pair * 16
             v_chunk = v_col // self.tma_copy_head_per_iter
@@ -3334,7 +3394,7 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
             w0, w1, w2, w3 = v_vec[0], v_vec[1], v_vec[2], v_vec[3]
             if cutlass.const_expr(mask_tail):
                 if kv_seq_idx + self.kv_tile > basic_params.seqlen_k:
-                    first_k = kv_seq_idx + v_seq_offset + basic_params.lane_mod4 * 4
+                    first_k = kv_seq_idx + v_seq_offset + lane_mod4 * 4
                     w0 = _tma_atrex_mask_v_word(w0, first_k, basic_params.seqlen_k)
                     w1 = _tma_atrex_mask_v_word(w1, first_k, basic_params.seqlen_k)
                     w2 = _tma_atrex_mask_v_word(w2, first_k + 16, basic_params.seqlen_k)
@@ -3350,7 +3410,7 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 p_regs[k_frag0 * 2 + row_half],
                 p_regs[(k_frag0 + 1) * 2 + row_half],
             )
-            pair_lane = (basic_params.lane_mod4 % 2) * 2
+            pair_lane = (lane_mod4 % 2) * 2
             src0 = pair_lane
             src1 = src0 + 1
             lo = _tma_shfl_sync(
@@ -3368,7 +3428,7 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 kind=_tma_Shfl.IDX,
             )
             selector = cutlass.Int32(0x5410) + (
-                basic_params.lane_mod4 // 2
+                lane_mod4 // 2
             ) * cutlass.Int32(0x2222)
             return cute.arch.inline_ptx(
                 "prmt.b32 $0, $1, $2, $3;",
@@ -3378,14 +3438,18 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
 
         if cutlass.const_expr(
             self.head_tile == 256
-            and self.q_tile == 64
-            and self.kv_tile == 64
             and self.num_splits == 1
-            and mask_tail
+            and (
+                (self.q_tile == 64 and self.kv_tile == 64 and mask_tail)
+                or (self.q_tile == 128 and self.kv_tile == 128)
+            )
         ):
-            # Keep only two D pairs of V live at a time in the masked frontier.
-            # Each output fragment still accumulates v_frag 0 before v_frag 1.
-            # The unmasked hot loop retains the existing prefetch schedule.
+            # Bound V's live set while each output fragment accumulates
+            # the K fragments in their original ascending order.
+            if cutlass.const_expr(self.q_tile == 128):
+                d_pairs_per_group = 4
+            else:
+                d_pairs_per_group = 2
             p_fragments = [None] * self.pv_v_frags
             for v_frag in cutlass.range_constexpr(self.pv_v_frags):
                 p_fragments[v_frag] = (
@@ -3395,30 +3459,30 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                     pack_p_cols(v_frag * 4 + 2, 1),
                 )
 
-            v_cur = [None] * 4
-            for d_in_group in cutlass.range_constexpr(2):
+            v_cur = [None] * (d_pairs_per_group * 2)
+            for d_in_group in cutlass.range_constexpr(d_pairs_per_group):
                 v_cur[d_in_group * 2], v_cur[d_in_group * 2 + 1] = load_v_fragment_pair(
                     0, d_in_group
                 )
-            for d_group in cutlass.range_constexpr(self.pv_d_frags // 4):
+            for d_group in cutlass.range_constexpr(self.pv_d_frags // (d_pairs_per_group * 2)):
                 for v_frag in cutlass.range_constexpr(self.pv_v_frags):
                     prefetch_next = cutlass.const_expr(
                         v_frag + 1 < self.pv_v_frags
-                        or d_group + 1 < self.pv_d_frags // 4
+                        or d_group + 1 < self.pv_d_frags // (d_pairs_per_group * 2)
                     )
                     if cutlass.const_expr(prefetch_next):
                         next_v_frag = (v_frag + 1) % self.pv_v_frags
                         next_d_group = d_group + (v_frag + 1) // self.pv_v_frags
-                        v_next = [None] * 4
+                        v_next = [None] * (d_pairs_per_group * 2)
                     p_reg0, p_reg1, p_reg2, p_reg3 = p_fragments[v_frag]
-                    for d_in_group in cutlass.range_constexpr(2):
+                    for d_in_group in cutlass.range_constexpr(d_pairs_per_group):
                         if cutlass.const_expr(prefetch_next):
                             v_next[d_in_group * 2], v_next[d_in_group * 2 + 1] = load_v_fragment_pair(
                                 next_v_frag * self.MMA_TILER[2],
-                                next_d_group * 2 + d_in_group,
+                                next_d_group * d_pairs_per_group + d_in_group,
                             )
                         for d_in_pair in cutlass.range_constexpr(2):
-                            d_frag = d_group * 4 + d_in_group * 2 + d_in_pair
+                            d_frag = d_group * (d_pairs_per_group * 2) + d_in_group * 2 + d_in_pair
                             v_index = d_in_group * 2 + d_in_pair
                             o_off = d_frag * 4
                             array462_mma_1356 = _tma_atrex_mma_e4m3_f32(
@@ -3926,12 +3990,28 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 kv_tile_idx = kv_tile_end - 1
             else:
                 kv_tile_idx = num_kv_tiles - 1
-            masked_kv_tile_count = 1
-            # Packed requests can be rectangular, so reserve one full
-            # extra overlap for the bottom-right causal offset.
-            masked_kv_tile_count = _tma_atrex_ceildiv(
-                self.q_tile + self.kv_tile - 1, self.kv_tile
-            )
+            # A packed tile may cover fewer logical Q positions than rows.
+            # An aligned logical span stays inside one K/V frontier tile.
+            frontier_mask_span = 0
+            if cutlass.const_expr(
+                not self.pack_gqa and self.num_splits == 1
+                and self.q_tile == self.kv_tile
+            ):
+                frontier_mask_span = self.kv_tile
+            elif cutlass.const_expr(
+                self.pack_gqa and self.num_splits == 1
+                and self.q_tile == 128 and self.kv_tile == 128
+                and q_heads_per_kv_head <= self.q_tile
+                and self.q_tile % q_heads_per_kv_head == 0
+                and self.kv_tile % (self.q_tile // q_heads_per_kv_head) == 0
+            ):
+                frontier_mask_span = self.q_tile // q_heads_per_kv_head
+            if cutlass.const_expr(frontier_mask_span > 0):
+                masked_kv_tile_count = 1
+            else:
+                masked_kv_tile_count = _tma_atrex_ceildiv(
+                    self.q_tile + self.kv_tile - 1, self.kv_tile
+                )
 
             # Phase 1: potentially masked iterations.
             pipeline_k_stage = cutlass.Int32(0)
@@ -3954,6 +4034,25 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 else:
                     pipeline_k_stage -= 1
 
+            if cutlass.const_expr(frontier_mask_span > 0):
+                if causal_q_offset % frontier_mask_span != 0 and kv_tile_idx >= kv_tile_begin:
+                    row_state = self.compute_one_kv_tile(
+                        basic_params,
+                        mma_params,
+                        softmax_params,
+                        q_regs,
+                        row_state,
+                        kv_tile_idx,
+                        pipeline_k_stage,
+                        is_masked_frontier_tile=True,
+                        uses_softmax_init_path=False,
+                    )
+                    kv_tile_idx -= 1
+                    if pipeline_k_stage == 0:
+                        pipeline_k_stage = cutlass.Int32(2)
+                    else:
+                        pipeline_k_stage -= 1
+
             # Phase 2: remaining tiles outside the explicit mask frontier.
             while kv_tile_idx >= kv_tile_begin:
                 row_state = self.compute_one_kv_tile(
@@ -3973,9 +4072,11 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                 else:
                     pipeline_k_stage -= 1
 
-            _tma_barrier_cta_sync(
-                self.COMPUTE_BARRIER_ID, thread_count=self.threads_compute
-            )
+            # Only shared-O staging needs the final K/V alias lifetime barrier.
+            if cutlass.const_expr(not (not self.pack_gqa and self.q_tile == 128 and self.kv_tile == 128 and self.num_splits == 1)):
+                _tma_barrier_cta_sync(
+                    self.COMPUTE_BARRIER_ID, thread_count=self.threads_compute
+                )
 
             quad_lane_base = lane_div4 * 4
             row_max_0 = _tma_shfl_sync(
@@ -4079,9 +4180,9 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                                 o_ptr + o_head_base + partial_row_offset + partial_col
                             ).store(partial_vec, alignment=8)
             else:
-                # No compute warp may alias sKV as sO while a peer still reads the
-                # final sV tile. After that lifetime barrier, normalize O, stage an
-                # stmatrix-friendly layout, and store 128b per lane to GMEM.
+                # Normalize O and store 128b per lane. Shared-O paths use the
+                # preceding lifetime barrier before reusing sKV; full-tile
+                # register stores need no shared-memory staging.
                 sO = cutlass.Pointer(sKV, dtype=o.dtype)
                 # Bottom-right rectangular causal attention can have empty rows.
                 # Their neutral accumulator must normalize to zero, not 0*inf.
@@ -4125,47 +4226,59 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
                         (o.dtype(o_scaled3[0]), o.dtype(o_scaled3[1])),
                         o.dtype,
                     )
-                    sO_ptr = (
-                        sO
-                        + compute_warp_idx * (self.pv_d_frags // 2) * (16 * 16)
-                        + d_frag_pair * (16 * 16)
-                        + lane * 8
-                    )
-                    _tma_stmatrix(
-                        sO_ptr,
-                        [o_packed0, o_packed1, o_packed2, o_packed3],
-                        _tma_MMALayout.ROW,
-                    )
-
-                store_row = lane_mod8 + ((lane_div8) % 2) * 8
-                store_col = lane_div16 * 8
-                store_q_seq_idx = q_seq_idx + q_warp_row0 + store_row
-                for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
-                    store_col_in_cta = d_frag_pair * 16 + store_col
-                    sO_ptr = (
-                        sO
-                        + compute_warp_idx * (self.pv_d_frags // 2) * (16 * 16)
-                        + d_frag_pair * (16 * 16)
-                        + lane * 8
-                    )
-                    o_vec = sO_ptr.load(count=8, alignment=16)
-                    if cutlass.const_expr(self.pack_gqa):
-                        gO_ptr = (
-                            o_ptr
-                            + o_head_base
-                            + (store_q_seq_idx // q_heads_per_kv_head) * q_seq_stride
-                            + (store_q_seq_idx % q_heads_per_kv_head) * head_dim
-                            + store_col_in_cta
+                    if cutlass.const_expr(not self.pack_gqa and self.q_tile == 128 and self.kv_tile == 128 and self.num_splits == 1):
+                        words = _tma_atrex_transpose_o_quad(
+                            o_packed0, o_packed1, o_packed2, o_packed3, lane_mod4,
                         )
+                        o_vec = cutlass.Vector.from_elements(words, dtype=cutlass.Int32).bitcast(o.dtype)
+                        store_q_seq_idx = q_seq_idx + q_warp_row0 + lane_div4 + (lane_mod4 & 1) * 8
+                        store_col_in_cta = d_frag_pair * 16 + (lane_mod4 // 2) * 8
+                        gO_ptr = o_ptr + o_head_base + store_q_seq_idx * q_seq_stride + store_col_in_cta
+                        if store_q_seq_idx < packed_row_count and store_col_in_cta < head_dim:
+                            gO_ptr.store(o_vec, alignment=16)
                     else:
-                        gO_ptr = (
-                            o_ptr
-                            + o_head_base
-                            + store_q_seq_idx * q_seq_stride
-                            + store_col_in_cta
+                        sO_ptr = (
+                            sO
+                            + compute_warp_idx * (self.pv_d_frags // 2) * (16 * 16)
+                            + d_frag_pair * (16 * 16)
+                            + lane * 8
                         )
-                    if store_q_seq_idx < packed_row_count and store_col_in_cta < head_dim:
-                        gO_ptr.store(o_vec, alignment=16)
+                        _tma_stmatrix(
+                            sO_ptr,
+                            [o_packed0, o_packed1, o_packed2, o_packed3],
+                            _tma_MMALayout.ROW,
+                        )
+
+                if cutlass.const_expr(not (not self.pack_gqa and self.q_tile == 128 and self.kv_tile == 128 and self.num_splits == 1)):
+                    store_row = lane_mod8 + ((lane_div8) % 2) * 8
+                    store_col = lane_div16 * 8
+                    store_q_seq_idx = q_seq_idx + q_warp_row0 + store_row
+                    for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
+                        store_col_in_cta = d_frag_pair * 16 + store_col
+                        sO_ptr = (
+                            sO
+                            + compute_warp_idx * (self.pv_d_frags // 2) * (16 * 16)
+                            + d_frag_pair * (16 * 16)
+                            + lane * 8
+                        )
+                        o_vec = sO_ptr.load(count=8, alignment=16)
+                        if cutlass.const_expr(self.pack_gqa):
+                            gO_ptr = (
+                                o_ptr
+                                + o_head_base
+                                + (store_q_seq_idx // q_heads_per_kv_head) * q_seq_stride
+                                + (store_q_seq_idx % q_heads_per_kv_head) * head_dim
+                                + store_col_in_cta
+                            )
+                        else:
+                            gO_ptr = (
+                                o_ptr
+                                + o_head_base
+                                + store_q_seq_idx * q_seq_stride
+                                + store_col_in_cta
+                            )
+                        if store_q_seq_idx < packed_row_count and store_col_in_cta < head_dim:
+                            gO_ptr.store(o_vec, alignment=16)
 
         # A zero-length K/V sequence has a mathematically empty attention
         # reduction. This is ensured by writing O=0 for the
@@ -4354,3 +4467,357 @@ class _tma_FlashAttentionForwardSm120Fp8Tma:
             ),
             use_pdl=use_pdl,
         )
+
+
+class _Sm120UniformQ1Scheduler(SingleTileScheduler):
+    """Exact Q1 launch; cuQ/used-K remain GPU inputs to SeqlenInfoQK."""
+
+    @staticmethod
+    def get_grid_shape(params, *, loc=None, ip=None):
+        return params.num_batch, params.num_head, params.num_splits
+
+    @staticmethod
+    def create(params, clc=None, *, loc=None, ip=None):
+        batch, head, split = cute.arch.block_idx()
+        # Reuse upstream scheduler serialization and the split divmod contract.
+        return SingleTileScheduler(
+            params, (Int32(0), head * params.num_splits + split, batch),
+            loc=loc, ip=ip)
+
+
+class FlashAttentionForwardSm120Hd256Fp8Decode(FlashAttentionForwardSm120):
+    """Distribute KV columns across 2/4 warps and partition the D256 PV output."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.dtype == cutlass.Float8E4M3FN
+        assert self.tile_hdim == 256 and self.tile_hdimv == 256
+        assert self.tile_m == 16 and (self.tile_n, self.num_threads) in ((32, 64), (64, 128), (128, 128))
+        assert self.pack_gqa and not self.Q_in_regs
+        self.hd256_vo_split = True
+        self.vo_num_warps = self.num_threads // 32
+        self.vo_n_per_warp = self.tile_n // self.vo_num_warps
+        self.vo_d_per_warp = 256 // self.vo_num_warps
+        self.vo_active_half_rows = 1 if self.qhead_per_kvhead == 8 and self.tile_n == 128 else 2
+
+    @staticmethod
+    def can_implement(dtype, head_dim, head_dim_v, tile_m, tile_n, num_stages,
+                      num_threads, is_causal, Q_in_regs=False):
+        if not (dtype == cutlass.Float8E4M3FN and head_dim == 256 and head_dim_v == 256
+                and tile_m == 16 and (tile_n, num_threads) in ((32, 64), (64, 128), (128, 128))
+                and is_causal and not Q_in_regs and num_stages in (1, 2)):
+            return False
+        # Conservative resource check with a larger Q/P allocation than this M16 prototype.
+        return FlashAttentionForwardSm120.can_implement(
+            dtype, head_dim, head_dim_v, 32, tile_n, num_stages, 64, is_causal, False)
+
+    def _get_smem_layout_atom(self):
+        layouts = super()._get_smem_layout_atom()
+        if self.tile_n == 32 and self.page_size == 64:
+            # The N32 bulk route benefits from a 128-byte Q/K bank swizzle.
+            # Keep N64/N128 and page128 on their original padded layout.
+            sQK = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 4), 0,
+                cute.make_layout((16, 256), stride=(256, 1)))
+            return sQK, sQK, layouts[2], layouts[3], layouts[4]
+        return layouts
+
+    def _get_tiled_mma(self):
+        op = warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16))
+        tiled = cute.make_tiled_mma(op, (1, 1, 1), permutation_mnk=(16, 16, 16))
+        return tiled, tiled
+
+    @cute.jit
+    def epilogue(self, acc_O: cute.Tensor, lse: cute.Tensor, split_idx: Int32,
+                 mO: cute.Tensor, mLSE: Optional[cute.Tensor], sO: cute.Tensor,
+                 seqlen: SeqlenInfoQK, gmem_tiled_copy_O: cute.TiledCopy,
+                 tma_atom_O: Optional[cute.CopyAtom], tiled_mma: cute.TiledMma,
+                 tidx: Int32, m_block: Int32, head_idx: Int32, batch_idx: Int32):
+        warp_idx = tidx // 32
+        lane = tidx % 32
+        if const_expr(mLSE is not None):
+            if warp_idx == 0:
+                if const_expr(self.is_split_kv):
+                    mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
+                else:
+                    mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
+                PackGQA(16, 256, False, self.qhead_per_kvhead).store_LSE(
+                    mLSE_cur, lse, tiled_mma, lane, m_block, seqlen.seqlen_q)
+        if const_expr(self.is_split_kv):
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=False)[
+                None, None, head_idx, split_idx]
+        else:
+            mO_cur = cute.domain_offset(
+                ((0, seqlen.offset_q), 0), mO[None, None, head_idx])
+        coordinates = cute.make_identity_tensor((16, self.vo_d_per_warp))
+        owned = tiled_mma.get_slice(lane).partition_C(coordinates)
+        row_limit = seqlen.seqlen_q * self.qhead_per_kvhead - m_block * 16
+        for i in cutlass.range(cute.size(acc_O.shape), unroll_full=True):
+            row_in_tile = owned[i][0]
+            if row_in_tile < row_limit:
+                packed_row = m_block * 16 + row_in_tile
+                query_idx = packed_row // self.qhead_per_kvhead
+                query_head = packed_row - query_idx * self.qhead_per_kvhead
+                column = warp_idx * self.vo_d_per_warp + owned[i][1]
+                out_ptr = utils.elem_pointer(mO_cur, ((query_head, query_idx), column))
+                if const_expr(self.is_split_kv):
+                    out_ptr[0] = acc_O[i]
+                else:
+                    out_ptr[0] = acc_O[i].to(cutlass.BFloat16)
+
+
+    def _get_shared_storage_cls(self):
+        sQ_t = cute.struct.Align[cute.struct.MemRange[cutlass.Int8, cute.cosize(self.sQ_layout)], 1024]
+        sK_t = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)], 1024]
+        sV_t = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sV_layout)], 1024]
+        sP_t = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sP_layout)], 1024]
+        @cute.struct
+        class SharedStorage:
+            sV: sV_t
+            sQ: sQ_t
+            sK: sK_t
+            sP: sP_t
+            sMD: cute.struct.Align[cute.struct.MemRange[Float32, self.num_threads], 16]
+        return SharedStorage
+
+    @cute.jit
+    def compute_one_n_block(
+        self, n_block: Int32, smem_pipe_read: Int32, smem_pipe_write: Int32,
+        mma_params: SimpleNamespace, smem_copy_params: SimpleNamespace,
+        softmax: Softmax, load_K: Callable, load_V: Callable,
+        score_mod: Callable | None, batch_idx: cutlass.Int32, head_idx: cutlass.Int32,
+        m_block: cutlass.Int32, seqlen: SeqlenInfoQK, aux_data: AuxData = AuxData(),
+        fastdiv_mods=None, mask_fn: Optional[Callable] = None,
+        is_first_n_block: cutlass.Constexpr = False,
+        check_inf: cutlass.Constexpr = True, n_block_min: Int32 = 0,
+    ):
+        # Local tensor bindings prevent DSL 4.6.2 from rebuilding every
+        # namespace field as an scf.if live-out when only sMD is stored.
+        sQ, sK, sV = smem_copy_params.sQ, smem_copy_params.sK, smem_copy_params.sV
+        sP, sMD = smem_copy_params.sP, smem_copy_params.sMD
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = tidx // 32
+        lane = tidx % 32
+        lane_group = lane // 4
+        lane_in_group = lane % 4
+        matrix_id = lane // 8
+        k_stage = smem_pipe_read if const_expr(self.num_stages > 1) else 0
+        acc_S = cute.make_rmem_tensor(
+            mma_params.thr_mma_qk.partition_shape_C((16, self.vo_n_per_warp)), Float32)
+        acc_S.fill(0.0)
+        # Runtime restricts this class to uniform Q1. With GQA8, only rows0..7
+        # are observable; zero lower P once so full M16 PV stays initialized.
+        if const_expr(is_first_n_block and self.vo_active_half_rows == 1):
+            for i in cutlass.range_constexpr((8 * self.tile_n) // self.num_threads):
+                position = tidx + i * self.num_threads
+                sP[8 + position // self.tile_n, position % self.tile_n] = Float32(0.0).to(self.dtype)
+            softmax.row_max[1] = Float32(0.0)
+            softmax.row_sum[1] = Float32(0.25)
+        cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
+        cute.arch.barrier()
+        if self.num_stages == 1 or n_block - self.num_stages + 1 >= n_block_min:
+            load_V(n_block - self.num_stages + 1, smem_pipe_write,
+                   need_predicates=is_first_n_block and self.num_stages == 1)
+        cute.arch.cp_async_commit_group()
+
+        q_row = lane % 8 + (matrix_id % 2) * 8
+        for kk in cutlass.range_constexpr(8):
+            a = _ldmatrix_m8n8_x4_b16(utils.elem_pointer(
+                sQ, (q_row, kk * 32 + (matrix_id // 2) * 16)).align(16))
+            for n in cutlass.range_constexpr(self.vo_n_per_warp // 8):
+                k_row = warp_idx * (self.vo_n_per_warp) + n * 8 + lane % 8
+                b = _ldmatrix_m8n8_x2_b16(utils.elem_pointer(
+                    sK,
+                    (k_row, kk * 32 + ((lane // 8) % 2) * 16, k_stage)).align(16))
+                c = (acc_S[(0, 0), 0, n], acc_S[(1, 0), 0, n],
+                     acc_S[(0, 1), 0, n], acc_S[(1, 1), 0, n])
+                d = _mma_m16n8k32_f32_fp8(a, b, c, self.dtype, reuse_accumulator=True)
+                acc_S[(0, 0), 0, n] = d[0]
+                acc_S[(1, 0), 0, n] = d[1]
+                acc_S[(0, 1), 0, n] = d[2]
+                acc_S[(1, 1), 0, n] = d[3]
+
+        # Each warp owns tile_n/num_warps globally distinct KV columns. Mask all iterations;
+        # public eligibility excludes custom masks, local attention and score mods.
+        for half_m in cutlass.range_constexpr(self.vo_active_half_rows):
+            packed_row = m_block * 16 + lane_group + half_m * 8
+            q_pos = packed_row // self.qhead_per_kvhead
+            for n in cutlass.range_constexpr(self.vo_n_per_warp // 8):
+                for half_n in cutlass.range_constexpr(2):
+                    k_pos = n_block * self.tile_n + warp_idx * (self.vo_n_per_warp) + n * 8 + lane_in_group * 2 + half_n
+                    valid = packed_row < seqlen.seqlen_q * self.qhead_per_kvhead
+                    valid = valid and k_pos < seqlen.seqlen_k
+                    valid = valid and k_pos <= seqlen.seqlen_k - seqlen.seqlen_q + q_pos
+                    if not valid:
+                        acc_S[(half_n, half_m), 0, n] = -Float32.inf
+
+        # Stage each warp's local row maxima; only one of the four duplicate lanes writes.
+        for half_m in cutlass.range_constexpr(self.vo_active_half_rows):
+            local_max = -Float32.inf
+            for n in cutlass.range_constexpr(self.vo_n_per_warp // 8):
+                local_max = cutlass.max(local_max, acc_S[(0, half_m), 0, n])
+                local_max = cutlass.max(local_max, acc_S[(1, half_m), 0, n])
+            local_max = cute.arch.warp_reduction_max(local_max, threads_in_group=4)
+            if lane_in_group == 0:
+                sMD[warp_idx * 16 + lane_group + half_m * 8] = local_max
+        cute.arch.barrier()
+
+        row_scale = cute.make_rmem_tensor(2, Float32)
+        if const_expr(self.vo_active_half_rows == 1):
+            row_scale.fill(1.0)
+        for half_m in cutlass.range_constexpr(self.vo_active_half_rows):
+            row = lane_group + half_m * 8
+            global_max = -Float32.inf
+            for w in cutlass.range_constexpr(self.vo_num_warps):
+                global_max = cutlass.max(global_max, sMD[w * 16 + row])
+            previous_max = softmax.row_max[half_m]
+            global_max = cutlass.max(global_max, previous_max)
+            softmax.row_max[half_m] = global_max
+            safe_max = Float32(0.0) if global_max == -Float32.inf else global_max
+            row_scale[half_m] = (
+                Float32(1.0) if const_expr(is_first_n_block)
+                else cute.math.exp2((previous_max - safe_max) * softmax.scale_log2, fastmath=True))
+            local_sum = Float32(0.0)
+            for n in cutlass.range_constexpr(self.vo_n_per_warp // 8):
+                for half_n in cutlass.range_constexpr(2):
+                    p = cute.math.exp2(
+                        (acc_S[(half_n, half_m), 0, n] - safe_max) * softmax.scale_log2,
+                        fastmath=True)
+                    local_sum += p
+                    col = warp_idx * (self.vo_n_per_warp) + n * 8 + lane_in_group * 2 + half_n
+                    sP[row, col] = p.to(self.dtype)
+            local_sum += cute.arch.shuffle_sync(local_sum, lane ^ 2)
+            local_sum += cute.arch.shuffle_sync(local_sum, lane ^ 1)
+            if lane_in_group == 0:
+                sMD[self.num_threads // 2 + warp_idx * 16 + row] = local_sum
+        if const_expr(self.vo_active_half_rows == 1):
+            acc_O_local = mma_params.acc_O
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O_local)
+            acc_O_mn[0, None].store(acc_O_mn[0, None].load() * row_scale[0])
+        else:
+            softmax.rescale_O(mma_params.acc_O, row_scale)
+
+        # Existing V wait also makes P and all warp-local sums visible.
+        cute.arch.cp_async_wait_group(self.num_stages * 2 - 2)
+        cute.arch.barrier()
+        for half_m in cutlass.range_constexpr(self.vo_active_half_rows):
+            row = lane_group + half_m * 8
+            global_sum = Float32(0.0)
+            for w in cutlass.range_constexpr(self.vo_num_warps):
+                global_sum += sMD[self.num_threads // 2 + w * 16 + row]
+            # Softmax.finalize performs a quad sum. All lanes keep 1/4 of
+            # the common denominator, retaining that helper and its LSE contract.
+            softmax.row_sum[half_m] = (
+                softmax.row_sum[half_m] * row_scale[half_m] + global_sum * Float32(0.25))
+        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+        if n_block - self.num_stages >= n_block_min:
+            load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
+        cute.arch.cp_async_commit_group()
+
+        # Every warp consumes the complete P tile and its disjoint D output slice.
+        p_layout = cute.make_layout(((4, 2, 2), 1, self.tile_n // 32), stride=((1, 4, 8), 0, 16))
+        tOrP = cute.make_rmem_tensor(p_layout, self.dtype)
+        tOrP_i32 = cute.recast_tensor(tOrP, Int32)
+        p_row = lane % 8 + (matrix_id % 2) * 8
+        for kb in cutlass.range_constexpr(self.tile_n // 32):
+            regs = _ldmatrix_m8n8_x4_b16(utils.elem_pointer(
+                sP, (p_row, kb * 32 + (matrix_id // 2) * 16)).align(16))
+            for reg in cutlass.range_constexpr(4):
+                tOrP_i32[(0, reg % 2, reg // 2), 0, kb] = regs[reg]
+        lane_row = lane % 16
+        lane_matrix_col = (lane // 16) * 16
+        for kb in cutlass.range_constexpr(self.tile_n // 32):
+            a = (tOrP_i32[(0, 0, 0), 0, kb], tOrP_i32[(0, 1, 0), 0, kb],
+                 tOrP_i32[(0, 0, 1), 0, kb], tOrP_i32[(0, 1, 1), 0, kb])
+            for group in cutlass.range_constexpr(self.vo_d_per_warp // 32):
+                col = warp_idx * self.vo_d_per_warp + group * 32 + lane_matrix_col
+                b0 = _ldmatrix_m16n16_x2_trans_b8(utils.elem_pointer(
+                    sV, (kb * 32 + lane_row, col, k_stage)).align(16))
+                b1 = _ldmatrix_m16n16_x2_trans_b8(utils.elem_pointer(
+                    sV, (kb * 32 + 16 + lane_row, col, k_stage)).align(16))
+                for local_n in cutlass.range_constexpr(4):
+                    n = group * 4 + local_n
+                    c = (mma_params.acc_O[(0, 0), 0, n], mma_params.acc_O[(1, 0), 0, n],
+                         mma_params.acc_O[(0, 1), 0, n], mma_params.acc_O[(1, 1), 0, n])
+                    d = _mma_m16n8k32_f32_fp8(a, (b0[local_n], b1[local_n]), c,
+                                             self.dtype, reuse_accumulator=True)
+                    mma_params.acc_O[(0, 0), 0, n] = d[0]
+                    mma_params.acc_O[(1, 0), 0, n] = d[1]
+                    mma_params.acc_O[(0, 1), 0, n] = d[2]
+                    mma_params.acc_O[(1, 1), 0, n] = d[3]
+
+
+    @cute.jit
+    def _vo_load_two_pages(
+        self, gmem_tiled_copy: cute.TiledCopy, tDst: cute.Tensor,
+        tCoord: cute.Tensor, tPred: cute.Tensor, block: Int32,
+        smem_pipe_write: Int32, seqlen: Int32,
+        need_predicates: cutlass.Constexpr, mKV_pages: cute.Tensor,
+        mPageTable: cute.Tensor, page_batch_idx: Int32, gmem_thr_copy,
+        tile_hdim: cutlass.Constexpr,
+    ):
+        # Each source is one physical page. The two page IDs may be unrelated.
+        stage = smem_pipe_write if const_expr(self.num_stages > 1) else 0
+        for half in cutlass.range_constexpr(2):
+            slot = block * 2 + half
+            page = Int32(0)
+            if const_expr(need_predicates):
+                if slot * 64 < seqlen:
+                    page = mPageTable[page_batch_idx, slot]
+            else:
+                page = mPageTable[page_batch_idx, slot]
+            gPage = cute.local_tile(
+                mKV_pages[None, None, page], (64, tile_hdim), (0, 0))
+            tSrc = gmem_thr_copy.partition_S(gPage)
+            n_per_page = cute.size(tSrc.shape[1])
+            for n in cutlass.range_constexpr(n_per_page):
+                dst_n = half * n_per_page + n
+                predicate = None
+                if const_expr(need_predicates):
+                    valid_row = tCoord[0, dst_n, 0][0] < seqlen - block * 128
+                    predicate = cute.make_fragment_like(tPred[None, 0, None])
+                    for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
+                        for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
+                            predicate[i, k] = valid_row
+                # Predicated cp.async also zero-fills invalid V rows. A missing
+                # tail page uses physical page0 only as a safe unused source.
+                cute.copy(gmem_tiled_copy, tSrc[None, n, None],
+                          tDst[None, dst_n, None, stage], pred=predicate)
+
+    @cute.jit
+    def load_K(
+        self, gmem_tiled_copy: cute.TiledCopy, tKgK: cute.Tensor,
+        tKsK: cute.Tensor, tKcK: cute.Tensor, t0KcK: cute.Tensor,
+        tKpK: cute.Tensor, block: Int32, smem_pipe_write: Int32,
+        seqlen: Int32, need_predicates: cutlass.Constexpr,
+        mKV_pages: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None, page_batch_idx: Int32 = 0,
+        gmem_thr_copy: Optional[cute.TiledCopy] = None,
+    ):
+        if const_expr(self.tile_n == 128 and self.page_size == 64):
+            self._vo_load_two_pages(gmem_tiled_copy, tKsK, tKcK, tKpK,
+                block, smem_pipe_write, seqlen, need_predicates, mKV_pages,
+                mPageTable, page_batch_idx, gmem_thr_copy, self.tile_hdim)
+        else:
+            FlashAttentionForwardBase.load_K(self, gmem_tiled_copy, tKgK,
+                tKsK, tKcK, t0KcK, tKpK, block, smem_pipe_write, seqlen,
+                need_predicates, mKV_pages, mPageTable, page_batch_idx, gmem_thr_copy)
+
+    @cute.jit
+    def load_V(
+        self, gmem_tiled_copy: cute.TiledCopy, tVgV: cute.Tensor,
+        tVsV: cute.Tensor, tVcV: cute.Tensor, t0VcV: cute.Tensor,
+        tVpV: cute.Tensor, block: Int32, smem_pipe_write: Int32,
+        seqlen: Int32, need_predicates: cutlass.Constexpr,
+        mKV_pages: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None, page_batch_idx: Int32 = 0,
+        gmem_thr_copy: Optional[cute.TiledCopy] = None,
+    ):
+        if const_expr(self.tile_n == 128 and self.page_size == 64):
+            self._vo_load_two_pages(gmem_tiled_copy, tVsV, tVcV, tVpV,
+                block, smem_pipe_write, seqlen, need_predicates, mKV_pages,
+                mPageTable, page_batch_idx, gmem_thr_copy, self.tile_hdimv)
+        else:
+            FlashAttentionForwardBase.load_V(self, gmem_tiled_copy, tVgV,
+                tVsV, tVcV, t0VcV, tVpV, block, smem_pipe_write, seqlen,
+                need_predicates, mKV_pages, mPageTable, page_batch_idx, gmem_thr_copy)
