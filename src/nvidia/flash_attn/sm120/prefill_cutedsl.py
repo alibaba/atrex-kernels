@@ -2335,9 +2335,13 @@ def __getattr__(name):
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright 2026 Alibaba Group
 from enum import Enum as _tma_Enum
+from inspect import signature as _tma_signature
 from cutlass import Boolean as _tma_Boolean
 from cutlass._mlir.dialects import nvvm as _tma_nvvm
 from cutlass.cute.arch.nvvm_wrappers import shuffle_sync_op as _tma_shuffle_sync_op
+
+# Newer NVVM bindings take the result type as a keyword sequence.
+_TMA_LDMATRIX_RESULTS = "results" in _tma_signature(_tma_nvvm.ldmatrix).parameters
 
 # prefill_tma_primitives.py — Copyright 2026 Alibaba Group; SPDX-License-Identifier: Apache-2.0
 class _tma_Shfl(_tma_Enum):
@@ -2466,11 +2470,15 @@ def _tma_ldmatrix(ptr, nregs: cutlass.Constexpr, layout=_tma_MMALayout.ROW,
     _tma_ldmatrix_instruction(nregs, layout, shape, src_format)
     result_type = (T.i32() if nregs == 1 else
                    ir.Type.parse("!llvm.struct<(" + ",".join(["i32"] * nregs) + ")>"))
+    result_type_kwargs = (
+        {"results": [result_type]} if _TMA_LDMATRIX_RESULTS else {"res": result_type}
+    )
     result = _tma_nvvm.ldmatrix(
-        result_type, ptr.ir_value(loc=loc, ip=ip), nregs,
-        _tma_nvvm.MMALayout.col if layout is _tma_MMALayout.COL else _tma_nvvm.MMALayout.row,
+        ptr=ptr.ir_value(loc=loc, ip=ip), num=nregs,
+        layout=_tma_nvvm.MMALayout.col if layout is _tma_MMALayout.COL else _tma_nvvm.MMALayout.row,
         shape=None if shape == "m8n8" else _tma_nvvm.LoadShape.M16N16,
         src_format=None if src_format == "b16" else _tma_nvvm.LoadSrcFormat.B8,
+        **result_type_kwargs,
         loc=loc, ip=ip,
     )
     if nregs == 1:
