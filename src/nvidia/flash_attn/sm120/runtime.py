@@ -34,7 +34,7 @@ from flash_attn.cute.cute_dsl_utils import (
     to_cute_aux_tensor,
     to_cute_tensor,
 )
-from atrex.src.nvidia.flash_attn.sm120.prefill_cutedsl import (
+from atrex.src.nvidia.flash_attn.sm120.attention_cutedsl import (
     FlashAttentionForwardSm120, FlashAttentionForwardSm120Hd256Fp8Decode,
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
@@ -1103,7 +1103,7 @@ _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
 import functools as _tma_functools
 from cutlass.cute.runtime import make_fake_compact_tensor as _tma_make_fake_compact_tensor
 from cutlass.cute.runtime import make_fake_stream as _tma_make_fake_stream
-from .prefill_cutedsl import _tma_FlashAttentionForwardSm120Fp8Tma
+from .attention_cutedsl import _tma_FlashAttentionForwardSm120Fp8Tma
 
 # prefill_tma_runtime.py — Copyright 2026 Alibaba Group; SPDX-License-Identifier: Apache-2.0
 def _select_tma_prefill_config(max_q, batch, hq, hkv, sm_count, max_kv=0):
