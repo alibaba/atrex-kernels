@@ -143,7 +143,7 @@ def _prep_layout_indices():
 @pytest.mark.parametrize("kv_heads", [1, 2, 3])
 @pytest.mark.parametrize("page_size", [64, 128, 256])
 def test_prep_kv_bit_exact_and_graph_lengths(kv_heads, page_size):
-    from atrex.src.ppu.flash_attn.zwm890p import runtime
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     lengths = [0, 63, 65, 129, 511]
     case = build_case(page_size, [1] * len(lengths), lengths, hq=kv_heads * 8, hkv=kv_heads)
@@ -219,10 +219,10 @@ def test_prefill_fast_path_source_matches_main():
     import hashlib
 
     from atrex.core.compile_cu import _atrex_source_root
-    from atrex.src.ppu.flash_attn.zwm890p import runtime
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     root = _atrex_source_root() / "ppu/flash_attn/zwm890p"
-    source = (root / "kernel.cu").read_text()
+    source = (root / "prefill.cu").read_text()
     expected = (
         ("template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>",
          "// ==================================================================================== KERNEL 3",
@@ -239,7 +239,7 @@ def test_prefill_fast_path_source_matches_main():
     assert "void atrex_ppu_attn(" not in general
     assert "bool GENERAL" not in source
     assert runtime._launch.jit_spec.sources == (
-        "ppu/flash_attn/zwm890p/kernel.cu",
+        "ppu/flash_attn/zwm890p/prefill.cu",
         "ppu/flash_attn/zwm890p/prefill_general.cu",
     )
     assert runtime._launch.jit_spec.include_dirs == ("ppu/flash_attn/zwm890p/include",)
@@ -343,7 +343,7 @@ def test_unsupported_row_stride():
 ])
 def test_prefill_decode_dispatch(query, hq, hkv, path, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
 
     case = build_case(64, [query, query], [1025, 2049], hq=hq, hkv=hkv)
     if path == "prefill":
@@ -374,7 +374,7 @@ def test_prefill_decode_dispatch(query, hq, hkv, path, monkeypatch):
                                   NotImplementedError("selected kernel failure")])
 def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
 
     case = _case(64, [4, 4], [1025, 2049])
     calls = []
@@ -397,7 +397,7 @@ def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
 @pytest.mark.parametrize("version", [None, 2, 3])
 def test_fa_version_preserves_dispatch(query, version, monkeypatch):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
 
     case = _case(64, [query, query], [1025, 2049])
     case["fa_version"] = version
@@ -453,7 +453,7 @@ def test_decode_runtime_heads_and_pages(query, heads, page_size):
 @pytest.mark.parametrize("batch", [1, 3])
 def test_short_q_auto_never_uses_prefill(query, heads, batch, monkeypatch):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import runtime
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     def unexpected(**kwargs):
         raise AssertionError("Supported short-Q attention must use decode")
@@ -545,7 +545,7 @@ def test_eligibility_does_not_compile_or_launch(monkeypatch):
     from atrex import can_use_flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import launch
     from atrex.src.ppu.flash_attn.zwm890p import decode_build
-    from atrex.src.ppu.flash_attn.zwm890p import runtime
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
     import atrex.api.flash_attn as api
 
     def unexpected(*args, **kwargs):

@@ -45,6 +45,6 @@ def forward(*, fa_version=None, **kwargs):
         from .decode_runtime import forward as decode_forward
 
         return decode_forward(fa_version=fa_version, **kwargs)
-    from .runtime import forward as prefill_forward
+    from .prefill_runtime import forward as prefill_forward
 
     return prefill_forward(**kwargs)

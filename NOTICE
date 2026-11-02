@@ -42,7 +42,7 @@ The PPU direct-paged decode implementation uses native PPU instructions and SDK
 headers, with FlashAttention-for-SAIL as a reference. PPU CuTe/ACTLASS/ACTLIZE
 headers are not bundled or required by this implementation. The reference
 vendor BSD-3-Clause license is retained in
-src/ppu/flash_attn/zwm890p/decode/LICENSE.
+src/ppu/flash_attn/zwm890p/LICENSE.decode.
 
 FlashInfer SM120 FP8 Prefill
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
