@@ -16,8 +16,8 @@ def validate(call):
     if table is None or k.ndim != 4 or k.shape[-1] != 256 or v.shape != k.shape:
         raise NotImplementedError("PPU prefill requires paged K/V [blocks,page_size,KV heads,256]")
     kv_heads = k.shape[2]
-    if kv_heads <= 0 or q.shape[1] <= 0 or q.shape[1] % (4 * kv_heads):
-        raise NotImplementedError("PPU prefill requires GQA to be a positive multiple of four")
+    if kv_heads <= 0 or q.shape[1] <= 0 or q.shape[1] % (2 * kv_heads):
+        raise NotImplementedError("PPU prefill requires GQA to be a positive multiple of two")
     if k.shape[1] < 64 or k.shape[1] % 64:
         raise NotImplementedError("PPU prep_kv requires page_size to be a multiple of 64")
     block_elements = k.shape[1] * k.shape[2] * k.shape[3]
