@@ -455,7 +455,7 @@ def test_decode_runtime_heads_and_pages(query, heads, page_size):
 @pytest.mark.parametrize("page_size", [64, 128, 256])
 @pytest.mark.parametrize("splits", [0, 1, 4])
 @pytest.mark.parametrize("descale", [False, True])
-def test_qwen36_air_heads_pages_and_splits(heads, query, page_size, splits, descale):
+def test_gqa6_and_gqa12_heads_pages_and_splits(heads, query, page_size, splits, descale):
     from atrex import can_use_flash_attn_varlen_func
 
     lengths = [127, 513, 1025]
@@ -474,7 +474,7 @@ def test_qwen36_air_heads_pages_and_splits(heads, query, page_size, splits, desc
 
 @pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
 @pytest.mark.parametrize("query", [1, 4, 65])
-def test_qwen36_air_graph_reads_updated_kv_and_lengths(heads, query):
+def test_gqa6_and_gqa12_graph_reads_updated_kv_and_lengths(heads, query):
     from atrex import flash_attn_varlen_func
 
     case = build_case(256, [query, max(1, query - 1)], [511, 1023],
@@ -494,7 +494,7 @@ def test_qwen36_air_graph_reads_updated_kv_and_lengths(heads, query):
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
-def test_qwen36_air_mixed_prefill_and_decode(heads):
+def test_gqa6_and_gqa12_mixed_prefill_and_decode(heads):
     case = build_case(256, [1, 0, 256, 4], [513, 0, 1025, 255],
                       hq=heads[0], hkv=heads[1])
     _check(case, graph=True)
@@ -517,7 +517,7 @@ def test_prefill_prewarm_caches_only_compiled_module(monkeypatch):
     torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
-def test_qwen36_air_prefill_graph_changes_scale_sign():
+def test_prefill_heads6_kv1_graph_changes_scale_sign():
     from atrex import flash_attn_varlen_func
 
     case = build_case(256, [65, 17], [513, 257], hq=6, hkv=1)
@@ -536,7 +536,7 @@ def test_qwen36_air_prefill_graph_changes_scale_sign():
 @pytest.mark.parametrize("query", [6, 17, 63, 64, 65, 127, 128, 129])
 @pytest.mark.parametrize("scale", [None, 0., -.5, .75])
 @pytest.mark.parametrize("splits", [1, 4])
-def test_qwen36_air_packed_query_head_boundaries(query, scale, splits):
+def test_prefill_heads6_kv1_packed_query_head_boundaries(query, scale, splits):
     case = build_case(256, [query, 1, query - 1], [257, 127, 513], hq=6, hkv=1)
     if scale is None:
         for name in ("q_descale", "k_descale", "v_descale"):
@@ -546,7 +546,7 @@ def test_qwen36_air_packed_query_head_boundaries(query, scale, splits):
     _check(case, splits=splits)
 
 
-def test_qwen36_air_zero_descale_preserves_nan_q():
+def test_prefill_heads6_kv1_zero_descale_preserves_nan_q():
     from atrex import flash_attn_varlen_func
 
     case = build_case(256, [65, 17], [513, 257], hq=6, hkv=1)
@@ -563,7 +563,7 @@ def test_qwen36_air_zero_descale_preserves_nan_q():
 
 
 @pytest.mark.parametrize("batch", [32, 64])
-def test_qwen36_air_mixed_kv_graph_replans_each_replay(batch):
+def test_gqa12_mixed_kv_graph_replans_each_replay(batch):
     from atrex import flash_attn_varlen_func
     from op_test.utils.flash_attn_contract import error_metrics
 
@@ -625,7 +625,7 @@ def test_decode_softmax_dynamic_range(query, heads, amplitude):
 @pytest.mark.parametrize("amplitude", [1., 2., 4.])
 @pytest.mark.parametrize("scale", [0., -.75, .75])
 @pytest.mark.parametrize("seed", [17, 37])
-def test_qwen36_air_prefill_softmax_dynamic_range(amplitude, scale, seed):
+def test_prefill_heads6_kv1_softmax_dynamic_range(amplitude, scale, seed):
     case = build_case(256, [65, 17], [1025, 513], hq=6, hkv=1)
     torch.manual_seed(seed)
     for name in ("q", "k"):
@@ -663,7 +663,10 @@ def test_decode_build_specializations():
 
 
 @pytest.mark.parametrize("query", range(1, 6))
-def test_decode_selects_compiled_query_variant(query, monkeypatch):
+@pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
+@pytest.mark.parametrize("capacity", [512, 8192])
+@pytest.mark.parametrize("splits", [0, 1])
+def test_decode_selects_compiled_query_variant(query, heads, capacity, splits, monkeypatch):
     from atrex import flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import decode_build
 
@@ -684,11 +687,16 @@ def test_decode_selects_compiled_query_variant(query, monkeypatch):
         return library
 
     monkeypatch.setattr(decode_build, "load_library", load)
-    case = build_case(64, [query, query], [127, 257], hq=32, hkv=2)
-    actual = flash_attn_varlen_func(**case, num_splits=1)
+    case = build_case(64, [query, query], [127, 257], hq=heads[0], hkv=heads[1])
+    table = torch.full((2, capacity // 64), -1, dtype=torch.int32, device="cuda")
+    table[:, :case["block_table"].shape[1]] = case["block_table"]
+    case["block_table"] = table
+    case["max_seqlen_k"] = capacity
+    actual = flash_attn_varlen_func(**case, num_splits=splits)
     expected, _ = reference(case)
     torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
-    assert loaded == ["q1" if query == 1 else "q4_wide" if query == 4 else "q4"]
+    group = heads[0] // heads[1]
+    assert loaded == ["q1" if query == 1 else "q4_wide" if query == 4 and group == 16 else "q4"]
 
 
 @pytest.mark.parametrize("heads", [24, 32])
@@ -958,7 +966,7 @@ def test_decode_real_kernel_events(query, heads):
     case = build_case(64, [query, query], [1025, 2049], hq=heads[0], hkv=heads[1])
     names = profile_case(case)
     assert any("atrex_ppu_native_decode_kernel" in name for name in names)
-    if query == 4 and heads[0] // heads[1] in (12, 16):
+    if query == 4 and heads[0] // heads[1] == 16:
         assert not any("atrex_ppu_native_decode_prepare" in name for name in names)
         assert not any("atrex_ppu_native_decode_combine" in name for name in names)
     else:

@@ -1,22 +1,9 @@
 """Direct paged FP8 decode; the prefill implementation is never used here."""
 
 import ctypes
-from functools import lru_cache
 import math
 
 import torch
-
-
-@lru_cache(maxsize=None)
-def _half_kernel(device):
-    from .decode_build import load_library
-
-    library = load_library("q4_halves", device)
-    resources = (ctypes.c_int * 4)()
-    status = library.atrex_ppu_decode_resources(resources)
-    if status:
-        raise RuntimeError(f"PPU decode occupancy query failed: {status}")
-    return library, resources[3]
 
 
 def validate(call):
@@ -90,19 +77,9 @@ def forward(
     variant = "q1" if max_seqlen_q == 1 else "q4"
     if max_seqlen_q == 4 and q.shape[1] // k.shape[2] == 16:
         variant = "q4_wide"
-        if num_splits == 0 and page_table.shape[1] * k.shape[1] <= 4096:
-            variant = "q4_columns"
     batch = cu_seqlens_q.numel() - 1
     compute_units = torch.cuda.get_device_properties(q.device).multi_processor_count
-    library = None
-    if max_seqlen_q == 4 and q.shape[1] // k.shape[2] == 12 and num_splits == 0 and page_table.shape[1] * k.shape[1] <= 4096:
-        candidate, blocks = _half_kernel(q.device)
-        if batch * k.shape[2] * 2 <= compute_units * blocks:
-            library = candidate
-        else:
-            library = load_library("q4_wide", q.device)
-    if library is None:
-        library = load_library(variant, q.device)
+    library = load_library(variant, q.device)
     total = q.shape[0]
     query_heads, head_dim = q.shape[1:]
     page_size, kv_heads = k.shape[1:3]

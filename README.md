@@ -75,8 +75,8 @@ The original 8/1, implicit-unit-scale kernel signature, body, and launcher are
 retained from main (`43798a6f`). Other heads/scales use the independent
 `atrex_ppu_attn_general` kernel in a separate CUDA translation unit. Both share
 the same local layout/instruction helpers; this adds no third-party dependency.
-Qwen3.6-Air TP4 uses local heads 6/1: its prefill specialization packs query/head
-rows into full MMA tiles, including when device descales are supplied.
+The 6/1-head prefill specialization packs query/head rows into full MMA tiles,
+including when device descales are supplied.
 Prefill uses `prep_kv`:
 each call allocates packed K and V buffers of
 `requests * num_kv_heads * ceil(max_seqlen_k / 64) * 16384` bytes each, plus small scale and
@@ -94,7 +94,11 @@ prefill path only when its contract also matches; otherwise they fail explicitly
 Decode reads `block_table` directly with invocation-local scratch, without KV
 packing or persistent input caches. HGCC lazily compiles `native_decode.cu`
 using PPU SDK headers, without PPU CuTe/ACTLASS. Prewarm each required path
-before CUDA Graph capture. Target tests cover standalone FP32 correctness,
+before CUDA Graph capture. All KV lengths use the same three decode variants:
+Q1 uses `q1`; Q4 with GQA16 uses `q4_wide`; all other supported short-Q calls
+use `q4`. Variant selection does not depend on KV length, page-table capacity,
+batch size, or `num_splits`.
+Target tests cover standalone FP32 correctness,
 dispatch and fail-fast behavior, graph replay, scratch reuse, KV tail
 sanitization, and real kernel events.
 

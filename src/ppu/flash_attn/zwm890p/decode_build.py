@@ -21,8 +21,6 @@ DEFINES = {
     "q1": {"Q1_ONLY": 1},
     "q4": {"Q1_ONLY": 0},
     "q4_wide": {"Q1_ONLY": 0, "KEY_ROWS": 64},
-    "q4_halves": {"Q1_ONLY": 0, "OUTPUT_DIVISIONS": 2},
-    "q4_columns": {"Q1_ONLY": 0, "KEY_ROWS": 64, "PV_COLUMNS": 1},
 }
 BACKEND_FLAGS = (
     "-ppu-max-vreg-count=256", "-ppu-sink-matrix-addr=true",
