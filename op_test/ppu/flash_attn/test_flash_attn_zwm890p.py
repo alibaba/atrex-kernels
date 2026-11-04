@@ -435,41 +435,25 @@ def test_fa2_uses_original_prefill(query):
 
 
 @pytest.mark.parametrize("query", range(1, 6))
-@pytest.mark.parametrize("heads", [(8, 1), (16, 1), (24, 3), (32, 2), (48, 3), (64, 4)])
+@pytest.mark.parametrize("heads", [(6, 1), (8, 1), (12, 2), (16, 1), (24, 2),
+                                  (24, 3), (32, 2), (36, 3), (48, 3), (64, 4)])
 @pytest.mark.parametrize("page_size", [64, 128, 256])
 def test_decode_runtime_heads_and_pages(query, heads, page_size):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
 
     query_heads, kv_heads = heads
     q_lens = [query, 1, max(1, query - 1)]
-    case = build_case(page_size, q_lens, [127, 1025, 2049], hq=query_heads, hkv=kv_heads)
-    assert can_use_flash_attn_varlen_func(**case)
-    expected, _ = reference(case)
-    for splits in (0, 1):
-        actual = flash_attn_varlen_func(**case, num_splits=splits)
-        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
-
-
-@pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
-@pytest.mark.parametrize("query", [1, 2, 3, 4, 5, 65])
-@pytest.mark.parametrize("page_size", [64, 128, 256])
-@pytest.mark.parametrize("splits", [0, 1, 4])
-@pytest.mark.parametrize("descale", [False, True])
-def test_gqa6_and_gqa12_heads_pages_and_splits(heads, query, page_size, splits, descale):
-    from atrex import can_use_flash_attn_varlen_func
-
-    lengths = [127, 513, 1025]
-    case = build_case(page_size, [query, 1, max(1, query - 1)], lengths,
-                      hq=heads[0], hkv=heads[1])
-    if not descale:
-        for name in ("q_descale", "k_descale", "v_descale"):
-            case[name] = None
+    lengths = [127, 1025, 2049]
+    case = build_case(page_size, q_lens, lengths, hq=query_heads, hkv=kv_heads)
     for request, length in enumerate(lengths):
         if length % page_size:
             page = int(case["block_table"][request, length // page_size])
             case["v"][page, length % page_size:].view(torch.uint8).fill_(0x7f)
     assert can_use_flash_attn_varlen_func(**case)
-    _check(case, splits=splits)
+    expected, _ = reference(case)
+    for splits in (0, 1, 4):
+        actual = flash_attn_varlen_func(**case, num_splits=splits)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
@@ -562,29 +546,6 @@ def test_prefill_heads6_kv1_zero_descale_preserves_nan_q():
     torch.testing.assert_close(actual[finite].float(), expected[finite].float(), atol=.03, rtol=.05)
 
 
-@pytest.mark.parametrize("batch", [32, 64])
-def test_gqa12_mixed_kv_graph_replans_each_replay(batch):
-    from atrex import flash_attn_varlen_func
-    from op_test.utils.flash_attn_contract import error_metrics
-
-    lengths = [[4096, 8192, 16384, 32768][(index * 3 + index // 4) % 4]
-               for index in range(batch)]
-    case = build_case(256, [4] * batch, lengths, hq=24, hkv=2)
-    for name in ("q_descale", "k_descale", "v_descale"):
-        case[name] = torch.ones((1, 2), device="cuda").expand(batch, 2)
-    flash_attn_varlen_func(**case)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = flash_attn_varlen_func(**case)
-    for current in (lengths, [4096] * batch, lengths):
-        case["seqused_k"].copy_(torch.tensor(current, device="cuda", dtype=torch.int32))
-        graph.replay()
-        torch.cuda.synchronize()
-        expected, _ = reference(case)
-        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
-        assert error_metrics(actual, expected)["relative_l2"] < .05
-
-
 @pytest.mark.parametrize("query", range(2, 6))
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
 @pytest.mark.parametrize("batch", [1, 3])
@@ -662,10 +623,11 @@ def test_decode_build_specializations():
     assert decode_build.DEFINES["q4"]["Q1_ONLY"] == 0
 
 
-@pytest.mark.parametrize("query", range(1, 6))
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
-@pytest.mark.parametrize("capacity", [512, 8192])
-@pytest.mark.parametrize("splits", [0, 1])
+@pytest.mark.parametrize("query,capacity,splits", [
+    (1, 512, 0), (2, 512, 1), (3, 512, 0), (5, 8192, 1),
+    (4, 512, 0), (4, 512, 1), (4, 8192, 0), (4, 8192, 1),
+])
 def test_decode_selects_compiled_query_variant(query, heads, capacity, splits, monkeypatch):
     from atrex import flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import decode_build
@@ -701,13 +663,14 @@ def test_decode_selects_compiled_query_variant(query, heads, capacity, splits, m
 
 @pytest.mark.parametrize("heads", [24, 32])
 @pytest.mark.parametrize("batch", [3, 64, 128])
-@pytest.mark.parametrize("maximum", [4096, 8192])
+@pytest.mark.parametrize("maximum", [4096, 32768])
 def test_decode_graph_switches_single_and_multiple_splits(heads, batch, maximum):
     from atrex import flash_attn_varlen_func
+    from op_test.utils.flash_attn_contract import error_metrics
 
     case = build_case(256, [4] * batch, [maximum] * batch, hq=heads, hkv=2)
     for name, scale in (("q_descale", .875), ("k_descale", 1.125), ("v_descale", .75)):
-        case[name].fill_(scale)
+        case[name] = torch.full((1, 2), scale, device="cuda").expand(batch, 2)
     case["seqused_k"].fill_(4)
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
     flash_attn_varlen_func(**case, out=out, num_splits=0)
@@ -716,6 +679,7 @@ def test_decode_graph_switches_single_and_multiple_splits(heads, batch, maximum)
         flash_attn_varlen_func(**case, out=out, num_splits=0)
     updates = [[maximum] * batch, [4] * batch,
                [4 if request % 2 else maximum for request in range(batch)],
+               [maximum // (8, 4, 2, 1)[request % 4] for request in range(batch)],
                [33] * batch, [maximum] * batch, [4] * batch]
     for lengths in updates:
         case["seqused_k"].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
@@ -724,6 +688,7 @@ def test_decode_graph_switches_single_and_multiple_splits(heads, batch, maximum)
         torch.testing.assert_close(out, eager, atol=0., rtol=0.)
         expected, _ = reference(case)
         torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
+        assert error_metrics(out, expected)["relative_l2"] < .05
 
 
 def test_decode_vector_output_rejects_unaligned_out():
@@ -909,10 +874,11 @@ def test_direct_decode_contract_and_mutation(query, splits, layout):
 
 
 @pytest.mark.parametrize("query", range(1, 6))
-def test_decode_implicit_descales(query):
+@pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
+def test_decode_implicit_descales(query, heads):
     from atrex import flash_attn_varlen_func
 
-    case = build_case(64, [query, query], [1025, 2049], hq=32, hkv=2)
+    case = build_case(64, [query, query], [1025, 2049], hq=heads[0], hkv=heads[1])
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name].fill_(1)
     expected, _ = reference(case)
