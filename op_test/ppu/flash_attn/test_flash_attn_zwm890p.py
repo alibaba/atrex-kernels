@@ -597,8 +597,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert decode_build.DEFINES["q1"]["Q1_ONLY"] == 1
-    assert decode_build.DEFINES["q4"]["Q1_ONLY"] == 0
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])

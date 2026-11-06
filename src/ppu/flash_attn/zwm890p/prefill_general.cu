@@ -170,18 +170,9 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 #else
   if (npg >= 0) STAGE(0, 0);
 #endif
-#if PGSTEP2
-
-#define PGSTEP 2
-#else
-#define PGSTEP 1
-#endif
-#if PGU2
-#define SPSTEP 2
-#else
-#define SPSTEP 1
-#endif
-  for (int pp = 0; pp <= npg; pp += PGSTEP) {
+  constexpr int page_step = PGSTEP2 ? 2 : 1;
+  constexpr int split_step = PGU2 ? 2 : 1;
+  for (int pp = 0; pp <= npg; pp += page_step) {
 #if SP2E
     if ((pp & 1) == 0) {
       cp_wait<0>();
@@ -199,9 +190,9 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 #elif SP2 || SP2B
 
 #if SP2B
-    const bool _lead = true;
+    constexpr bool _lead = true;
 #else
-    const bool _lead = (PGSTEP == 2) || ((pp & 1) == 0);
+    const bool _lead = (page_step == 2) || ((pp & 1) == 0);
 #endif
     if (_lead) {
       cp_wait<0>();
@@ -228,7 +219,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 #endif
 
 #pragma unroll
-    for (int _sp = 0; _sp < SPSTEP; ++_sp) {
+    for (int _sp = 0; _sp < split_step; ++_sp) {
       const int pg = pp + _sp;
       if (pg > npg) continue;
     const unsigned char* Kb = Ks + (pg & (buffers - 1)) * KPAGE_BYTES;
@@ -285,7 +276,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     load_k_ldmatrix(future_second_key, key_block + 128);
     u32 first_probability[4];
     {
-      const int group = 1;
+      constexpr int group = 1;
     float maximum[2] = {-INFINITY, -INFINITY};
 #pragma unroll
     for (int row_half = 0; row_half < 2; ++row_half) {
@@ -376,7 +367,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     bool future_rescale = false;
     u32 second_probability[4];
     {
-      const int group = 0;
+      constexpr int group = 0;
     float maximum[2] = {-INFINITY, -INFINITY};
 #pragma unroll
     for (int row_half = 0; row_half < 2; ++row_half) {
@@ -448,8 +439,6 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     __syncthreads();
 #endif
   }
-#undef PGSTEP
-#undef SPSTEP
 #undef STAGE
 #undef STAGE_NC
 #undef RESCALE
@@ -555,7 +544,7 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   const int launch_nblk = FIXED_HEADS ? (n_tok * FIXED_HEADS + MQ * HEAD_GROUP - 1) / (MQ * HEAD_GROUP) + (n_req > 1 ? n_req : 0) :
       (n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk);
   const int head_groups = FIXED_HEADS ? 1 : query_heads / HEAD_GROUP;
-  const int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
+  constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
     cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
