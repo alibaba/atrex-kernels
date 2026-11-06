@@ -17,10 +17,7 @@ from atrex.core.compile_cu import _jit_cache_root, _process_lock
 ROOT = Path(__file__).resolve().parent
 LOCK = threading.Lock()
 LIBRARIES = {}
-DEFINES = {
-    "q1": {"Q1_ONLY": 1},
-    "q4": {"Q1_ONLY": 0},
-}
+VARIANTS = ("q1", "q4", "q4_wide")
 BACKEND_FLAGS = (
     "-ppu-max-vreg-count=256", "-ppu-sink-matrix-addr=true",
     "-ppu-max-alloca-byte-size=1024", "-ppu-sink-async-addr=true",
@@ -43,8 +40,7 @@ def _build(variant, device_index):
         "-O3", "-std=c++17", "-arch=ppu_15", "--use_fast_math",
         "--resource-usage", "-lineinfo", "-DNDEBUG",
     ]
-    flags += [f"-DDECODE_{name}={value}" for name, value in
-              DEFINES[variant].items()]
+    flags += [f"-DDECODE_VARIANT={variant}"]
     for flag in BACKEND_FLAGS:
         flags += ["-mllvm", flag]
     flags += ["-Xcompiler", "-fPIC", "-shared", str(ROOT / "native_decode.cu")]
@@ -83,7 +79,7 @@ def _build(variant, device_index):
 
 
 def load_library(variant, device):
-    if variant not in DEFINES:
+    if variant not in VARIANTS:
         raise ValueError(f"Unknown PPU decode variant: {variant}")
     device_index = torch.device(device).index
     if device_index is None:

@@ -24,8 +24,8 @@ def validate(call):
     query_heads = q.shape[1]
     if page_size not in (64, 128, 256):
         raise NotImplementedError("PPU decode supports page sizes 64, 128, and 256")
-    if kv_heads <= 0 or query_heads not in (8 * kv_heads, 16 * kv_heads):
-        raise NotImplementedError("PPU decode currently supports GQA=8 or GQA=16")
+    if kv_heads <= 0 or query_heads not in (6 * kv_heads, 8 * kv_heads, 12 * kv_heads, 16 * kv_heads):
+        raise NotImplementedError("PPU decode supports GQA=6, 8, 12, or 16")
     if query not in range(1, 6) or not 0 < batch <= 992 or not batch <= q.shape[0] <= batch * query:
         raise NotImplementedError("PPU decode supports nonempty Q1-Q5 requests and batch <= 992")
     if lengths is None or lengths.shape != (batch,) or table.ndim != 2 or table.shape[0] != batch:
@@ -75,8 +75,11 @@ def forward(
     from .decode_build import load_library
 
     variant = "q1" if max_seqlen_q == 1 else "q4"
-    library = load_library(variant, q.device)
+    if max_seqlen_q == 4 and q.shape[1] // k.shape[2] == 16:
+        variant = "q4_wide"
     batch = cu_seqlens_q.numel() - 1
+    compute_units = torch.cuda.get_device_properties(q.device).multi_processor_count
+    library = load_library(variant, q.device)
     total = q.shape[0]
     query_heads, head_dim = q.shape[1:]
     page_size, kv_heads = k.shape[1:3]
@@ -87,7 +90,6 @@ def forward(
         q_descale = unit if q_descale is None else q_descale
         k_descale = unit if k_descale is None else k_descale
         v_descale = unit if v_descale is None else v_descale
-    compute_units = torch.cuda.get_device_properties(q.device).multi_processor_count
     selected_splits = num_splits or 32
     partial = partial_lse = None
     if selected_splits > 1:
