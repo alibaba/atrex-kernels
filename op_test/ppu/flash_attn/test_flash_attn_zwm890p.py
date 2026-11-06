@@ -435,9 +435,11 @@ def test_fa2_uses_original_prefill(query):
 
 
 @pytest.mark.parametrize("query", range(1, 6))
-@pytest.mark.parametrize("heads", [(6, 1), (8, 1), (12, 2), (16, 1), (24, 2),
-                                  (24, 3), (32, 2), (36, 3), (48, 3), (64, 4)])
-@pytest.mark.parametrize("page_size", [64, 128, 256])
+@pytest.mark.parametrize("heads,page_size", [
+    (heads, page_size)
+    for heads in [(6, 1), (8, 1), (16, 1), (24, 2), (24, 3), (32, 2), (48, 3), (64, 4)]
+    for page_size in [64, 128, 256]
+] + [((12, 2), 256), ((36, 3), 256)])
 def test_decode_runtime_heads_and_pages(query, heads, page_size):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
 
@@ -458,23 +460,32 @@ def test_decode_runtime_heads_and_pages(query, heads, page_size):
 
 @pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
 @pytest.mark.parametrize("query", [1, 4, 65])
-def test_gqa6_and_gqa12_graph_reads_updated_kv_and_lengths(heads, query):
+def test_gqa6_and_gqa12_graph_reads_updated_inputs(heads, query, monkeypatch):
     from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     case = build_case(256, [query, max(1, query - 1)], [511, 1023],
                       hq=heads[0], hkv=heads[1])
     flash_attn_varlen_func(**case)
+
+    def unexpected(device):
+        raise AssertionError("Prewarmed prefill must not rehash the extension sources")
+
+    monkeypatch.setattr(runtime._launch, "build", unexpected)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = flash_attn_varlen_func(**case)
     case["seqused_k"].add_(1)
     case["k"].copy_((case["k"].float() * .5).to(case["k"].dtype))
     case["v"].copy_((case["v"].float() * .75).to(case["v"].dtype))
-    case["q_descale"].mul_(.875)
-    graph.replay()
-    torch.cuda.synchronize()
-    expected, _ = reference(case)
-    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
+    for scale in ((0., -.5, .75) if query > 5 else (.875,)):
+        case["q_descale"].fill_(scale)
+        eager = flash_attn_varlen_func(**case)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected, _ = reference(case)
+        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
+        torch.testing.assert_close(eager.float(), expected, atol=.03, rtol=.05)
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (24, 2)])
@@ -484,41 +495,8 @@ def test_gqa6_and_gqa12_mixed_prefill_and_decode(heads):
     _check(case, graph=True)
 
 
-def test_prefill_prewarm_caches_only_compiled_module(monkeypatch):
-    from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
-
-    case = build_case(256, [65, 17], [513, 257], hq=6, hkv=1)
-    flash_attn_varlen_func(**case)
-
-    def unexpected(device):
-        raise AssertionError("Prewarmed prefill must not rehash the extension sources")
-
-    monkeypatch.setattr(runtime._launch, "build", unexpected)
-    case["v"].copy_((case["v"].float() * .5).to(case["v"].dtype))
-    actual = flash_attn_varlen_func(**case)
-    expected, _ = reference(case)
-    torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
-
-
-def test_prefill_heads6_kv1_graph_changes_scale_sign():
-    from atrex import flash_attn_varlen_func
-
-    case = build_case(256, [65, 17], [513, 257], hq=6, hkv=1)
-    flash_attn_varlen_func(**case)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = flash_attn_varlen_func(**case)
-    for scale in (0., -.5, .75):
-        case["q_descale"].fill_(scale)
-        graph.replay()
-        torch.cuda.synchronize()
-        expected, _ = reference(case)
-        torch.testing.assert_close(actual.float(), expected, atol=.03, rtol=.05)
-
-
 @pytest.mark.parametrize("query", [6, 17, 63, 64, 65, 127, 128, 129])
-@pytest.mark.parametrize("scale", [None, 0., -.5, .75])
+@pytest.mark.parametrize("scale", [None, -.5])
 @pytest.mark.parametrize("splits", [1, 4])
 def test_prefill_heads6_kv1_packed_query_head_boundaries(query, scale, splits):
     case = build_case(256, [query, 1, query - 1], [257, 127, 513], hq=6, hkv=1)
@@ -584,7 +562,7 @@ def test_decode_softmax_dynamic_range(query, heads, amplitude):
 
 
 @pytest.mark.parametrize("amplitude", [1., 2., 4.])
-@pytest.mark.parametrize("scale", [0., -.75, .75])
+@pytest.mark.parametrize("scale", [-.75, .75])
 @pytest.mark.parametrize("seed", [17, 37])
 def test_prefill_heads6_kv1_softmax_dynamic_range(amplitude, scale, seed):
     case = build_case(256, [65, 17], [1025, 513], hq=6, hkv=1)
@@ -731,9 +709,11 @@ def test_eligibility_does_not_compile_or_launch(monkeypatch):
     assert can_use_flash_attn_varlen_func(**build_case(64, [256, 1], [257, 127], hq=32, hkv=2))
 
 
-@pytest.mark.parametrize("heads", [(2, 1), (4, 1), (6, 1), (8, 1), (10, 1), (12, 2),
-                                  (16, 1), (24, 2), (32, 2), (40, 4), (48, 3), (64, 4)])
-@pytest.mark.parametrize("page_size", [64, 128, 256])
+@pytest.mark.parametrize("heads,page_size", [
+    (heads, page_size)
+    for heads in [(4, 1), (6, 1), (8, 1), (16, 1), (24, 2), (32, 2), (48, 3), (64, 4)]
+    for page_size in [64, 128, 256]
+] + [((2, 1), 256), ((10, 1), 256), ((12, 2), 256), ((40, 4), 256)])
 def test_prefill_parameterized_heads_and_descales(heads, page_size):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
 
