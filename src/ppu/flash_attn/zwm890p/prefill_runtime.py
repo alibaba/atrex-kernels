@@ -1,5 +1,7 @@
 """Native paged FP8 prefill with invocation-local layout conversion and scratch."""
 
+from functools import lru_cache
+
 import torch
 
 from atrex.core.compile_cu import cuda_kernel
@@ -16,6 +18,11 @@ from atrex.core.compile_cu import cuda_kernel
 )
 def _launch(*args):
     """Bound to the native entry on first call."""
+
+
+@lru_cache(maxsize=None)
+def _extension(device):
+    return _launch.build(device)
 
 
 def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k):
@@ -108,7 +115,7 @@ def forward(
     if num_splits == 0:
         num_splits = _default_splits(q.shape[0], requests, max_seqlen_q, max_seqlen_k)
     num_splits = min(num_splits, max(1, (max_seqlen_k + 63) // 64))
-    extension = _launch.build(q.device)
+    extension = _extension(q.device)
     max_pages = (max_seqlen_k + 63) // 64
     remapped_table = _remap_block_table(page_table, virtual_stride, subpages)
     # Preserve the original prep_kv layout and native argument contract.

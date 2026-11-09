@@ -1,23 +1,35 @@
 #include "prefill_common.cuh"
 
-template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>
-__global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
+__device__ __forceinline__ u32 scaled_query_bits(u32 bits, bool zero, u32 sign) {
+  const u32 nan_high = ((bits & 0x7f7f7f7fu) + 0x01010101u) & 0x80808080u;
+  const u32 nan_mask = nan_high | (nan_high - (nan_high >> 7));
+  return (zero ? bits & nan_mask : bits) ^ sign;
+}
+
+template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4, int FIXED_HEADS = 0, bool SCALED = false>
+__global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex_ppu_attn_general(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
     const float* __restrict__ vamax, const int* __restrict__ cu_q,
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out,
     float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit,
     int query_heads, int kv_heads, const float* __restrict__ descales, float softmax_scale) {
-  constexpr bool GENERAL = true;
+  constexpr bool GENERAL = FIXED_HEADS == 0 || SCALED;
+  constexpr bool PACKED = FIXED_HEADS != 0;
+  constexpr int buffers = NBUF;
   extern __shared__ unsigned char sm[];
   unsigned char* Ks = sm;
-  unsigned char* Vs = sm + NBUF * KPAGE_BYTES;
+  unsigned char* Vs = sm + buffers * KPAGE_BYTES;
 
-  const int n_heads = GENERAL ? query_heads : NHEADS;
-  int bx = GROUPED ? blockIdx.x / (n_heads / 4) : blockIdx.x;
+  const int n_heads = PACKED ? FIXED_HEADS : query_heads;
+  const int n_kv_heads = PACKED ? 1 : kv_heads;
+  constexpr int threads = HEAD_GROUP * 64;
+  const int head_groups = PACKED ? 1 : n_heads / HEAD_GROUP;
+  constexpr int query_tile = PACKED ? MQ * HEAD_GROUP : MQ;
+  int bx = GROUPED ? blockIdx.x / head_groups : blockIdx.x;
   int req = -1, qbi = 0, nb_req = 0;
   for (int r = 0; r < n_req; ++r) {
-    const int nb = ((cu_q[r + 1] - cu_q[r]) + MQ - 1) / MQ;
+    const int nb = ((cu_q[r + 1] - cu_q[r]) * (PACKED ? FIXED_HEADS : 1) + query_tile - 1) / query_tile;
     if (bx < nb) { req = r; qbi = bx; nb_req = nb; break; }
     bx -= nb;
   }
@@ -27,25 +39,29 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
   const int kv_len = seq_lens[req];
 
   const int qb = nb_req - 1 - qbi;
-  const int q0 = qb * MQ;
-  const int base_pos = q0 + kv_len - q_len;
-  const int hi_cta = min(base_pos + MQ - 1, kv_len - 1);
+  const int q_rows = q_len * (PACKED ? FIXED_HEADS : 1);
+  const int q0 = qb * query_tile;
+  const int base_pos = q0 / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len;
+  const int hi_cta = min((q0 + query_tile - 1) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len, kv_len - 1);
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int unit = warp >> 1, wq = warp & 1;
-  const int head = (GROUPED ? blockIdx.x % (n_heads / 4) : blockIdx.y) * 4 + unit;
-  const int kv_head = GENERAL ? head / (query_heads / kv_heads) : 0;
-  const int packed_request = GENERAL ? req * kv_heads + kv_head : req;
-  const int scale_count = n_req * kv_heads;
+  const int head = PACKED ? 0 : (GROUPED ? blockIdx.x % head_groups : blockIdx.y) * HEAD_GROUP + unit;
+  const int kv_head = PACKED ? 0 : head / (query_heads / kv_heads);
+  const int packed_request = req * n_kv_heads + kv_head;
+  const int scale_count = n_req * n_kv_heads;
   const float query_scale = GENERAL && descales ? descales[packed_request] : 1.f;
   const float key_scale = GENERAL && descales ? descales[scale_count + packed_request] : 1.f;
-  const float value_scale = GENERAL && descales ? descales[2 * scale_count + packed_request] : 1.f;
+  const float value_scale = GENERAL && !PACKED && descales ? descales[2 * scale_count + packed_request] : 1.f;
   const float logit_scale = GENERAL ? softmax_scale * query_scale * key_scale * 1.4426950408889634f : 1.f;
+  const bool zero_query = PACKED && SCALED && logit_scale == 0.f;
+  const u32 query_sign = PACKED && SCALED && logit_scale < 0.f ? 0x80808080u : 0u;
   const int lq = lane >> 2, la = lane & 3;
   const int lp = lane >> 3, lb = (lane >> 2) & 1;
 
-  const int bp_abs = base_pos + wq * MW;
-  const int hi_abs = min(bp_abs + MW - 1, kv_len - 1);
+  const int warp_row = PACKED ? warp * MW : wq * MW;
+  const int bp_abs = PACKED ? (q0 + warp_row) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len : base_pos + wq * MW;
+  const int hi_abs = min(PACKED ? (q0 + warp_row + MW - 1) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len : bp_abs + MW - 1, kv_len - 1);
 
   const int mlim_abs = bp_abs + 2 * lq - 4 * la;
   const int n_pages = (kv_len + PAGE - 1) / PAGE;
@@ -67,21 +83,22 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
   const int first_mask_page = bp >= 0 ? min(bp / PAGE, (kv_len - kv_lo) / PAGE) : -1;
 
   const unsigned char* qbase = q + (size_t)q_start * n_heads * HEAD_DIM + head * HEAD_DIM;
-  const int rowa = min(q0 + wq * MW + 2 * lq, q_len - 1);
-  const int rowb = min(q0 + wq * MW + 2 * lq + 1, q_len - 1);
+  const int rowa = min(q0 + warp_row + 2 * lq, q_rows - 1);
+  const int rowb = min(q0 + warp_row + 2 * lq + 1, q_rows - 1);
+  const int row_stride = PACKED ? 1 : n_heads;
 
   u32 qf[KSTEPS][4];
 #pragma unroll
   for (int ks = 0; ks < KSTEPS; ++ks) {
     const int d0 = ks * 32 + la * 8;
     const uint2 a = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowa * n_heads * HEAD_DIM + d0);
+        qbase + (size_t)rowa * row_stride * HEAD_DIM + d0);
     const uint2 b = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowb * n_heads * HEAD_DIM + d0);
-    qf[ks][0] = a.x;
-    qf[ks][1] = b.x;
-    qf[ks][2] = a.y;
-    qf[ks][3] = b.y;
+        qbase + (size_t)rowb * row_stride * HEAD_DIM + d0);
+    qf[ks][0] = scaled_query_bits(a.x, zero_query, query_sign);
+    qf[ks][1] = scaled_query_bits(b.x, zero_query, query_sign);
+    qf[ks][2] = scaled_query_bits(a.y, zero_query, query_sign);
+    qf[ks][3] = scaled_query_bits(b.y, zero_query, query_sign);
   }
 
   float acc[NDT][8];
@@ -104,13 +121,13 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
     const unsigned char* _vs = vg + (size_t)(npg - (page))*VPAGE_BYTES;                 \
     unsigned char* _kd = Ks + (buf)*KPAGE_BYTES;                                       \
     unsigned char* _vd = Vs + (buf)*VPAGE_BYTES;                                       \
-    _Pragma("unroll") for (int c = 0; c < KPAGE_BYTES / (NTHREADS * 16); ++c) {         \
-      const int _o = (c * NTHREADS + tid) * 16;                                        \
-      cp_async16(_kd + _o, _ks + _o);                                                  \
+    _Pragma("unroll") for (int c = 0; c < (KPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
+      const int _o = (c * threads + tid) * 16;                                         \
+      if (_o < KPAGE_BYTES) cp_async16(_kd + _o, _ks + _o);                             \
     }                                                                                  \
-    _Pragma("unroll") for (int c = 0; c < VPAGE_BYTES / (NTHREADS * 16); ++c) {         \
-      const int _o = (c * NTHREADS + tid) * 16;                                        \
-      cp_async16(_vd + _o, _vs + _o);                                                  \
+    _Pragma("unroll") for (int c = 0; c < (VPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
+      const int _o = (c * threads + tid) * 16;                                         \
+      if (_o < VPAGE_BYTES) cp_async16(_vd + _o, _vs + _o);                             \
     }                                                                                  \
   } while (0)
 
@@ -153,18 +170,9 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
 #else
   if (npg >= 0) STAGE(0, 0);
 #endif
-#if PGSTEP2
-
-#define PGSTEP 2
-#else
-#define PGSTEP 1
-#endif
-#if PGU2
-#define SPSTEP 2
-#else
-#define SPSTEP 1
-#endif
-  for (int pp = 0; pp <= npg; pp += PGSTEP) {
+  constexpr int page_step = PGSTEP2 ? 2 : 1;
+  constexpr int split_step = PGU2 ? 2 : 1;
+  for (int pp = 0; pp <= npg; pp += page_step) {
 #if SP2E
     if ((pp & 1) == 0) {
       cp_wait<0>();
@@ -182,9 +190,9 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
 #elif SP2 || SP2B
 
 #if SP2B
-    const bool _lead = true;
+    constexpr bool _lead = true;
 #else
-    const bool _lead = (PGSTEP == 2) || ((pp & 1) == 0);
+    const bool _lead = (page_step == 2) || ((pp & 1) == 0);
 #endif
     if (_lead) {
       cp_wait<0>();
@@ -211,15 +219,16 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
 #endif
 
 #pragma unroll
-    for (int _sp = 0; _sp < SPSTEP; ++_sp) {
+    for (int _sp = 0; _sp < split_step; ++_sp) {
       const int pg = pp + _sp;
       if (pg > npg) continue;
-    const unsigned char* Kb = Ks + (pg & (NBUF - 1)) * KPAGE_BYTES;
-    const unsigned char* Vb = Vs + (pg & (NBUF - 1)) * VPAGE_BYTES;
+    const unsigned char* Kb = Ks + (pg & (buffers - 1)) * KPAGE_BYTES;
+    const unsigned char* Vb = Vs + (pg & (buffers - 1)) * VPAGE_BYTES;
     const u32 key_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
     const u32 value_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Vb) / 16);
 #if !SPG4
-    const float aa = GENERAL ? 1.f : 0.0625f * 1.4426950408889634f;
+    const float aa = PACKED && SCALED ? (zero_query ? 1.f : fabsf(logit_scale)) :
+        (GENERAL ? 1.f : 0.0625f * 1.4426950408889634f);
 #endif
     float page_scores[4][8];
 #pragma unroll
@@ -237,7 +246,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
       MMA_E4M3(page_scores[2], qf[step], first_key);
       MMA_E4M3(page_scores[3], qf[step], second_key);
     }
-    if constexpr (GENERAL) {
+    if constexpr (GENERAL && !PACKED) {
 #pragma unroll
       for (int tile = 2; tile < 4; ++tile) {
 #pragma unroll
@@ -252,7 +261,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
         for (int element = 0; element < 8; ++element)
-          if (2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit ||
+          if ((PACKED ?
+                physical_page * PAGE + tile * 16 + 4 * la + 2 * (element >> 2) + (element & 1) >
+                    (q0 + warp_row + 2 * lq + ((element >> 1) & 1)) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len - kv_lo :
+                2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit) ||
               4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
             page_scores[tile][element] = -INFINITY;
       }
@@ -264,7 +276,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
     load_k_ldmatrix(future_second_key, key_block + 128);
     u32 first_probability[4];
     {
-      const int group = 1;
+      constexpr int group = 1;
     float maximum[2] = {-INFINITY, -INFINITY};
 #pragma unroll
     for (int row_half = 0; row_half < 2; ++row_half) {
@@ -329,7 +341,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
         }
       }
     }
-    if constexpr (GENERAL) {
+    if constexpr (GENERAL && !PACKED) {
 #pragma unroll
       for (int tile = 0; tile < 2; ++tile) {
 #pragma unroll
@@ -343,7 +355,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
         for (int element = 0; element < 8; ++element)
-          if (2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit ||
+          if ((PACKED ?
+                physical_page * PAGE + tile * 16 + 4 * la + 2 * (element >> 2) + (element & 1) >
+                    (q0 + warp_row + 2 * lq + ((element >> 1) & 1)) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len - kv_lo :
+                2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit) ||
               4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
             page_scores[tile][element] = -INFINITY;
       }
@@ -352,7 +367,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
     bool future_rescale = false;
     u32 second_probability[4];
     {
-      const int group = 0;
+      constexpr int group = 0;
     float maximum[2] = {-INFINITY, -INFINITY};
 #pragma unroll
     for (int row_half = 0; row_half < 2; ++row_half) {
@@ -424,8 +439,6 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
     __syncthreads();
 #endif
   }
-#undef PGSTEP
-#undef SPSTEP
 #undef STAGE
 #undef STAGE_NC
 #undef RESCALE
@@ -438,21 +451,22 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
     s += __shfl_xor_sync(0xFFFFFFFFu, s, 2);
     ls[pr] = s;
   }
+  const float output_scale = PACKED && SCALED && descales ? descales[2 * scale_count + packed_request] : value_scale;
   if (SPLIT) {
 
 #if CF
 
     float inv[2];
 #pragma unroll
-    for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (value_scale / ls[pr]) : 0.f;
+    for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (output_scale / ls[pr]) : 0.f;
     unsigned char* row0 =
         reinterpret_cast<unsigned char*>(o_part) +
-        ((size_t)sl * n_tok * n_heads + (size_t)(q_start + q0) * n_heads + head) * PRECB;
+        ((size_t)sl * n_tok * n_heads + (size_t)q_start * n_heads + (size_t)q0 * row_stride + head) * PRECB;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
-      const int rr = wq * MW + 2 * lq + pr;
-      if (q0 + rr >= q_len) continue;
-      unsigned char* row = row0 + (size_t)rr * n_heads * PRECB;
+      const int rr = warp_row + 2 * lq + pr;
+      if (q0 + rr >= q_rows) continue;
+      unsigned char* row = row0 + (size_t)rr * row_stride * PRECB;
       const bool nul = !(ls[pr] > 0.f);
       const float sc = inv[pr];
 #pragma unroll
@@ -471,21 +485,21 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
 #else
 
     float* row0 = o_part +
-                  ((size_t)sl * n_tok * n_heads + (size_t)(q_start + q0) * n_heads + head) * PREC;
+                  ((size_t)sl * n_tok * n_heads + (size_t)q_start * n_heads + (size_t)q0 * row_stride + head) * PREC;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
-      const int rr = wq * MW + 2 * lq + pr;
-      if (q0 + rr >= q_len) continue;
-      float* row = row0 + (size_t)rr * n_heads * PREC;
+      const int rr = warp_row + 2 * lq + pr;
+      if (q0 + rr >= q_rows) continue;
+      float* row = row0 + (size_t)rr * row_stride * PREC;
       const bool nul = !(ls[pr] > 0.f);
 #pragma unroll
       for (int dt = 0; dt <= NDT; ++dt) {
         const int d = (dt < NDT) ? dt : 0;
         float4 v;
-        v.x = (dt < NDT) ? ACCF(acc[d][2 * pr]) * value_scale : (nul ? -INFINITY : mq[pr]);
-        v.y = (dt < NDT) ? ACCF(acc[d][2 * pr + 1]) * value_scale : (nul ? 0.f : ls[pr]);
-        v.z = (dt < NDT) ? ACCF(acc[d][4 + 2 * pr]) * value_scale : 0.f;
-        v.w = (dt < NDT) ? ACCF(acc[d][5 + 2 * pr]) * value_scale : 0.f;
+        v.x = (dt < NDT) ? ACCF(acc[d][2 * pr]) * output_scale : (nul ? -INFINITY : mq[pr]);
+        v.y = (dt < NDT) ? ACCF(acc[d][2 * pr + 1]) * output_scale : (nul ? 0.f : ls[pr]);
+        v.z = (dt < NDT) ? ACCF(acc[d][4 + 2 * pr]) * output_scale : 0.f;
+        v.w = (dt < NDT) ? ACCF(acc[d][5 + 2 * pr]) * output_scale : 0.f;
         *reinterpret_cast<float4*>(row + dt * 16 + 4 * la) = v;
       }
     }
@@ -494,13 +508,13 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
 
     float inv[2];
 #pragma unroll
-    for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (value_scale / ls[pr]) : 0.f;
+    for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (output_scale / ls[pr]) : 0.f;
     __nv_bfloat16* obase = out + (size_t)q_start * n_heads * HEAD_DIM + head * HEAD_DIM;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
-      const int rr = wq * MW + 2 * lq + pr;
-      if (q0 + rr >= q_len) continue;
-      __nv_bfloat16* row = obase + (size_t)(q0 + rr) * n_heads * HEAD_DIM;
+      const int rr = warp_row + 2 * lq + pr;
+      if (q0 + rr >= q_rows) continue;
+      __nv_bfloat16* row = obase + (size_t)(q0 + rr) * row_stride * HEAD_DIM;
       const float sc = inv[pr];
 #pragma unroll
       for (int dt = 0; dt < NDT; ++dt) {
@@ -516,22 +530,26 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn_general(
   }
 }
 
-void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
+template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false>
+void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
           int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
   constexpr bool GROUPED = true;
+  constexpr int threads = HEAD_GROUP * 64;
   const int n_req = (int)cu_q.size(0) - 1;
   const int n_tok = (int)out.size(0);
   const int query_heads = (int)q.size(1);
   const float* scales = descales.numel() ? descales.data_ptr<float>() : nullptr;
-  const int launch_nblk = n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk;
-  const int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
+  const int launch_nblk = FIXED_HEADS ? (n_tok * FIXED_HEADS + MQ * HEAD_GROUP - 1) / (MQ * HEAD_GROUP) + (n_req > 1 ? n_req : 0) :
+      (n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk);
+  const int head_groups = FIXED_HEADS ? 1 : query_heads / HEAD_GROUP;
+  constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
-    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     once = true;
   }
   const auto qp = reinterpret_cast<const unsigned char*>(q.data_ptr());
@@ -540,22 +558,44 @@ void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_f
   const auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   auto stream = at::cuda::getCurrentCUDAStream();
   if (nsplit <= 1) {
-    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (query_heads / 4)) : dim3((unsigned)launch_nblk, query_heads / 4);
-    atrex_ppu_attn_general<0, GROUPED, 4><<<grid, NTHREADS, smem, stream>>>(
+    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups) : dim3((unsigned)launch_nblk, head_groups);
+    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1,
         query_heads, (int)kv_heads, scales, (float)softmax_scale);
   } else {
-    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (query_heads / 4), 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, query_heads / 4, (unsigned)nsplit);
+    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups, 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, head_groups, (unsigned)nsplit);
     if (nsplit == 2)
-      atrex_ppu_attn_general<1, GROUPED, 2><<<grid, NTHREADS, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
     else
-      atrex_ppu_attn_general<1, GROUPED, 4><<<grid, NTHREADS, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
   }
+}
+
+void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
+          torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
+          torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
+          int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
+  const int group = q.size(1) / kv_heads;
+  if (q.size(1) == 6 && kv_heads == 1 && descales.numel() == 0 && softmax_scale == 0.0625)
+    launch_attn_head_group<4, 6>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+  else if (q.size(1) == 6 && kv_heads == 1)
+    launch_attn_head_group<4, 6, true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+  else if (group % 4 == 0)
+    launch_attn_head_group<4>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+  else if (group % 6 == 0)
+    launch_attn_head_group<6>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+  else
+    launch_attn_head_group<2>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
 }
