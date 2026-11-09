@@ -98,8 +98,6 @@ before CUDA Graph capture. All KV lengths use the same three decode variants:
 Q1 uses `q1`; Q4 with GQA16 uses `q4_wide`; all other supported short-Q calls
 use `q4`. Variant selection does not depend on KV length, page-table capacity,
 batch size, or `num_splits`.
-The CUDA source retains the output-half and PV-column implementations as backups;
-they have no registered build variant and are not selected by the runtime.
 Target tests cover standalone FP32 correctness,
 dispatch and fail-fast behavior, graph replay, scratch reuse, KV tail
 sanitization, and real kernel events.

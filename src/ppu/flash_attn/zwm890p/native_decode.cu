@@ -11,17 +11,13 @@ constexpr int NativePlanRows = 32;
 constexpr int NativeKeyHalves = NativeKeyRows / 16;
 constexpr int NativeTileBytes = NativeKeyRows * 256;
 constexpr int NativeKeyWindow = NativeKeyHalves == 2 ? 3 : 2;
-// Retain the output-half and PV-column implementations as disabled backups.
-constexpr int NativeOutputDivisions = 1;
-constexpr bool NativePVColumns = false;
 
 template<int Query, int Group>
 struct NativeGeometry {
     static constexpr int Rows = Query == 1 ? 16 : ((Query * Group + 15) / 16) * 16;
     static constexpr int Threads = Query == 1 ? 64 : Rows * 2;
     static constexpr int KeyOffset = Rows * 256 > NativeTileBytes * 2 ? Rows * 256 : NativeTileBytes * 2;
-    static constexpr bool Nsplit = NativePVColumns && Query == 4 && Group == 16 && NativeKeyRows == 64;
-    static constexpr int SharedBytes = Nsplit ? NativeTileBytes * 4 : KeyOffset + NativeTileBytes;
+    static constexpr int SharedBytes = KeyOffset + NativeTileBytes;
 };
 
 template<bool Value>
@@ -75,7 +71,6 @@ struct DecodeParams {
     int average_splits;
     int page_shift;
     int key_stage_offset;
-    int value_stage_offset;
 };
 
 int native_average_splits(const DecodeParams& params, int resident_blocks = 0) {
@@ -200,7 +195,7 @@ __device__ __forceinline__ const unsigned char* native_stage(const DecodeParams&
         int64_t row_stride = Keys ? params.key_row_stride : params.value_row_stride;
         int valid_rows = FullTile ? NativeKeyRows : min(NativeKeyRows, max(0, length - base));
         #pragma unroll
-        for (int slab = 0; slab < (Values ? 2 / NativeOutputDivisions : 2); ++slab) {
+        for (int slab = 0; slab < 2; ++slab) {
             if (page_valid && valid_rows > 0) {
                 unsigned int destination = static_cast<unsigned int>(__cvta_generic_to_shared(target + slab * NativeKeyRows * 128));
                 unsigned long long stride = row_stride;
@@ -279,10 +274,10 @@ __device__ __forceinline__ void native_rescale_row(float (&output)[Count][8], co
     else if constexpr (Row + 1 < Rows) native_rescale_row<Row + 1, 0, Count, Rows>(output, alpha);
 }
 
-template<int Tile, int Stride = 16>
+template<int Tile>
 __device__ __forceinline__ void native_load_value(const unsigned char* transposed, int output_base,
                                                  int lane, unsigned int (&values)[4]) {
-    int dimension = output_base + Tile * Stride + (lane & 7) + ((lane >> 4) & 1) * 8;
+    int dimension = output_base + Tile * 32 + (lane & 7) + ((lane >> 4) & 1) * 8;
     int slot = ((lane >> 3) & 1) * 16;
     unsigned int address = static_cast<unsigned int>(__cvta_generic_to_shared(transposed + native_transpose_offset(dimension, slot)));
     asm volatile("ppu.tc02.ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -294,8 +289,8 @@ __device__ __forceinline__ void native_pv_scoped(float (&output)[Count][8], cons
                                                 const unsigned char* transposed, int output_base, int lane) {
     __ppu_sched_bound();
     unsigned int first[4], second[4];
-    native_load_value<Tile, 32>(transposed, output_base, lane, first);
-    native_load_value<Tile + 1, 32>(transposed, output_base, lane, second);
+    native_load_value<Tile>(transposed, output_base, lane, first);
+    native_load_value<Tile + 1>(transposed, output_base, lane, second);
     #pragma hggc mmatiestrictly
     {
         native_mma(output[Tile], probabilities, first);
@@ -305,52 +300,10 @@ __device__ __forceinline__ void native_pv_scoped(float (&output)[Count][8], cons
     if constexpr (Tile + 2 < Count) native_pv_scoped<Tile + 2, Count>(output, probabilities, transposed, output_base, lane);
 }
 
-template<int Tile, int Window, int Offset = 0>
-__device__ __forceinline__ void native_value_window(const unsigned char* transposed, int output_base,
-                                                   int lane, unsigned int (&values)[Window][4]) {
-    native_load_value<Tile + Offset>(transposed, output_base, lane, values[Offset]);
-    if constexpr (Offset + 1 < Window) native_value_window<Tile, Window, Offset + 1>(transposed, output_base, lane, values);
-}
-
-template<int Tile, int Window, int Count, int Offset = 0>
-__device__ __forceinline__ void native_mma_window(float (&output)[Count][8], const unsigned int (&probabilities)[4],
-                                                 const unsigned int (&values)[Window][4]) {
-    native_mma(output[Tile + Offset], probabilities, values[Offset]);
-    if constexpr (Offset + 1 < Window) native_mma_window<Tile, Window, Count, Offset + 1>(output, probabilities, values);
-}
-
-template<int Tile, int Count, int Window>
-__device__ __forceinline__ void native_pv_window(float (&output)[Count][8], const unsigned int (&probabilities)[4],
-                                                const unsigned char* transposed, int output_base, int lane,
-                                                unsigned int (&first)[Window][4], unsigned int (&second)[Window][4]) {
-    if constexpr (Tile + Window < Count) native_value_window<Tile + Window, Window>(transposed, output_base, lane, second);
-    __ppu_sched_bound();
-    #pragma hggc mmatiestrictly
-    {
-        native_mma_window<Tile, Window, Count>(output, probabilities, first);
-    }
-    __ppu_sched_bound();
-    if constexpr (Tile + Window < Count) native_pv_window<Tile + Window, Count, Window>(output, probabilities,
-        transposed, output_base, lane, second, first);
-}
-
-template<int Count>
-__device__ __forceinline__ void native_pv(float (&output)[Count][8], const unsigned int (&probabilities)[4],
-                                        const unsigned char* transposed, int output_base, int lane) {
-    if constexpr (Count == 8) {
-        native_pv_scoped<0, Count>(output, probabilities, transposed, output_base, lane);
-    } else {
-        constexpr int Window = 4;
-        unsigned int first[Window][4], second[Window][4];
-        native_value_window<0, Window>(transposed, output_base, lane, first);
-        native_pv_window<0, Count, Window>(output, probabilities, transposed, output_base, lane, first, second);
-    }
-}
-
 template<int Tile, int Part = 0>
-__device__ __forceinline__ void native_value_pair(const unsigned char* values, unsigned int (&fragments)[2][4], int output_base = 0) {
+__device__ __forceinline__ void native_value_pair(const unsigned char* values, unsigned int (&fragments)[2][4]) {
     unsigned int shared = static_cast<unsigned int>(__cvta_generic_to_shared(values));
-    int column = output_base + Tile * 16;
+    int column = Tile * 16;
     unsigned long long address = static_cast<unsigned long long>(shared >> 4) + (column / 128) * (NativeKeyRows * 8) + Part * 256 + ((column / 32) % 4) * 2;
     unsigned int lower[4], upper[4];
     asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans {%0,%1,%2,%3}, [%4], %5, %6, %7;"
@@ -459,47 +412,6 @@ __device__ __forceinline__ void native_qk_ring(float (&scores)[NativeKeyHalves][
     if constexpr (Channel + 1 < 8) native_qk_ring<Channel + 1>(scores, queries, keys, ring);
 }
 
-template<int Index>
-__device__ __forceinline__ void native_qk_flow(float (&scores)[NativeKeyHalves][8], const unsigned int (&queries)[8][4],
-                                             const unsigned char* keys, unsigned int (&ring)[6][4]) {
-    native_mma(scores[Index % NativeKeyHalves], queries[Index / NativeKeyHalves], ring[Index % 6]);
-    if constexpr (Index + 6 < 8 * NativeKeyHalves) {
-        native_load_key(keys, (Index + 6) / NativeKeyHalves, (Index + 6) % NativeKeyHalves, ring[Index % 6]);
-    }
-    if constexpr (Index + 1 < 8 * NativeKeyHalves) native_qk_flow<Index + 1>(scores, queries, keys, ring);
-}
-
-__device__ __forceinline__ void native_qk_window(float (&scores)[NativeKeyHalves][8], const unsigned int (&queries)[8][4],
-                                               const unsigned char* keys) {
-    unsigned int ring[6][4];
-    __ppu_sched_bound();
-    #pragma unroll
-    for (int index = 0; index < 6; ++index) native_load_key(keys, index / NativeKeyHalves, index % NativeKeyHalves, ring[index]);
-    #pragma hggc mmatiestrictly
-    {
-        native_qk_flow<0>(scores, queries, keys, ring);
-    }
-    __ppu_sched_bound();
-}
-
-template<int Tile, int Part>
-__device__ __forceinline__ void native_pv_columns(float (&output)[16][8], const unsigned int (&probabilities)[4][4],
-                                                 const unsigned char* values, int output_base) {
-    __ppu_sched_bound();
-    unsigned int fragments[2][4];
-    native_value_pair<Tile, Part>(values, fragments, output_base);
-    #pragma hggc mmatiestrictly
-    {
-        #pragma unroll
-        for (int row = 0; row < 4; ++row) {
-            native_mma(output[row * 4 + Tile], probabilities[row], fragments[0]);
-            native_mma(output[row * 4 + Tile + 1], probabilities[row], fragments[1]);
-        }
-    }
-    __ppu_sched_bound();
-    if constexpr (Tile + 2 < 4) native_pv_columns<Tile + 2, Part>(output, probabilities, values, output_base);
-}
-
 template<int Tile, int Count, int Group>
 __device__ __forceinline__ void native_store(const DecodeParams& params, const float (&output)[Count][8],
                                            const float (&multipliers)[2], const float (&lse)[2],
@@ -553,7 +465,7 @@ __device__ __forceinline__ void native_scatter_output(unsigned short* shared_out
             int index = row * 2 + (pair >> 1);
             float first = output[Tile][index] * multipliers[row];
             float second = output[Tile][index + 4] * multipliers[row];
-            int offset = packed_row * (256 / NativeOutputDivisions) + (dimension ^ ((packed_row & (7 / NativeOutputDivisions)) * 32));
+            int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
             *reinterpret_cast<unsigned int*>(shared_output + offset) = native_bfloat_pair(first, second);
         }
     }
@@ -563,12 +475,10 @@ __device__ __forceinline__ void native_scatter_output(unsigned short* shared_out
 template<int Query, int Group>
 __device__ __forceinline__ void native_decode_task(const DecodeParams& params, int split, int head, int request,
                                                   int active_splits, unsigned char* shared_keys,
-                                                  unsigned char* shared_values, unsigned char* shared_transposed,
-                                                  unsigned char* shared_next_values) {
+                                                  unsigned char* shared_values, unsigned char* shared_transposed) {
     constexpr int Threads = NativeGeometry<Query, Group>::Threads;
-    constexpr int OutputTiles = Query == 1 ? 8 : 16 / NativeOutputDivisions;
+    constexpr int OutputTiles = Query == 1 ? 8 : 16;
     constexpr int ActiveRows = Query == 1 && Group <= 8 ? 1 : 2;
-    constexpr bool Nsplit = NativeGeometry<Query, Group>::Nsplit;
     int lane = threadIdx.x & 31;
     int warp = native_warp();
     const int* offsets = static_cast<const int*>(params.offsets);
@@ -578,8 +488,8 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     int length = __ldg(lengths + request);
     const int* page_table = params.page_table + request * params.page_table_stride;
     const unsigned char* key_source = params.keys + head * params.key_head_stride;
-    int output_base = Query == 1 ? warp * 16 : static_cast<int>(blockIdx.x) * (256 / NativeOutputDivisions) * (NativeOutputDivisions > 1);
-    const unsigned char* value_source = params.values + head * params.value_head_stride + (Query != 1 ? output_base : 0);
+    int output_base = Query == 1 ? warp * 16 : 0;
+    const unsigned char* value_source = params.values + head * params.value_head_stride;
     int row_base = Query == 1 ? 0 : warp * 16;
     int tile_count = (length + NativeKeyRows - 1) / NativeKeyRows;
     bool single_split = params.splits == 1 || (Query != 1 && params.automatic && active_splits == 1);
@@ -646,10 +556,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             else asm volatile("ppu.cp.async.commit_group;");
         }
         float scores[NativeKeyHalves][8] = {};
-        if constexpr (Nsplit) {
-            native_qk_window(scores, query_fragments, current);
-        }
-        else if constexpr (Query == 1 || NativeKeyRows > 32) {
+        if constexpr (Query == 1 || NativeKeyRows > 32) {
             native_qk_direct<0>(scores, query_fragments, current);
         } else {
             unsigned int ring[NativeKeyWindow][NativeKeyHalves][4];
@@ -717,7 +624,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                 }
             }
         }
-        if constexpr (Query != 1 && !Nsplit && !First) {
+        if constexpr (Query != 1 && !First) {
             if (__any_sync(0xffffffff, alpha[0] != 1.f || alpha[1] != 1.f)) native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
         }
         unsigned int probabilities[NativeKeyRows / 32][4];
@@ -732,59 +639,12 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             }
         }
         if constexpr (Query == 1) __syncthreads();
-        if constexpr (Nsplit) {
-            auto shared_probabilities = reinterpret_cast<uint4*>(current);
-            auto shared_scales = reinterpret_cast<float*>(current + 4096);
-            #pragma unroll
-            for (int part = 0; part < 2; ++part) {
-                shared_probabilities[(warp * 2 + part) * 32 + lane] = make_uint4(
-                    probabilities[part][0], probabilities[part][1], probabilities[part][2], probabilities[part][3]);
-            }
-            if ((lane & 3) == 0) {
-                shared_scales[warp * 16 + (lane >> 2)] = alpha[0];
-                shared_scales[warp * 16 + (lane >> 2) + 8] = alpha[1];
-            }
-            __syncthreads();
-            if constexpr (!First) {
-                float scales[4][2];
-                #pragma unroll
-                for (int row = 0; row < 4; ++row) {
-                    scales[row][0] = shared_scales[row * 16 + (lane >> 2)];
-                    scales[row][1] = shared_scales[row * 16 + (lane >> 2) + 8];
-                }
-                __ppu_sched_bound();
-                #pragma unroll
-                for (int row = 0; row < 4; ++row) {
-                    if (__any_sync(0xffffffff, scales[row][0] != 1.f || scales[row][1] != 1.f)) {
-                        #pragma unroll
-                        for (int column = 0; column < 4; ++column) {
-                            #pragma unroll
-                            for (int value = 0; value < 8; ++value) output[row * 4 + column][value] *= scales[row][(value >> 1) & 1];
-                        }
-                    }
-                }
-            }
-        }
-        unsigned char* value_destination = Nsplit ? shared_next_values : Query == 1 ? shared_values : current;
+        unsigned char* value_destination = Query == 1 ? shared_values : current;
         if (tile > begin) native_stage<Threads, false, true, true>(params, page_table, next_value, tile - 1, length, current, value_destination);
         else asm volatile("ppu.cp.async.commit_group;");
         #pragma unroll
         for (int part = 0; part < NativeKeyRows / 32; ++part) {
-            if constexpr (Nsplit) {
-                auto shared_probabilities = reinterpret_cast<const uint4*>(current);
-                unsigned int gathered[4][4];
-                #pragma unroll
-                for (int row = 0; row < 4; ++row) {
-                    uint4 packed = shared_probabilities[(row * 2 + part) * 32 + lane];
-                    gathered[row][0] = packed.x;
-                    gathered[row][1] = packed.y;
-                    gathered[row][2] = packed.z;
-                    gathered[row][3] = packed.w;
-                }
-                if (part == 0) native_pv_columns<0, 0>(output, gathered, shared_values, warp * 64);
-                else native_pv_columns<0, 1>(output, gathered, shared_values, warp * 64);
-            }
-            else if constexpr (Query == 1) native_pv<OutputTiles>(output, probabilities[part], current + part * 32, output_base, lane);
+            if constexpr (Query == 1) native_pv_scoped<0, OutputTiles>(output, probabilities[part], current + part * 32, output_base, lane);
             else if constexpr (NativeKeyRows > 32 && (Group == 16 || Group == 12)) {
                 if (part == 0) native_pv_atoms<OutputTiles, 0>(output, probabilities[0], shared_values);
                 else native_pv_atoms<OutputTiles, 1>(output, probabilities[1], shared_values);
@@ -794,13 +654,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
         }
         unsigned char* previous = current;
         current = next;
-        if constexpr (Nsplit) {
-            next = previous;
-            unsigned char* previous_values = shared_values;
-            shared_values = shared_next_values;
-            shared_next_values = previous_values;
-        }
-        else if constexpr (Query == 1) next = previous;
+        if constexpr (Query == 1) next = previous;
         else {
             next = shared_values;
             shared_values = previous;
@@ -830,78 +684,22 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             if (!single_split) lse[row] = fmaf(running_max[row], log_scale, log2f(sum) - 8.f);
         }
     }
-    if constexpr (Nsplit) {
-        __syncthreads();
-        auto factors = reinterpret_cast<float*>(shared_keys);
-        auto shared_output = reinterpret_cast<unsigned short*>(shared_keys + NativeTileBytes);
-        if ((lane & 3) == 0) {
-            factors[warp * 16 + (lane >> 2)] = multipliers[0];
-            factors[warp * 16 + (lane >> 2) + 8] = multipliers[1];
-            factors[64 + warp * 16 + (lane >> 2)] = lse[0];
-            factors[64 + warp * 16 + (lane >> 2) + 8] = lse[1];
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int row = 0; row < 4; ++row) {
-            #pragma unroll
-            for (int column = 0; column < 4; ++column) {
-                #pragma unroll
-                for (int pair = 0; pair < 4; ++pair) {
-                    int packed_row = row * 16 + (lane >> 2) + (pair & 1) * 8;
-                    int query_index = packed_row / Group;
-                    if (query_index < query_count) {
-                        int token = query_begin + query_index;
-                        int query_head = head * Group + packed_row % Group;
-                        int dimension = warp * 64 + column * 16 + (lane & 3) * 4 + (pair >> 1) * 2;
-                        int index = (pair & 1) * 2 + (pair >> 1);
-                        float first = output[row * 4 + column][index] * factors[packed_row];
-                        float second = output[row * 4 + column][index + 4] * factors[packed_row];
-                        if (single_split) {
-                            int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
-                            *reinterpret_cast<unsigned int*>(shared_output + offset) = native_bfloat_pair(first, second);
-                        } else {
-                            int64_t offset = (static_cast<int64_t>(split) * params.query_heads + query_head) * params.total_q + token;
-                            *reinterpret_cast<float2*>(params.partial_output + offset * 256 + dimension) = make_float2(first, second);
-                            if (dimension == 0) params.partial_lse[offset] = factors[64 + packed_row];
-                        }
-                    }
-                }
-            }
-        }
-        if (single_split) {
-            __syncthreads();
-            #pragma unroll
-            for (int copy = 0; copy < QueryRows * 32 / Threads; ++copy) {
-                int vector = threadIdx.x + copy * Threads;
-                int packed_row = vector >> 5;
-                int dimension = (vector & 31) * 8;
-                int query_index = packed_row / Group;
-                if (query_index < query_count) {
-                    int token = query_begin + query_index;
-                    int query_head = head * Group + packed_row % Group;
-                    int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
-                    *reinterpret_cast<uint4*>(params.output + token * params.output_row_stride
-                        + query_head * params.output_head_stride + dimension) = *reinterpret_cast<const uint4*>(shared_output + offset);
-                }
-            }
-        }
-    }
-    else if constexpr ((NativeKeyRows > 32 || NativeOutputDivisions > 1) && Query != 1) {
+    if constexpr (NativeKeyRows > 32 && Query != 1) {
         if (single_split) {
             auto shared_output = reinterpret_cast<unsigned short*>(shared_keys);
             __syncthreads();
             native_scatter_output<0, OutputTiles, Group>(shared_output, output, multipliers, query_count, row_base, lane);
             __syncthreads();
             #pragma unroll
-            for (int copy = 0; copy < QueryRows * (32 / NativeOutputDivisions) / Threads; ++copy) {
+            for (int copy = 0; copy < QueryRows * 32 / Threads; ++copy) {
                 int vector = threadIdx.x + copy * Threads;
-                int packed_row = vector / (32 / NativeOutputDivisions);
-                int dimension = (vector & (32 / NativeOutputDivisions - 1)) * 8;
+                int packed_row = vector / 32;
+                int dimension = (vector & 31) * 8;
                 int query_index = packed_row / Group;
                 if (query_index < query_count) {
                     int token = query_begin + query_index;
                     int query_head = head * Group + packed_row % Group;
-                    int offset = packed_row * (256 / NativeOutputDivisions) + (dimension ^ ((packed_row & (7 / NativeOutputDivisions)) * 32));
+                    int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
                     *reinterpret_cast<uint4*>(params.output + token * params.output_row_stride
                         + query_head * params.output_head_stride + output_base + dimension)
                         = *reinterpret_cast<const uint4*>(shared_output + offset);
@@ -1108,7 +906,6 @@ void atrex_ppu_native_decode_kernel(DecodeParams params) {
     unsigned char* shared_keys = storage;
     unsigned char* shared_values = storage + NativeTileBytes;
     unsigned char* shared_transposed = storage + (NativeKeyRows > 32 ? params.key_stage_offset : NativeGeometry<Query, Group>::KeyOffset);
-    unsigned char* shared_next_values = NativeGeometry<Query, Group>::Nsplit ? storage + params.value_stage_offset : nullptr;
     if constexpr (Persistent) {
         int* plan = static_cast<int*>(params.plan);
         volatile int* task_mailbox = reinterpret_cast<volatile int*>(shared_transposed);
@@ -1121,7 +918,7 @@ void atrex_ppu_native_decode_kernel(DecodeParams params) {
             int head = request_head % params.kv_heads;
             int request = request_head / params.kv_heads;
             native_decode_task<Query, Group>(params, split, head, request, __ldg(plan + 4 + request),
-                shared_keys, shared_values, shared_transposed, shared_next_values);
+                shared_keys, shared_values, shared_transposed);
             if constexpr (Query != 1) {
                 if (total_jobs <= static_cast<int>(gridDim.x)) break;
             }
@@ -1131,8 +928,8 @@ void atrex_ppu_native_decode_kernel(DecodeParams params) {
             task = __shfl_sync(0xffffffff, static_cast<int>(*task_mailbox), 0);
         }
     } else {
-        native_decode_task<Query, Group>(params, NativeOutputDivisions > 1 ? 0 : blockIdx.x, blockIdx.y, blockIdx.z, params.splits,
-            shared_keys, shared_values, shared_transposed, shared_next_values);
+        native_decode_task<Query, Group>(params, blockIdx.x, blockIdx.y, blockIdx.z, params.splits,
+            shared_keys, shared_values, shared_transposed);
     }
 }
 
@@ -1200,11 +997,6 @@ template<int Query, int Group>
 int native_launch(DecodeParams params, hggcStream_t stream) {
     constexpr int Threads = NativeGeometry<Query, Group>::Threads;
     params.key_stage_offset = NativeGeometry<Query, Group>::KeyOffset;
-    params.value_stage_offset = NativeTileBytes * 3;
-    if constexpr (NativeOutputDivisions > 1) {
-        params.automatic = false;
-        params.splits = 1;
-    }
     if constexpr (Query == 4 && Group == 16) {
         constexpr int single_split_limit = NativePlanRows * Query * Group * 2;
         if (params.automatic && params.max_query == 4 && params.max_kv <= single_split_limit) {
@@ -1212,7 +1004,7 @@ int native_launch(DecodeParams params, hggcStream_t stream) {
             params.splits = 1;
         }
     }
-    dim3 grid(NativeOutputDivisions > 1 ? NativeOutputDivisions : params.splits, params.kv_heads, params.batch);
+    dim3 grid(params.splits, params.kv_heads, params.batch);
     if (params.automatic) {
         int blocks_per_cu = 0;
         auto status = hggcOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu,
@@ -1314,10 +1106,8 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
 extern "C" int atrex_ppu_decode_resources(int* values) {
     hggcFuncAttributes attributes{};
     constexpr int Query = NativeQ1Only ? 1 : 4;
-    constexpr int Group = !NativeQ1Only && NativeOutputDivisions == 2 ? 12 : 16;
-    constexpr bool Persistent = NativeQ1Only || NativeOutputDivisions == 1;
-    constexpr int Threads = NativeGeometry<Query, Group>::Threads;
-    auto function = atrex_ppu_native_decode_kernel<Query, Group, Persistent>;
+    constexpr int Threads = NativeGeometry<Query, 16>::Threads;
+    auto function = atrex_ppu_native_decode_kernel<Query, 16, true>;
     auto status = hggcFuncGetAttributes(&attributes, function);
     if (status != hggcSuccess) return static_cast<int>(status);
     int blocks = 0;
