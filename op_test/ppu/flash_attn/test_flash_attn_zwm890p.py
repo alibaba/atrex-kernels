@@ -299,14 +299,28 @@ def test_prefill_bounded_workspace_groups(heads, scaled, splits, monkeypatch):
         assert any("atrex_ppu_prefill_group_metadata" in name for name in names)
 
 
-def test_prefill_workspace_budget_too_small(monkeypatch):
+def test_prefill_single_request_exceeds_workspace_target(monkeypatch):
     from atrex import flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     case = _case(64, [65, 17], [257, 513])
+    expected = flash_attn_varlen_func(**case)
     monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", 1024)
-    with pytest.raises(ValueError, match="One PPU prefill request"):
-        flash_attn_varlen_func(**case)
+    allocations = []
+    allocate = runtime._group_workspace
+
+    def checked_workspace(*args):
+        result = allocate(*args)
+        views, capacity, minimum, slots = result
+        assert capacity == minimum == 1 and slots == 2
+        allocations.append(views["k"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case)
+    assert allocations and min(allocations) > runtime._PREP_WORKSPACE_BYTES
+    assert torch.equal(actual, expected)
+    _check(case, graph=True)
 
 
 def test_eager_scratch_not_retained_per_layer_or_shape():
