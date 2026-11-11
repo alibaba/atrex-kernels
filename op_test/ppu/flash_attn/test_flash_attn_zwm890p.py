@@ -245,6 +245,70 @@ def test_prefill_fast_path_source_matches_main():
     assert runtime._launch.jit_spec.include_dirs == ("ppu/flash_attn/zwm890p/include",)
 
 
+@pytest.mark.parametrize("heads,scaled,splits", [
+    ((6, 1), False, 1), ((6, 1), True, 4),
+    ((8, 1), False, 1), ((8, 1), False, 4),
+    ((24, 2), True, 1), ((32, 2), True, 4),
+])
+def test_prefill_bounded_workspace_groups(heads, scaled, splits, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    # Force a small workspace: empty requests, global Q offsets, descales and
+    # split outputs must stay correct when metadata changes during graph replay.
+    case = build_case(256, [17, 0, 65, 2, 129], [257, 0, 513, 65, 513],
+                      hq=heads[0], hkv=heads[1])
+    if not scaled:
+        for name in ("q_descale", "k_descale", "v_descale"):
+            case[name] = None
+    expected = flash_attn_varlen_func(**case, num_splits=splits)
+    pages = (case["max_seqlen_k"] + 63) // 64
+    budget = runtime._group_layout(5, 2, heads[1], pages, scaled)[1]
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", budget)
+    allocations = []
+    allocate = runtime._group_workspace
+
+    def checked_workspace(*args):
+        result = allocate(*args)
+        allocations.append(result[0]["k"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case, num_splits=splits)
+    # Check the entire backing allocation, not just the two packed tensors.
+    assert allocations and max(allocations) <= budget
+    assert torch.equal(actual, expected)
+    _check(case, splits=splits)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = flash_attn_varlen_func(**case, num_splits=splits)
+    # Keep total Q and its upper bound fixed, but move work between requests.
+    # Replay must re-plan from device metadata, not reuse captured boundaries.
+    case["cu_seqlens_q"].copy_(torch.tensor([0, 0, 0, 100, 213, 213],
+                                            dtype=torch.int32, device="cuda"))
+    case["seqused_k"][3] = 129
+    case["block_table"][2, :2].copy_(case["block_table"][2, :2].flip(0))
+    if scaled:
+        case["v_descale"].mul_(.5)
+    graph.replay()
+    expected, _ = reference(case)
+    torch.testing.assert_close(graph_out.float(), expected, atol=.03, rtol=.05)
+    if heads == (6, 1) and not scaled and splits == 1:
+        names = profile_case(case)
+        assert any("atrex_ppu_prefill_group_plan" in name for name in names)
+        assert any("atrex_ppu_prefill_group_metadata" in name for name in names)
+
+
+def test_prefill_workspace_budget_too_small(monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    case = _case(64, [65, 17], [257, 513])
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", 1024)
+    with pytest.raises(ValueError, match="One PPU prefill request"):
+        flash_attn_varlen_func(**case)
+
+
 def test_eager_scratch_not_retained_per_layer_or_shape():
     from atrex import flash_attn_varlen_func
 

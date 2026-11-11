@@ -1,6 +1,7 @@
 """Native paged FP8 prefill with invocation-local layout conversion and scratch."""
 
 from functools import lru_cache
+from math import prod
 
 import torch
 
@@ -23,6 +24,94 @@ def _launch(*args):
 @lru_cache(maxsize=None)
 def _extension(device):
     return _launch.build(device)
+
+
+# Includes packed K/V, page remapping, scales and grouping metadata. Inputs,
+# the returned output and the separate FA Split-KV partials are not prep scratch.
+_PREP_WORKSPACE_BYTES = 8 * 1024**3
+
+
+@cuda_kernel(
+    sources=("ppu/flash_attn/zwm890p/prefill_workspace.cu",),
+    module_name="atrex_ppu_prefill_workspace",
+    function_name="prepare",
+)
+def _workspace_launch(*args):
+    """Graph-replayable metadata planning; no attention arithmetic."""
+
+
+@lru_cache(maxsize=None)
+def _workspace_extension(device):
+    return _workspace_launch.build(device)
+
+
+def _aligned_bytes(size):
+    return (size + 511) // 512 * 512
+
+
+def _group_layout(batch, capacity, heads, pages, scaled):
+    minimum = max(1, capacity // 2) if capacity < batch else batch
+    slots = (batch + minimum - 1) // minimum
+    # One allocation owns every prep temporary, including full-call descales.
+    specifications = (
+        ("k", (capacity * heads * pages * 16384,), torch.uint8, 1),
+        ("v", (capacity * heads * pages * 16384,), torch.uint8, 1),
+        ("k_scale", (capacity * heads * pages,), torch.float32, 4),
+        ("v_amax", (capacity * heads * 256,), torch.float32, 4),
+        ("table", (capacity, pages), torch.int32, 4),
+        ("cu", (capacity + 1,), torch.int32, 4),
+        ("lengths", (capacity,), torch.int32, 4),
+        ("scales", (3, batch, heads) if scaled else (0,), torch.float32, 4),
+        ("group_scales", (3, capacity, heads) if scaled else (0,), torch.float32, 4),
+        ("cost", (batch + 1,), torch.int64, 8),
+        ("groups", (batch + 1,), torch.int32, 4),
+        ("next", (batch + 1,), torch.int32, 4),
+        ("starts", (slots + 1,), torch.int32, 4),
+    )
+    layout, total = {}, 0
+    for name, shape, dtype, width in specifications:
+        size = prod(shape) * width
+        layout[name] = (total, size, shape, dtype)
+        total += _aligned_bytes(size)
+    return layout, total, minimum, slots
+
+
+def _group_workspace(batch, heads, pages, scaled, device):
+    lower, upper = 1, min(batch, _PREP_WORKSPACE_BYTES // (2 * heads * pages * 16384))
+    capacity = 0
+    while lower <= upper:
+        middle = (lower + upper) // 2
+        if _group_layout(batch, middle, heads, pages, scaled)[1] <= _PREP_WORKSPACE_BYTES:
+            capacity, lower = middle, middle + 1
+        else:
+            upper = middle - 1
+    if capacity == 0:
+        raise ValueError("One PPU prefill request exceeds the prep workspace budget; request grouping cannot fit it")
+    layout, size, minimum, slots = _group_layout(batch, capacity, heads, pages, scaled)
+    storage = torch.empty(size, dtype=torch.uint8, device=device)
+    views = {
+        name: storage[offset:offset + length].view(dtype).view(shape)
+        for name, (offset, length, shape, dtype) in layout.items()
+    }
+    return views, capacity, minimum, slots
+
+
+@lru_cache(maxsize=None)
+def _group_geometry(query_heads, kv_heads, device):
+    # Mirror the existing main kernel's CTA geometry, without changing its ABI
+    # or binary. Its 128-KiB shared memory and launch bounds cap residency.
+    packed = query_heads == 6 and kv_heads == 1
+    ratio = query_heads // kv_heads
+    head_group = 4 if packed or ratio % 4 == 0 else 6 if ratio % 6 == 0 else 2
+    properties = torch.cuda.get_device_properties(device)
+    blocks = min(
+        properties.shared_memory_per_multiprocessor // (4 * 2 * 64 * 256),
+        properties.max_threads_per_multi_processor // (head_group * 64),
+        1 if head_group > 4 else 2,
+    )
+    return (query_heads if packed else 1, 32 * head_group if packed else 32,
+            1 if packed else query_heads // head_group,
+            max(1, properties.multi_processor_count * blocks))
 
 
 def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k):
@@ -110,42 +199,87 @@ def forward(
     if max_seqlen_k == 0:
         out.zero_()
         return out, None
-    # Keep the existing long-prefill policy. Short-Q calls may split the KV
-    # range; all requests are processed without host-side batch partitioning.
+    # Preserve the existing Split-KV policy independently of request grouping.
     if num_splits == 0:
         num_splits = _default_splits(q.shape[0], requests, max_seqlen_q, max_seqlen_k)
     num_splits = min(num_splits, max(1, (max_seqlen_k + 63) // 64))
     extension = _extension(q.device)
     max_pages = (max_seqlen_k + 63) // 64
-    remapped_table = _remap_block_table(page_table, virtual_stride, subpages)
-    # Preserve the original prep_kv layout and native argument contract.
     kv_heads = k.shape[2]
-    descales = torch.empty((0,), dtype=torch.float32, device=q.device)
-    if any(scale is not None for scale in (q_descale, k_descale, v_descale)):
-        descales = torch.empty((3, requests, kv_heads), dtype=torch.float32, device=q.device)
-        for index, scale in enumerate((q_descale, k_descale, v_descale)):
+    scales = (q_descale, k_descale, v_descale)
+    scaled = any(scale is not None for scale in scales)
+    packed_bytes = requests * kv_heads * max_pages * 16384
+    full_bytes = sum(_aligned_bytes(size) for size in (
+        packed_bytes, packed_bytes, requests * kv_heads * max_pages * 4,
+        requests * kv_heads * 256 * 4, 3 * requests * kv_heads * 4 if scaled else 0,
+        requests * page_table.shape[1] * subpages * 4 if virtual_stride != 1 else 0,
+        subpages * 4 if virtual_stride != 1 and subpages > 1 else 0,
+    ))
+    workspace = None
+    if full_bytes > _PREP_WORKSPACE_BYTES:
+        workspace, capacity, minimum, slots = _group_workspace(
+            requests, kv_heads, max_pages, scaled, q.device,
+        )
+        descales = workspace["scales"]
+        packed_k, packed_v = workspace["k"], workspace["v"]
+        k_scale, v_amax = workspace["k_scale"], workspace["v_amax"]
+        remapped_table = workspace["table"]
+    else:
+        # Preserve the original single-launch path when its complete prep
+        # scratch fits. No planner or group metadata kernels run on this path.
+        remapped_table = _remap_block_table(page_table, virtual_stride, subpages)
+        descales = torch.empty(
+            (3, requests, kv_heads) if scaled else (0,),
+            dtype=torch.float32, device=q.device,
+        )
+        packed_k = torch.empty(packed_bytes, dtype=torch.uint8, device=q.device)
+        packed_v = torch.empty_like(packed_k)
+        k_scale = torch.empty(requests * kv_heads * max_pages, dtype=torch.float32, device=q.device)
+        v_amax = torch.empty(requests * kv_heads * 256, dtype=torch.float32, device=q.device)
+    if scaled:
+        for index, scale in enumerate(scales):
             if scale is None:
                 descales[index].fill_(1.0)
             else:
                 descales[index].copy_(scale)
-    packed_k = torch.empty(requests * kv_heads * max_pages * 16384, dtype=torch.uint8, device=q.device)
-    packed_v = torch.empty_like(packed_k)
-    k_scale = torch.empty(requests * kv_heads * max_pages, dtype=torch.float32, device=q.device)
-    v_amax = torch.empty(requests * kv_heads * 256, dtype=torch.float32, device=q.device)
     partial = torch.empty(
         num_splits * q.shape[0] * q.shape[1] * 272 if num_splits > 1 else 0,
         dtype=torch.float32, device=q.device,
     )
     out.zero_()
-    extension.prep_kv(
-        key_view, value_view, remapped_table, seqused_k,
-        packed_k, packed_v, k_scale, v_amax, max_pages,
-    )
-    extension.attn(
-        q, packed_k, packed_v, k_scale, v_amax, cu_seqlens_q, seqused_k,
-        out, partial, max_pages, (q.shape[0] + 31) // 32 + requests, num_splits,
-        kv_heads, descales, softmax_scale,
-    )
+    if workspace is not None:
+        planner = _workspace_extension(q.device)
+        query_multiplier, query_tile, head_groups, resident = _group_geometry(q.shape[1], kv_heads, q.device)
+        planner.plan(
+            cu_seqlens_q, seqused_k, workspace["cost"], workspace["groups"],
+            workspace["next"], workspace["starts"], capacity, minimum,
+            query_multiplier, query_tile, head_groups, num_splits, resident,
+        )
+    # The launch count is graph-static; the GPU recomputes group boundaries on
+    # every invocation. Unused slots have zero lengths and do no attention work.
+    for slot in range(slots if workspace is not None else 1):
+        if workspace is not None:
+            planner.prepare(
+                page_table, cu_seqlens_q, seqused_k, descales, workspace["starts"],
+                remapped_table, workspace["cu"], workspace["lengths"],
+                workspace["group_scales"], slot, virtual_stride, subpages,
+            )
+            group_cu, group_lengths, group_scales = (
+                workspace["cu"], workspace["lengths"], workspace["group_scales"],
+            )
+            group_requests = capacity
+        else:
+            group_cu, group_lengths, group_scales = cu_seqlens_q, seqused_k, descales
+            group_requests = requests
+        extension.prep_kv(
+            key_view, value_view, remapped_table, group_lengths,
+            packed_k, packed_v, k_scale, v_amax, max_pages,
+        )
+        extension.attn(
+            q, packed_k, packed_v, k_scale, v_amax, group_cu, group_lengths,
+            out, partial, max_pages, (q.shape[0] + 31) // 32 + group_requests, num_splits,
+            kv_heads, group_scales, softmax_scale,
+        )
     if num_splits > 1:
         extension.combine(partial, out, num_splits)
     return out, None
