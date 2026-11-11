@@ -72,6 +72,11 @@ flash_attn_varlen_func = _lazy_import_and_call(
     "atrex.api.flash_attn",
 )
 
+qsa_compact = _lazy_import_and_call(
+    "qsa_compact",
+    "atrex.api.qsa_compact",
+)
+
 __all__ = (
     "can_use_flash_attn_varlen_func",
     "can_use_chunk_gdn_fwd_cutedsl",
@@ -81,4 +86,5 @@ __all__ = (
     "flash_attn_varlen_func",
     "nvfp4_fused_moe",
     "prepare_nvfp4_fused_moe_weights",
+    "qsa_compact",
 )

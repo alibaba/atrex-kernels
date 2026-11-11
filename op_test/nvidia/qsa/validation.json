@@ -1,0 +1,57 @@
+{
+  "scope": "Basic installed-wheel QSA validation; SM100 run pending at submission",
+  "test_sha256": {
+    "qsa_contract.py": "9a8da1956a5f4d41b0368f878595877d6ce16b1bf1c885326db8743ec2bbe364",
+    "qsa_regression.py": "0eb0c3d1221114ab05a24f67966cb71a7fac478dc92c4a648aa4da0b56c129ec",
+    "test_qsa_sm100.py": "28de4b0f3a81ee39ad7cf858220e846876049ea48390cffac473cba36c8f2414",
+    "test_qsa_sm103.py": "38da5d571ebca633a32d9a77c7ac2e771ea3ec485d271e1566b712da88a81e38"
+  },
+  "current_source_digest": "3d4a356d9c1f0abb873ef1a21a488f06cf6803cc56eb050e30b9fca4a94b1a1c",
+  "baseline_source_digest": "067a1f257edba706d1a4c562dd5cd098fc2fab8c8156c31767b0ba817f578ba5",
+  "numerical_checks": {
+    "strict_atol": 0.003,
+    "strict_rtol": 0.02,
+    "random_fp8_fixture_relative_l2_limit": 0.035,
+    "paired_relative_l2_growth_limit": 0.01
+  },
+  "targets": [
+    {
+      "architecture": "sm100",
+      "status": "pending",
+      "run": "dv_b7ae00df0067"
+    },
+    {
+      "architecture": "sm103",
+      "sms": 152,
+      "status": "passed",
+      "run": "qsa-pr-minimal-20261111-r2",
+      "tests": {
+        "tests": 29,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "dependencies": {
+        "torch": "2.11.0a0+a6c236b9fd.nv26.3.46836102",
+        "triton": "3.6.0",
+        "nvidia-cutlass-dsl": "4.8.1",
+        "apache-tvm-ffi": "0.1.11"
+      },
+      "paired_cases": 8,
+      "paired_accuracy_checks": 16,
+      "strict_reference_failures": {
+        "baseline": 8,
+        "current": 8
+      },
+      "new_strict_reference_failures": 0,
+      "maximum_latency_increase_pct": {
+        "warm": 1.167,
+        "cold_l2": 1.282,
+        "eager": 0.9
+      },
+      "kernel_events": 12,
+      "all_kernel_names_have_atrex_prefix": true,
+      "regression_report_sha256": "c013882c7b0b21c9e31496a41c2ebd83ec2f0256e7d3de800bd0809497e538c6"
+    }
+  ]
+}
