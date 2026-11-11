@@ -28,6 +28,7 @@ def _extension(device):
 
 # Includes packed K/V, page remapping, scales and grouping metadata. Inputs,
 # the returned output and the separate FA Split-KV partials are not prep scratch.
+# This is a grouping target, not a limit on supported request sizes.
 _PREP_WORKSPACE_BYTES = 8 * 1024**3
 
 
@@ -85,8 +86,9 @@ def _group_workspace(batch, heads, pages, scaled, device):
             capacity, lower = middle, middle + 1
         else:
             upper = middle - 1
-    if capacity == 0:
-        raise ValueError("One PPU prefill request exceeds the prep workspace budget; request grouping cannot fit it")
+    # Requests cannot be split here. Allow one request above the target and
+    # let the allocator report an OOM only if the actual allocation fails.
+    capacity = max(1, capacity)
     layout, size, minimum, slots = _group_layout(batch, capacity, heads, pages, scaled)
     storage = torch.empty(size, dtype=torch.uint8, device=device)
     views = {
