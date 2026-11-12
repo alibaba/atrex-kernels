@@ -25,6 +25,8 @@ An operator change is incomplete unless its matching target test is added or
 updated in the same change. The current files are:
 
 ```text
+op_test/nvidia/qsa/test_qsa_sm100.py
+op_test/nvidia/qsa/test_qsa_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm103.py
 op_test/nvidia/chunk_gdn/test_chunk_gdn_sm120.py
 op_test/nvidia/flash_attn/test_flash_attn_sm103.py
@@ -107,6 +109,21 @@ accepted. See the
 [`atrex-kernel-integration`](.agents/skills/atrex-kernel-integration/SKILL.md)
 skill for the full placement, API, dispatch, compilation, kernel-name, and
 validation requirements.
+
+## QSA compact attention
+
+`atrex.qsa_compact` provides gated, paged sparse attention on NVIDIA SM100/SM103.
+It consumes native four-token block IDs with BF16 or FP8 E4M3FN Q/K/V and BF16
+output. It supports D256, GQA ratios 8/12, one or two KV heads, page sizes that
+are positive multiples of 16, ragged prefill, and Q1/Q4 decode. Warmed Q1/Q4 calls
+support CUDA Graph replay with a preallocated output. Dispatch is static and
+compilation is lazy. The validated environment uses CUDA 13+, CuTeDSL 4.6.2
+and TVM-FFI 0.1.12, matching the declared package dependencies.
+
+See the [QSA guide](src/nvidia/qsa/sm103/DESIGN.md) for tensor layouts, FP8 scales,
+capacity and numerical limits, and the
+[SM100](op_test/nvidia/qsa/test_qsa_sm100.py) and
+[SM103](op_test/nvidia/qsa/test_qsa_sm103.py) tests for validation.
 
 ## Build
 
