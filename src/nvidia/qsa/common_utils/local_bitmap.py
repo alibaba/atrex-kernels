@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.typing import Int32, Int64
 
-from .warp import _shfl32
+from .device import _shfl32
 from . import qsa_sm_ptx
 
 

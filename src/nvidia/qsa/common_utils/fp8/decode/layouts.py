@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
+from cutlass.cute.typing import BFloat16, Float32, Int32
 
-from . import qsa_sm_ptx
+from ... import qsa_sm_ptx
 
-from ..common_utils.device import DeviceHelpers, _elem_pointer, _shfl, _shfl32
+from ...device import DeviceHelpers, _elem_pointer, _shfl as _shfl, _shfl32 as _shfl32
 
 LOG2_E = 1.4426950408889634
 
@@ -40,12 +38,12 @@ class QSAForward(DeviceHelpers):
         self.ordered = ordered
         self.kvmajor = kvmajor
         self.partial_bound = partial_bound
-        assert n_tile == 96 and ent_tile == 24 and (head_dim == 256)
+        assert n_tile == 128 and ent_tile == 32 and (head_dim == 256)
         assert n_tile == 4 * ent_tile, 'one union entry expands to 4 tokens'
         assert ent_tile <= 32, 'one gather-warp lane resolves one union entry'
-        assert n_tile * s_stages + head_dim // 4 + head_dim <= 512, 'TMEM column overflow'
+        assert n_tile * s_stages + head_dim <= 512, 'TMEM column overflow'
         assert k_stages >= 2 and v_stages >= 2, 'lagged arrival needs >=2 stages'
-        smem_est = (k_stages + v_stages) * n_tile * head_dim * 2 + 32768 + 2048 + 1024
+        smem_est = (k_stages + v_stages) * n_tile * head_dim + m_tile * head_dim + 2048 + 1024
         assert smem_est <= 232448, f'SMEM budget overflow: {smem_est}'
         self.group = group
         self.head_dim = head_dim
@@ -101,55 +99,12 @@ class QSAForward(DeviceHelpers):
         self.RM = br * self.RB
         self.take_warps = 11 if self.mmasched else self.NWARPS - 1
         self.threads = 32 * self.NWARPS
-        self.dtype = BFloat16
+        self.dtype = cutlass.Float8E4M3FN
         self.acc = Float32
         self.arch_str = 'sm_100'
-        self.copy_elems = 8
+        self.copy_elems = 16
         self.gptr = 8
 
-    @cute.jit
-    def __call__(self, mQ, mK, mV, mWS, mCount, mRM, mTicket, mBT, mGate,
-                 mOut, softmax_scale: Float32, nblocks: Int32, ncta: Int32,
-                 tbase: Int32, tmapK: Int64, tmapV: Int64, stream):
-        self.scale_log2 = softmax_scale * Float32(LOG2_E)
-        M, N, D = self.m_tile, self.n_tile, self.head_dim
-        qk_tiler = (M, N, D)
-        pv_tiler = (M, D, N)
-        qk_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype, self.dtype, tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K, self.acc, tcgen05.CtaGroup.ONE,
-            qk_tiler[:2], tcgen05.OperandSource.TMEM)
-        qk_sm_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype,self.dtype,tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,self.acc,tcgen05.CtaGroup.ONE,
-            qk_tiler[:2],tcgen05.OperandSource.SMEM)
-        # The PV A operand (P) is read from TMEM, aliasing the drained S stage.
-        pv_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype, self.dtype, tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN, self.acc, tcgen05.CtaGroup.ONE,
-            pv_tiler[:2], tcgen05.OperandSource.TMEM)
-        # V5: the QK A operand (Q) is ALSO read from TMEM (its own resident
-        # column range), freeing the full 64KB sQ SMEM buffer for deeper K/V
-        # gather rings.  Q is refilled by the softmax warpgroup with LDG ->
-        # register -> tcgen05.st once per unit.
-        q_tmem_lay = sm100_utils.make_smem_layout_a(qk_mma, (M,N,D//2),
-                                                    self.dtype, 1)
-        q_smem_lay = sm100_utils.make_smem_layout_a(qk_sm_mma,(M,N,D//2),self.dtype,1)
-        k_lay = sm100_utils.make_smem_layout_b(qk_mma, qk_tiler, self.dtype,
-                                               self.k_stages)
-        v_lay = sm100_utils.make_smem_layout_b(pv_mma, pv_tiler, self.dtype,
-                                               self.v_stages)
-        # Single-stage P layout: the stage stride is applied by hand in the
-        # kernel, because make_smem_layout_a packs stages back-to-back (N/2
-        # columns apart) while the S/P ping-pong stages are N columns apart.
-        p_tmem_lay = sm100_utils.make_smem_layout_a(pv_mma, pv_tiler, self.dtype, 1)
-        self.atrex_qsa_sm103_attention(qk_mma, qk_sm_mma, pv_mma, q_tmem_lay, q_smem_lay, k_lay, v_lay, p_tmem_lay,
-                    mQ, mK, mV, mWS, mCount, mRM, mTicket, mBT, mGate, mOut,
-                    self.scale_log2, nblocks, ncta, tbase, tmapK,
-                    tmapV).launch(
-            grid=(ncta, 1, 1), block=[self.threads, 1, 1],
-            cluster=(1, 1, 1), stream=stream, min_blocks_per_mp=1,
-            use_pdl=self.use_pdl)
 
 
     @cute.jit
@@ -157,18 +112,23 @@ class QSAForward(DeviceHelpers):
         ptr=cute.make_ptr(self.acc,(tOtO.iterator+(wg*16+(sg//32)*32)*65536).toint(),
             cute.AddressSpace.tmem,assumed_align=16)
         r=cute.make_rmem_tensor((32,),self.acc)
-        rg=cute.make_rmem_tensor((32,),self.dtype);rw=cute.make_rmem_tensor((32,),self.dtype)
+        rg=cute.make_rmem_tensor((32,),Float32 if self.gate_factor else BFloat16);rw=cute.make_rmem_tensor((32,),BFloat16)
         if cutlass.const_expr(self.decode_gate):self._mwait(gstaged,0)
         for chunk in cutlass.range_constexpr(4):
             qsa_sm_ptx.split_load(Int32((ptr+chunk*32).toint()),r,32,128)
             cute.arch.fence_view_async_tmem_load()
             if L<lane_rows:
                 row=row0+L//group;head=kvh*group+L%group;col=(sg%32//16)*128+chunk*32
-                gp=cute.make_ptr(self.dtype,_elem_pointer(mGate,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
-                op=cute.make_ptr(self.dtype,_elem_pointer(mOut,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
+                gp=cute.make_ptr(BFloat16,_elem_pointer(mGate,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
+                op=cute.make_ptr(BFloat16,_elem_pointer(mOut,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
                 if cutlass.const_expr(self.decode_gate):
                     for part in cutlass.range_constexpr(4):
-                        src=cute.make_tensor(sG.iterator+(chunk*4+part)*256+(sg%32)*8,cute.make_layout((8,)))
+                        gate_warp = 0 if cutlass.const_expr(self.br==1) else sg//32
+                        if cutlass.const_expr(self.gate_factor):
+                            offset=(chunk*4+part)*(2*self.br*group*8)+((sg%32//16)*self.br*group+L)*8
+                        else:
+                            offset=gate_warp*4096+(chunk*4+part)*256+(sg%32)*8
+                        src=cute.make_tensor(sG.iterator+offset,cute.make_layout((8,)))
                         dst=cute.make_tensor(rg.iterator+part*8,cute.make_layout((8,)))
                         cute.autovec_copy(src,dst)
                 else:
@@ -177,11 +137,14 @@ class QSAForward(DeviceHelpers):
                 for pair in cutlass.range_constexpr(16):
                     j=pair*2
                     o0,o1=cute.arch.fma_packed_f32x2((Float32(r[j]),Float32(r[j+1])),(inv,inv),zero2)
-                    a0=Float32(cutlass.select_(inv!=Float32(0),o0,Float32(0))).to(self.dtype)
-                    a1=Float32(cutlass.select_(inv!=Float32(0),o1,Float32(0))).to(self.dtype)
-                    g0,g1=cute.arch.fma_packed_f32x2((Float32(rg[j]),Float32(rg[j+1])),half2,zero2)
-                    t0=qsa_sm_ptx.tanh_approx(g0);t1=qsa_sm_ptx.tanh_approx(g1)
-                    s0,s1=cute.arch.fma_packed_f32x2((t0,t1),half2,half2)
+                    a0=Float32(cutlass.select_(inv!=Float32(0),o0,Float32(0))).to(BFloat16)
+                    a1=Float32(cutlass.select_(inv!=Float32(0),o1,Float32(0))).to(BFloat16)
+                    if cutlass.const_expr(self.gate_factor):
+                        s0,s1=Float32(rg[j]),Float32(rg[j+1])
+                    else:
+                        g0,g1=cute.arch.fma_packed_f32x2((Float32(rg[j]),Float32(rg[j+1])),half2,zero2)
+                        t0=qsa_sm_ptx.tanh_approx(g0);t1=qsa_sm_ptx.tanh_approx(g1)
+                        s0,s1=cute.arch.fma_packed_f32x2((t0,t1),half2,half2)
                     y0,y1=cute.arch.fma_packed_f32x2((a0.to(Float32),a1.to(Float32)),(s0,s1),zero2)
-                    rw[j]=y0.to(self.dtype);rw[j+1]=y1.to(self.dtype)
+                    rw[j]=y0.to(BFloat16);rw[j+1]=y1.to(BFloat16)
                 cute.autovec_copy(rw,cute.make_tensor(op,cute.make_layout((32,))))

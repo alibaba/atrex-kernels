@@ -9,11 +9,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 
-from ..sm103.mtp_m64 import QSAForward as Base
-from ..sm103.qsa_kernel import publish_bias
-from ..sm103.layouts import _elem_pointer, LOG2_E
-from ..sm103.native_metadata import build_native_metadata
-from ..sm103 import qsa_sm_ptx
+from .mtp_m64 import QSAForward as Base
+from .qsa_kernel import publish_bias
+from .layouts import _elem_pointer, LOG2_E
+from .native_metadata import build_native_metadata
+from . import qsa_sm_ptx
 
 
 class QSAForward(Base):
@@ -93,7 +93,7 @@ class QSAForward(Base):
             meta = smem.allocate_tensor(Int32, cute.make_layout((self.local_entries + 12 + self.RB + 8,)), 16)
             block = self._unit_blk(Int32(cta), nblocks, mCount)
             if cutlass.const_expr(self.decode_fixed):
-                from ..sm103.decode_metadata import build_decode_metadata
+                from .decode_metadata import build_decode_metadata
                 mWS, mCount, mRM = build_decode_metadata(mWS, mCount, mRM, mBT, mK, meta, tidx, block, Int32(cta), nblocks, self.kv_splits, self.local_entries, self.RB, self.page_size, self.local_metadata, self.metadata_request_span)
             else:
                 mWS, mCount, mRM = build_native_metadata(mWS, mCount, mRM, mBT, mK, meta, tidx, block, Int32(cta), nblocks, self.kv_splits, self.local_entries, self.RB, self.page_size, self.local_metadata, self.metadata_request_span, physical=self.union_physical)
@@ -101,7 +101,7 @@ class QSAForward(Base):
         sV = smem.allocate_tensor(self.dtype, v_lay.outer, 128, v_lay.inner)
         sQ = smem.allocate_tensor(self.dtype, q_smem_lay.outer, 128, q_smem_lay.inner)
         if cutlass.const_expr(self.fused_metadata and self.br in (2, 4)):
-            from ..sm103.union_metadata import build_union_metadata
+            from .union_metadata import build_union_metadata
             meta = smem.allocate_tensor(Int32, cute.make_layout((self.local_entries + 12 + 4 * self.RB + 8,)), 16)
             scratch = cute.make_tensor(cute.make_ptr(Int32, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=16), cute.make_layout((8192,)))
             block = self._unit_blk(Int32(cta), nblocks, mCount)

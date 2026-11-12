@@ -10,7 +10,7 @@ from ..common_utils.scales import _scale
 from ..common_utils.prefill_launch import PrefillLaunch, arena_sizes, launch_key, remember, scratch
 
 from ..common_utils.capacity import scratch_sizes
-from ..sm103.local_bitmap import LocalBitmapPreprocess
+from ..common_utils.local_bitmap import LocalBitmapPreprocess
 from ..common_utils.runtime import _compile, _select_br, _sms_count
 
 _COMPILE_CACHE = {}

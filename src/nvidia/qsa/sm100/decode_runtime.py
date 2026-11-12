@@ -8,8 +8,7 @@ import torch
 from ..common_utils.capacity import scratch_sizes
 from ..common_utils.mtp_domain import eligible
 from ..common_utils.runtime import _compile, _sms_count
-from ..common_utils.decode_dispatch import (
-    _select_decode_config, _standard_layout, _serving_layout)
+from ..common_utils.decode_dispatch import _select_decode_config, _standard_layout, _serving_layout
 from ..common_utils.scales import _scale
 
 _COMPILE_CACHE = {}
@@ -177,9 +176,9 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
                     k_cache, ws, count, mask)
     if separate and pre is None:
         if fp8:
-            from ..sm103.fp8.decode.union_preprocess import UnionPreprocess
+            from ..common_utils.fp8.decode.union_preprocess import UnionPreprocess
         else:
-            from ..sm103.union_preprocess import UnionPreprocess
+            from ..common_utils.union_preprocess import UnionPreprocess
         entries = 32 if fp8 else 24
         op = UnionPreprocess(page, maxe, ((maxe + entries - 1) // entries) * entries,
                              2 * tmax, request_span, True, False, False, **({"metadata_ready": br == 2 and separate and not unit_order, "direct_masks": br == 4 or balanced_fp8, "prefetch_k_tiles": 0 if balanced_fp8 else 2, "use_pdl": fp8 and separate and not unit_order and (br == 2 or (br == 4 and hkv > 1 and group > 8))} if fp8 else {}))
@@ -233,11 +232,11 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
     if splits > 1:
         import triton
         if fp8:
-            from ..sm103.fp8.decode.mtp_merge import atrex_mtp_merge, MERGE_BLOCK_D, MERGE_WARPS
+            from ..common_utils.fp8.decode.mtp_merge import atrex_mtp_merge, MERGE_BLOCK_D, MERGE_WARPS
             if balanced_fp8:
                 MERGE_BLOCK_D = 256
         else:
-            from ..sm103.mtp_merge import atrex_mtp_merge, merge_block_d, MERGE_WARPS
+            from ..common_utils.mtp_merge import atrex_mtp_merge, merge_block_d, MERGE_WARPS
             MERGE_BLOCK_D = merge_block_d(rows, heads, splits)
         merge_args = (heads, splits, triton.next_power_of_2(splits), dim, MERGE_BLOCK_D)
         if fp8:

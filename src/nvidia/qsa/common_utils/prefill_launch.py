@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..sm103.schedule import atrex_qsa_reset_ticket, schedule
+from .schedule import atrex_qsa_reset_ticket, schedule
 
 
 def launch_key(signature, sm_scale=None, v_scale=1.0, kvmajor=None):

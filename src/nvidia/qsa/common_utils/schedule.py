@@ -10,7 +10,7 @@ def atrex_qsa_reset_ticket(ticket):
 
 
 @triton.jit
-def atrex_qsa_sm103_order(COUNT,N:tl.constexpr,T:tl.constexpr,PDL:tl.constexpr):
+def atrex_qsa_order(COUNT,N:tl.constexpr,T:tl.constexpr,PDL:tl.constexpr):
     # Only the downstream attention is a PDL-dependent launch. This sort
     # runs after the preprocessor has fully completed on the same stream.
     if PDL:
@@ -34,4 +34,4 @@ def schedule(count,n,pdl):
     # The established <=4096-block schedule is unchanged; larger launches
     # concatenate complete, independently ordered segments.
     tile=min(4096,max(4,triton.next_power_of_2(n)))
-    atrex_qsa_sm103_order[(triton.cdiv(n,tile),)](count,n,tile,pdl,num_warps=8)
+    atrex_qsa_order[(triton.cdiv(n,tile),)](count,n,tile,pdl,num_warps=8)

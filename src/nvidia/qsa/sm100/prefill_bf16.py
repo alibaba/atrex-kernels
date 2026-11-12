@@ -11,9 +11,9 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
-from ..sm103.qsa_kernel import QSAForward as Base, publish_bias
-from ..sm103.layouts import _elem_pointer, LOG2_E
-from ..sm103 import qsa_sm_ptx
+from ..common_utils.qsa_kernel import QSAForward as Base, publish_bias
+from ..common_utils.layouts import _elem_pointer, LOG2_E
+from ..common_utils import qsa_sm_ptx
 
 
 class QSAForward(Base):

@@ -14,11 +14,11 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 
-from ..sm103.fp8.decode.mtp_m64 import QSAForward as Base
-from ..sm103.fp8.decode.qsa_kernel import publish_bias
-from ..sm103.fp8.decode.layouts import _elem_pointer, LOG2_E
-from ..sm103.fp8.decode.native_metadata import build_native_metadata
-from ..sm103 import qsa_sm_ptx
+from ..common_utils.fp8.decode.mtp_m64 import QSAForward as Base
+from ..common_utils.fp8.decode.qsa_kernel import publish_bias
+from ..common_utils.fp8.decode.layouts import _elem_pointer, LOG2_E
+from ..common_utils.fp8.decode.native_metadata import build_native_metadata
+from ..common_utils import qsa_sm_ptx
 from .maximum import max3, maximum
 
 
@@ -97,7 +97,7 @@ class QSAForward(Base):
             meta = smem.allocate_tensor(Int32, cute.make_layout((self.local_entries + 12 + self.RB + 8,)), 16)
             block = self._unit_blk(Int32(cta), nblocks, mCount)
             if cutlass.const_expr(self.decode_fixed):
-                from ..sm103.fp8.decode.decode_metadata import build_decode_metadata
+                from ..common_utils.fp8.decode.decode_metadata import build_decode_metadata
                 mWS, mCount, mRM = build_decode_metadata(mWS, mCount, mRM, mBT, mK, meta, tidx, block, Int32(cta), nblocks, self.kv_splits, self.local_entries, self.RB, self.page_size, self.local_metadata, self.metadata_request_span)
             else:
                 mWS, mCount, mRM = build_native_metadata(mWS, mCount, mRM, mBT, mK, meta, tidx, block, Int32(cta), nblocks, self.kv_splits, self.local_entries, self.RB, self.page_size, self.local_metadata, self.metadata_request_span)
@@ -105,7 +105,7 @@ class QSAForward(Base):
         sV = smem.allocate_tensor(self.dtype, v_lay.outer, 128, v_lay.inner)
         sQ = smem.allocate_tensor(self.dtype, q_smem_lay.outer, 128, q_smem_lay.inner)
         if cutlass.const_expr(self.fused_metadata and self.br in (2, 4)):
-            from ..sm103.fp8.decode.union_metadata import build_union_metadata
+            from ..common_utils.fp8.decode.union_metadata import build_union_metadata
             meta = smem.allocate_tensor(Int32, cute.make_layout((self.local_entries + 12 + 4 * self.RB + 8,)), 16)
             scratch = cute.make_tensor(cute.make_ptr(Int32, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=16), cute.make_layout((8192,)))
             block = self._unit_blk(Int32(cta), nblocks, mCount)

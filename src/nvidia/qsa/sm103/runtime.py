@@ -130,8 +130,7 @@ def run(
         # use KV splitting to expose parallelism for small decode batches.
         br = 4 if (R==4*_request_count and _request_count>=64 and
             2*_request_count*Hkv>=_sms and 4*group<=64) else 1
-        from ..common_utils.decode_dispatch import (
-            _select_decode_config, _standard_layout, _serving_layout)
+        from ..common_utils.decode_dispatch import _select_decode_config, _standard_layout, _serving_layout
         override = _select_decode_config(
             R, _request_count, Hkv, group, indexer_block_ids.shape[1], _sms, False,
             sm100=False, page=S, standard_layout=_standard_layout(
@@ -290,7 +289,7 @@ def run(
         if not _static_short:
             # Dynamic prefill starts a fresh ticket epoch on every invocation.
             # Static Q1/Q4 never reads the ticket and needs no initialization.
-            from .schedule import atrex_qsa_reset_ticket
+            from ..common_utils.schedule import atrex_qsa_reset_ticket
             atrex_qsa_reset_ticket[(1,)](mTicket, num_warps=1)
     kernel_gate, kernel_out = output_gate, out
     if kv_splits > 1:
@@ -312,7 +311,7 @@ def run(
                       or (union_separate and pre_compiled is None)):
         raise RuntimeError('Compile and warm this Q1/Q4 configuration before CUDA graph capture')
     if pre_compiled is None and union_separate:
-        from .union_preprocess import UnionPreprocess
+        from ..common_utils.union_preprocess import UnionPreprocess
         pre=UnionPreprocess(S,maxe,((maxe+23)//24)*24,2*tmax,_request_span,
                             True,False,union_physical)
         pre.atrex_union.set_name_prefix('atrex')
@@ -321,7 +320,7 @@ def run(
             [(16,1),(4,0),(4,0),(4,1),(16,3),(4,0),(4,0),(4,0)])
         _PRE_CACHE[pre_key]=pre_compiled
     elif pre_compiled is None and not direct_pre:
-        from .local_bitmap import LocalBitmapPreprocess
+        from ..common_utils.local_bitmap import LocalBitmapPreprocess
         pre = LocalBitmapPreprocess(br, S, bt_width, _request_span,
                                     pdl=(_pdl and not _ordered))
         pre.atrex_qsa_prefill_local_bitmap.set_name_prefix("atrex")
@@ -394,13 +393,13 @@ def run(
         pre_compiled(mLI, mPos, mBT, mT2R, mWS, mCount, mRM, rows, bt_rows,
                      num_pages, cutlass.Int32(_q0), cutlass.Int32(_q1), stream)
     if _ordered:
-        from .schedule import schedule
+        from ..common_utils.schedule import schedule
         schedule(mCount, nblocks, _pdl)
     tbase = cutlass.Int32(0)
     main_compiled(mQ, mK, mV, callWS, callCount, callRM, mTicket, mBT, mGate, mOut,
                   scale, nb, nct, tbase, tmk, tmv, stream)
     if kv_splits > 1:
-        from .mtp_merge import merge
+        from ..common_utils.mtp_merge import merge
         merge(kernel_out, kernel_gate, output_gate, out, kv_splits, wide=_strided_mtp_union)
     return out
 

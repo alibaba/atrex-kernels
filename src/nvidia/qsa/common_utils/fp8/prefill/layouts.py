@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.typing import BFloat16, Float32, Int32, Int64
+from cutlass.cute.typing import BFloat16, Float32, Int32
 
 from ... import qsa_sm_ptx
 
-from ....common_utils.device import DeviceHelpers, _elem_pointer, _shfl, _shfl32
+from ...device import DeviceHelpers, _elem_pointer, _shfl as _shfl, _shfl32 as _shfl32
 
 LOG2_E = 1.4426950408889634
 
@@ -107,49 +105,6 @@ class QSAForward(DeviceHelpers):
         self.copy_elems = 16
         self.gptr = 8
 
-    @cute.jit
-    def __call__(self, mQ, mK, mV, mWS, mCount, mRM, mTicket, mBT, mGate,
-                 mOut, softmax_scale: Float32, v_scale: Float32, nblocks: Int32, ncta: Int32,
-                 tbase: Int32, tmapK: Int64, tmapV: Int64, stream):
-        self.scale_log2 = softmax_scale * Float32(LOG2_E)
-        M, N, D = self.m_tile, self.n_tile, self.head_dim
-        qk_tiler = (M, N, D)
-        pv_tiler = (M, D, N)
-        qk_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype, self.dtype, tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K, self.acc, tcgen05.CtaGroup.ONE,
-            qk_tiler[:2], tcgen05.OperandSource.TMEM)
-        qk_sm_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype,self.dtype,tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,self.acc,tcgen05.CtaGroup.ONE,
-            qk_tiler[:2],tcgen05.OperandSource.SMEM)
-        # The PV A operand (P) is read from TMEM, aliasing the drained S stage.
-        pv_mma = sm100_utils.make_trivial_tiled_mma(
-            self.dtype, self.dtype, tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN, self.acc, tcgen05.CtaGroup.ONE,
-            pv_tiler[:2], tcgen05.OperandSource.TMEM)
-        # V5: the QK A operand (Q) is ALSO read from TMEM (its own resident
-        # column range), freeing the full 64KB sQ SMEM buffer for deeper K/V
-        # gather rings.  Q is refilled by the softmax warpgroup with LDG ->
-        # register -> tcgen05.st once per unit.
-        q_tmem_lay = sm100_utils.make_smem_layout_a(qk_mma, (M,N,D//2),
-                                                    self.dtype, 1)
-        q_smem_lay = sm100_utils.make_smem_layout_a(qk_sm_mma,(M,N,D),self.dtype,1)
-        k_lay = sm100_utils.make_smem_layout_b(qk_mma, qk_tiler, self.dtype,
-                                               self.k_stages)
-        v_lay = sm100_utils.make_smem_layout_b(pv_mma, pv_tiler, self.dtype,
-                                               self.v_stages)
-        # Single-stage P layout: the stage stride is applied by hand in the
-        # kernel, because make_smem_layout_a packs stages back-to-back (N/2
-        # columns apart) while the S/P ping-pong stages are N columns apart.
-        p_tmem_lay = sm100_utils.make_smem_layout_a(pv_mma, pv_tiler, self.dtype, 1)
-        self.atrex_qsa_sm103_attention(qk_mma, qk_sm_mma, pv_mma, q_tmem_lay, q_smem_lay, k_lay, v_lay, p_tmem_lay,
-                    mQ, mK, mV, mWS, mCount, mRM, mTicket, mBT, mGate, mOut,
-                    self.scale_log2, v_scale, nblocks, ncta, tbase, tmapK,
-                    tmapV).launch(
-            grid=(ncta, 1, 1), block=[self.threads, 1, 1],
-            cluster=(1, 1, 1), stream=stream, min_blocks_per_mp=1,
-            use_pdl=self.use_pdl)
 
 
     @cute.jit
