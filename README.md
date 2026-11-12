@@ -117,7 +117,8 @@ It consumes native four-token block IDs with BF16 or FP8 E4M3FN Q/K/V and BF16
 output. It supports D256, GQA ratios 8/12, one or two KV heads, page sizes that
 are positive multiples of 16, ragged prefill, and Q1/Q4 decode. Warmed Q1/Q4 calls
 support CUDA Graph replay with a preallocated output. Dispatch is static and
-compilation is lazy; CUDA 13+ and CuTeDSL 4.6–4.8 are required (validated on 4.8.1).
+compilation is lazy. The validated environment uses CUDA 13+, CuTeDSL 4.6.2
+and TVM-FFI 0.1.12, matching the declared package dependencies.
 
 See the [QSA guide](src/nvidia/qsa/sm103/DESIGN.md) for tensor layouts, FP8 scales,
 capacity and numerical limits, [tests](op_test/nvidia/qsa/README.md) for

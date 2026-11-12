@@ -2,7 +2,7 @@
 
 `atrex.qsa_compact` 在 NVIDIA SM100 / SM103 上提供分页稀疏 GQA attention，
 直接接收四-token block IDs，并融合 sigmoid gate。BF16 与 FP8 共用接口；gate 和输出均为 BF16。
-使用 CUDA 13+ 和 CuTeDSL 4.8.1；完整依赖与安装命令见测试说明。
+使用 CUDA 13+、CuTeDSL 4.6.2 和 TVM-FFI 0.1.12；完整依赖与安装命令见测试说明。
 
 | 架构 | Prefill / ragged batched prefill | Q1 decode / Q4 MTP | CUDA Graph |
 |---|---|---|---|

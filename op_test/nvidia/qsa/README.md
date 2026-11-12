@@ -1,17 +1,27 @@
 # NVIDIA QSA tests
 
 The public contract is documented in the [QSA guide](../../../src/nvidia/qsa/sm103/DESIGN.md).
-Each target has one entry: `test_qsa_sm100.py` or `test_qsa_sm103.py`.
+Each target has one self-contained test file: `test_qsa_sm100.py` or
+`test_qsa_sm103.py`, including its reference, profiler and performance CLI.
 Tests require an installed ATREX wheel, CUDA 13+, PyTorch, Triton,
-CuTeDSL (validated with 4.8.1), TVM-FFI, pytest and Nsight Systems.
+CuTeDSL 4.6.2, TVM-FFI >=0.1.12,<0.2, pytest and Nsight Systems.
+Validation uses TVM-FFI 0.1.12.
 
 ```bash
 python -m pip wheel --no-deps . -w /tmp/qsa-wheels
-python -m pip install --no-deps /path/to/atrex.whl
+python -m pip install /path/to/atrex.whl pytest
+python -m pip check
 python -m pytest -q -s op_test/nvidia/qsa/test_qsa_sm103.py
 ```
 
 Replace `sm103` with `sm100` for that target. Source-tree imports are rejected.
+On SM103, Triton's `ptxas` must support `sm_103a`. With Triton 3.5, select a
+CUDA 13.1 toolkit assembler if the bundled assembler lacks that target:
+
+```bash
+export TRITON_PTXAS_PATH=/usr/local/cuda-13.1/bin/ptxas
+```
+
 The suite covers eager prefill, Q1/Q4 graph replay, metadata updates, empty
 request slots, page boundaries, GQA 8/12, strided inputs, scales, alias checks,
 prewarm requirements, stream independence, input lifetime and real kernel names.
