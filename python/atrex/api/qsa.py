@@ -1,4 +1,4 @@
-"""Native four-token-block sparse attention; no token-index expansion."""
+"""Public QSA contracts with lazy, architecture-specific dispatch."""
 from __future__ import annotations
 
 from atrex.utils.device_target import detect_device_target

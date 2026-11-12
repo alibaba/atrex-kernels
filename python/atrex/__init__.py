@@ -74,7 +74,7 @@ flash_attn_varlen_func = _lazy_import_and_call(
 
 qsa_compact = _lazy_import_and_call(
     "qsa_compact",
-    "atrex.api.qsa_compact",
+    "atrex.api.qsa",
 )
 
 __all__ = (

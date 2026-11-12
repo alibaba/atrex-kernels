@@ -33,6 +33,7 @@ Run the same eight cases against both wheels:
 ```bash
 python op_test/nvidia/qsa/test_qsa_sm103.py --regression \
   --baseline-root /tmp/qsa-baseline --current-root /tmp/qsa-current \
+  --baseline-revision BASELINE_COMMIT --current-revision CANDIDATE_COMMIT \
   --output /tmp/qsa-regression.json
 ```
 

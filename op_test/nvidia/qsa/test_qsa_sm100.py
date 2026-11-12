@@ -45,6 +45,15 @@ def test_invalid_pages(api):
     contract.negative_pages(api)
 
 
+@pytest.mark.parametrize(
+    "family,arch,runtime_version",
+    [("cpu", "cpu", None), ("nvidia", "sm90", "13.0"),
+     ("nvidia", "sm100", "12.9"), ("nvidia", "sm103", None)],
+)
+def test_unsupported_target(api, monkeypatch, family, arch, runtime_version):
+    contract.unsupported_target(api, monkeypatch, family, arch, runtime_version)
+
+
 def test_negative_contract_and_capture(api):
     contract.negative_contract_and_capture(api)
 

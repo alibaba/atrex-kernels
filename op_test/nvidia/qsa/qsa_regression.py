@@ -51,10 +51,14 @@ class WheelAPI:
             sys.path.remove(str(self.root))
 
 
-def identity(root):
+def identity(root, revision):
     root = Path(root).resolve()
+    # Baselines before the API module rename still expose the same public API.
+    api = root / "atrex/api/qsa.py"
+    if not api.is_file():
+        api = root / "atrex/api/qsa_compact.py"
     paths = [
-        root / "atrex/api/qsa_compact.py",
+        api,
         *sorted((root / "atrex/src/nvidia/qsa").rglob("*.py")),
     ]
     assert len(paths) > 1 and all(p.is_file() for p in paths), root
@@ -63,6 +67,7 @@ def identity(root):
         for p in paths
     }
     return dict(
+        revision=revision,
         root=str(root),
         source_digest=hashlib.sha256(
             json.dumps(hashes, sort_keys=True).encode()
@@ -114,6 +119,8 @@ def main(architecture):
     parser.add_argument("--regression", action="store_true", required=True)
     parser.add_argument("--current-root", type=Path, required=True)
     parser.add_argument("--baseline-root", type=Path, required=True)
+    parser.add_argument("--baseline-revision", required=True)
+    parser.add_argument("--current-revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", default="all")
     parser.add_argument("--reverse-capture", action="store_true")
@@ -139,7 +146,8 @@ def main(architecture):
     report = dict(
         architecture=architecture,
         device=str(torch.cuda.get_device_properties(0)),
-        packages={n: identity(root) for n, root in roots.items()},
+        packages={n: identity(root, getattr(args, f"{n}_revision"))
+                  for n, root in roots.items()},
         versions={
             n: importlib.metadata.version(n)
             for n in ("torch", "triton", "nvidia-cutlass-dsl", "apache-tvm-ffi")

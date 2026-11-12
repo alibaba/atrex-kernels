@@ -493,6 +493,24 @@ def boundaries_and_metadata_refresh(api, page, ratio, dtype):
             assert stats["relative_l2"] < 0.035, stats
 
 
+def unsupported_target(api, monkeypatch, family, arch, runtime_version):
+    """Reject unsupported targets before compiler checks or device launches."""
+    import importlib
+    from types import SimpleNamespace
+
+    module = importlib.import_module("atrex.api.qsa")
+    target = SimpleNamespace(family=family, arch=arch, runtime_version=runtime_version)
+    monkeypatch.setattr(module, "detect_device_target", lambda device: target)
+
+    def unexpected_compile():
+        pytest.fail("unsupported targets must be rejected before compiler checks")
+
+    monkeypatch.setattr(module, "_check_compiler", unexpected_compile)
+    message = "CUDA 13" if arch in ("sm100", "sm103") else "NVIDIA SM100/SM103"
+    with pytest.raises(NotImplementedError, match=message):
+        api(torch.empty(1), None, None, None, None, None, None, False, None)
+
+
 def negative_contract_and_capture(api):
     d = small_case()
     with pytest.raises(ValueError, match="share storage"):
@@ -674,7 +692,7 @@ def sm103_dispatch_preserved(api, monkeypatch):
     from types import SimpleNamespace
 
     d = small_case()
-    module = importlib.import_module("atrex.api.qsa_compact")
+    module = importlib.import_module("atrex.api.qsa")
     legacy = importlib.import_module("atrex.src.nvidia.qsa.sm103.runtime")
     sentinel = object()
     monkeypatch.setattr(
