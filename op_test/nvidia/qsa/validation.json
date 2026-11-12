@@ -1,10 +1,20 @@
 {
-  "scope": "Installed-wheel basic contract and eight-case paired regression; CUDA 13, CuTeDSL 4.8.1",
+  "baseline_revision": "a2560d735d908f9b2c77f38781537764e8505d43",
+  "candidate_revision": "4a11d4df2370ee95379bacd2ef65e10a6e46cbdb",
+  "scope": "Installed-wheel contract and eight-case paired regression; CUDA 13, CuTeDSL 4.8.1",
   "test_sha256": {
-    "qsa_contract.py": "9a8da1956a5f4d41b0368f878595877d6ce16b1bf1c885326db8743ec2bbe364",
-    "qsa_regression.py": "0eb0c3d1221114ab05a24f67966cb71a7fac478dc92c4a648aa4da0b56c129ec",
-    "test_qsa_sm100.py": "28de4b0f3a81ee39ad7cf858220e846876049ea48390cffac473cba36c8f2414",
-    "test_qsa_sm103.py": "38da5d571ebca633a32d9a77c7ac2e771ea3ec485d271e1566b712da88a81e38"
+    "qsa_contract.py": "fd90bc5274f20e7401fd80f354057fdba901259d28b4bf8d64e4892841a3720d",
+    "qsa_regression.py": "67bdda554341dd2e2653843c3275803ad0e96401b7654d9e6831e6bdd1d2185a",
+    "test_qsa_sm100.py": "961f9a36251623c424073eab469b587d5f7593e4339014ae287263c0bfc4202c",
+    "test_qsa_sm103.py": "39405865595dc0d3bdccf56baca55e42a92e8298072108eaa49f3a8c60450251"
+  },
+  "measurement": {
+    "samples": 50,
+    "order": "per-sample alternating",
+    "cold_flush_bytes": 268435456,
+    "decode": "CUDA Graph replay",
+    "prefill": "eager CUDA Events",
+    "compilation_and_warmup": "excluded"
   },
   "numerical_checks": {
     "strict_atol": 0.003,
@@ -12,12 +22,13 @@
     "random_fp8_fixture_relative_l2_limit": 0.035,
     "paired_relative_l2_growth_limit": 0.01
   },
+  "latency_columns": ["case", "page", "dtype", "mode", "measurement", "baseline_us", "candidate_us", "change_pct"],
   "targets": [
     {
       "architecture": "sm100",
       "sms": 148,
       "tests": {
-        "tests": 29,
+        "tests": 33,
         "failures": 0,
         "errors": 0,
         "skipped": 0
@@ -35,27 +46,37 @@
         "baseline": 8,
         "current": 8
       },
-      "maximum_latency_increase_pct": {
-        "warm": 0.115,
-        "cold_l2": 0.666,
-        "eager": -0.547
-      },
       "kernel_events": 12,
       "all_kernel_names_have_atrex_prefix": true,
-      "regression_report_sha256": "e4b7100f6754e44362ac0fd5a4ad034579383dac619aa9ab339c78efd546a4bf"
+      "latencies": [
+        [0, 128, "bf16", "q1", "warm", 13.312, 12.768, -4.0865],
+        [0, 128, "bf16", "q1", "cold_l2", 15.136, 14.912, -1.4799],
+        [1, 128, "fp8", "q1", "warm", 13.232, 13.536, 2.2975],
+        [1, 128, "fp8", "q1", "cold_l2", 15.344, 15.376, 0.2085],
+        [2, 1056, "bf16", "q4", "warm", 24.256, 24.08, -0.7256],
+        [2, 1056, "bf16", "q4", "cold_l2", 28.288, 28.24, -0.1697],
+        [3, 1056, "fp8", "q4", "warm", 31.168, 30.992, -0.5647],
+        [3, 1056, "fp8", "q4", "cold_l2", 34.368, 34.224, -0.419],
+        [4, 2112, "bf16", "q4_union", "warm", 70.976, 70.736, -0.3381],
+        [4, 2112, "bf16", "q4_union", "cold_l2", 76.912, 77.056, 0.1872],
+        [5, 2112, "fp8", "q4_union", "warm", 54.848, 54.832, -0.0292],
+        [5, 2112, "fp8", "q4_union", "cold_l2", 59.136, 59.296, 0.2706],
+        [6, 16, "bf16", "prefill", "eager", 78.368, 79.536, 1.4904],
+        [7, 16, "fp8", "prefill", "eager", 79.904, 80.912, 1.2615]
+      ]
     },
     {
       "architecture": "sm103",
-      "sms": 152,
+      "sms": 148,
       "tests": {
-        "tests": 29,
+        "tests": 33,
         "failures": 0,
         "errors": 0,
         "skipped": 0
       },
       "dependencies": {
-        "torch": "2.11.0a0+a6c236b9fd.nv26.3.46836102",
-        "triton": "3.6.0",
+        "torch": "2.9.0+cu130",
+        "triton": "3.7.1",
         "nvidia-cutlass-dsl": "4.8.1",
         "apache-tvm-ffi": "0.1.11"
       },
@@ -66,16 +87,24 @@
         "baseline": 8,
         "current": 8
       },
-      "maximum_latency_increase_pct": {
-        "warm": 1.167,
-        "cold_l2": 1.282,
-        "eager": 0.9
-      },
       "kernel_events": 12,
       "all_kernel_names_have_atrex_prefix": true,
-      "regression_report_sha256": "c013882c7b0b21c9e31496a41c2ebd83ec2f0256e7d3de800bd0809497e538c6"
+      "latencies": [
+        [0, 128, "bf16", "q1", "warm", 13.056, 13.168, 0.8578],
+        [0, 128, "bf16", "q1", "cold_l2", 14.24, 14.256, 0.1124],
+        [1, 128, "fp8", "q1", "warm", 12.576, 12.672, 0.7634],
+        [1, 128, "fp8", "q1", "cold_l2", 14.192, 14.176, -0.1127],
+        [2, 1056, "bf16", "q4", "warm", 22.656, 22.56, -0.4237],
+        [2, 1056, "bf16", "q4", "cold_l2", 26.096, 26.064, -0.1226],
+        [3, 1056, "fp8", "q4", "warm", 30.576, 30.592, 0.0523],
+        [3, 1056, "fp8", "q4", "cold_l2", 33.696, 33.76, 0.1899],
+        [4, 2112, "bf16", "q4_union", "warm", 67.264, 66.656, -0.9039],
+        [4, 2112, "bf16", "q4_union", "cold_l2", 75.232, 75.152, -0.1063],
+        [5, 2112, "fp8", "q4_union", "warm", 53.056, 53.248, 0.3619],
+        [5, 2112, "fp8", "q4_union", "cold_l2", 58.544, 58.608, 0.1093],
+        [6, 16, "bf16", "prefill", "eager", 51.568, 51.616, 0.0931],
+        [7, 16, "fp8", "prefill", "eager", 51.648, 51.888, 0.4647]
+      ]
     }
-  ],
-  "baseline_source_digest": "067a1f257edba706d1a4c562dd5cd098fc2fab8c8156c31767b0ba817f578ba5",
-  "current_source_digest": "3d4a356d9c1f0abb873ef1a21a488f06cf6803cc56eb050e30b9fca4a94b1a1c"
+  ]
 }

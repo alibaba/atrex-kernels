@@ -113,12 +113,13 @@ graph.replay()
 Graph 固定 GPU 操作、地址和标量参数。输入、输出和 KV 存储须保持存活且地址稳定；
 内容可以原地更新。更换 shape、布局或 FP8 scale 值需要重新 capture。
 调用者负责跨 stream 依赖；共享 graph pool 时遵守 PyTorch 的执行顺序要求。
-完整 vLLM backend 接入和模型端到端吞吐尚未验证。
+框架接入须遵守上述输入、scale 和存储生命周期约定。
 
 ## 实现与静态 dispatch
 
-Prefill 和 decode/MTP 分别按架构与 dtype 选择实现。公共 BF16 decode、
-容量检查、scale 和 host helper 位于 `common_utils`。
+Prefill 和 decode/MTP 分别按架构与 dtype 选择实现。共用的布局、metadata、
+加载/MMA 逻辑、merge 和 host helper 位于 `common_utils`；架构专属的
+kernel 入口与 softmax 位于 `sm100` / `sm103`。SM103 的 `ld.red` 不进入公共基类。
 Decode 的规则优先级为：serving/148-SM 专用规则、标准布局弱区规则、
 FP8 Q4 区间表、架构默认公式。规则仅读取张量元信息，不读取 GPU 长度或在线测速。
 B 表示包含 padding 的分配槽位；未命中精细规则的输入继续使用通用配置。
