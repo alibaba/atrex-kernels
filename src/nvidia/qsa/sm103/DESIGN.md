@@ -2,7 +2,7 @@
 
 `atrex.qsa_compact` 在 NVIDIA SM100 / SM103 上提供分页稀疏 GQA attention，
 直接接收四-token block IDs，并融合 sigmoid gate。BF16 与 FP8 共用接口；gate 和输出均为 BF16。
-使用 CUDA 13+、CuTeDSL 4.6.2 和 TVM-FFI 0.1.12；完整依赖与安装命令见测试说明。
+使用 CUDA 13+、CuTeDSL 4.6.2 和 TVM-FFI 0.1.12；安装命令见仓库[构建说明](../../../../README.md#build)。
 
 | 架构 | Prefill / ragged batched prefill | Q1 decode / Q4 MTP | CUDA Graph |
 |---|---|---|---|
@@ -129,8 +129,7 @@ K/V 元素 stride 为 `(18*S*512,512,512,1)`，其余张量连续且满足对齐
 其他精细规则限定标准连续布局与 152 SM。具体边界以
 [`decode_dispatch.py`](../common_utils/decode_dispatch.py) 和
 [`decode_intervals.py`](../common_utils/decode_intervals.py) 为准。
-规则不保证任意 KV 分布都达到逐 case 最优；实测范围见
-[测试说明](../../../../op_test/nvidia/qsa/README.md)。
+规则不保证任意 KV 分布都达到逐 case 最优。
 
 ## 精度与已知限制
 
@@ -141,9 +140,8 @@ FP8 概率量化和归约引入额外误差，部分输入不满足该标准。
 测试同时记录 relative L2、最大绝对误差、超差元素数及基线配对差异。
 Q4 不保证逐位确定性。精度结论限已测分布，不包含输入 FP8 量化损失或模型端到端质量。
 
-## 测试与复现
+## 测试
 
 [test_qsa_sm100.py](../../../../op_test/nvidia/qsa/test_qsa_sm100.py) 和
 [test_qsa_sm103.py](../../../../op_test/nvidia/qsa/test_qsa_sm103.py) 分别覆盖对应架构的
 BF16/FP8 prefill、decode/MTP、页表与布局边界、跨 stream 及 Q1/Q4 Graph。
-环境准备与基本回归命令见 [测试说明](../../../../op_test/nvidia/qsa/README.md)。

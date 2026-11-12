@@ -121,8 +121,9 @@ compilation is lazy. The validated environment uses CUDA 13+, CuTeDSL 4.6.2
 and TVM-FFI 0.1.12, matching the declared package dependencies.
 
 See the [QSA guide](src/nvidia/qsa/sm103/DESIGN.md) for tensor layouts, FP8 scales,
-capacity and numerical limits, [tests](op_test/nvidia/qsa/README.md) for
-reproduction, and [validation](op_test/nvidia/qsa/validation.json) for the validation summary.
+capacity and numerical limits, and the
+[SM100](op_test/nvidia/qsa/test_qsa_sm100.py) and
+[SM103](op_test/nvidia/qsa/test_qsa_sm103.py) tests for validation.
 
 ## Build
 
