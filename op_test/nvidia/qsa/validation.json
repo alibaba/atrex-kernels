@@ -1,12 +1,10 @@
 {
   "baseline_revision": "a2560d735d908f9b2c77f38781537764e8505d43",
-  "candidate_revision": "4a11d4df2370ee95379bacd2ef65e10a6e46cbdb",
-  "scope": "Installed-wheel contract and eight-case paired regression; CUDA 13, CuTeDSL 4.8.1",
+  "candidate_revision": "e980520dd35df9fa59979e1d7fa7ca6ba37408d6",
+  "scope": "Installed-wheel contract and eight-case paired regression; CUDA 13, CuTeDSL 4.6.2",
   "test_sha256": {
-    "qsa_contract.py": "fd90bc5274f20e7401fd80f354057fdba901259d28b4bf8d64e4892841a3720d",
-    "qsa_regression.py": "67bdda554341dd2e2653843c3275803ad0e96401b7654d9e6831e6bdd1d2185a",
-    "test_qsa_sm100.py": "961f9a36251623c424073eab469b587d5f7593e4339014ae287263c0bfc4202c",
-    "test_qsa_sm103.py": "39405865595dc0d3bdccf56baca55e42a92e8298072108eaa49f3a8c60450251"
+    "test_qsa_sm100.py": "ac4a90008a837c6b204f363eb34fba1349838567099b4549743dc79000c0c083",
+    "test_qsa_sm103.py": "3a7e7a4a6ed1e02c7e474d2a07c3f3b6acf40e5e990928d8eef112e7fe627dc4"
   },
   "measurement": {
     "samples": 50,
@@ -35,10 +33,13 @@
       },
       "dependencies": {
         "torch": "2.9.0+cu130",
-        "triton": "3.7.1",
-        "nvidia-cutlass-dsl": "4.8.1",
-        "apache-tvm-ffi": "0.1.11"
+        "triton": "3.5.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "apache-tvm-ffi": "0.1.12"
       },
+      "declared_dependencies_satisfied": true,
+      "pip_check_passed": true,
+      "triton_ptxas": "CUDA 13.1.115",
       "paired_cases": 8,
       "paired_accuracy_checks": 16,
       "new_strict_reference_failures": 0,
@@ -49,20 +50,20 @@
       "kernel_events": 12,
       "all_kernel_names_have_atrex_prefix": true,
       "latencies": [
-        [0, 128, "bf16", "q1", "warm", 13.312, 12.768, -4.0865],
-        [0, 128, "bf16", "q1", "cold_l2", 15.136, 14.912, -1.4799],
-        [1, 128, "fp8", "q1", "warm", 13.232, 13.536, 2.2975],
-        [1, 128, "fp8", "q1", "cold_l2", 15.344, 15.376, 0.2085],
-        [2, 1056, "bf16", "q4", "warm", 24.256, 24.08, -0.7256],
-        [2, 1056, "bf16", "q4", "cold_l2", 28.288, 28.24, -0.1697],
-        [3, 1056, "fp8", "q4", "warm", 31.168, 30.992, -0.5647],
-        [3, 1056, "fp8", "q4", "cold_l2", 34.368, 34.224, -0.419],
-        [4, 2112, "bf16", "q4_union", "warm", 70.976, 70.736, -0.3381],
-        [4, 2112, "bf16", "q4_union", "cold_l2", 76.912, 77.056, 0.1872],
-        [5, 2112, "fp8", "q4_union", "warm", 54.848, 54.832, -0.0292],
-        [5, 2112, "fp8", "q4_union", "cold_l2", 59.136, 59.296, 0.2706],
-        [6, 16, "bf16", "prefill", "eager", 78.368, 79.536, 1.4904],
-        [7, 16, "fp8", "prefill", "eager", 79.904, 80.912, 1.2615]
+        [0, 128, "bf16", "q1", "warm", 13.552, 13.36, -1.4168],
+        [0, 128, "bf16", "q1", "cold_l2", 15.344, 15.248, -0.6257],
+        [1, 128, "fp8", "q1", "warm", 13.44, 13.408, -0.2381],
+        [1, 128, "fp8", "q1", "cold_l2", 15.136, 15.216, 0.5285],
+        [2, 1056, "bf16", "q4", "warm", 23.584, 23.776, 0.8141],
+        [2, 1056, "bf16", "q4", "cold_l2", 27.456, 27.632, 0.641],
+        [3, 1056, "fp8", "q4", "warm", 31.872, 31.744, -0.4016],
+        [3, 1056, "fp8", "q4", "cold_l2", 34.176, 34.08, -0.2809],
+        [4, 2112, "bf16", "q4_union", "warm", 68.768, 68.448, -0.4653],
+        [4, 2112, "bf16", "q4_union", "cold_l2", 76.704, 76.64, -0.0834],
+        [5, 2112, "fp8", "q4_union", "warm", 54.592, 54.592, 0.0],
+        [5, 2112, "fp8", "q4_union", "cold_l2", 60.448, 60.288, -0.2647],
+        [6, 16, "bf16", "prefill", "eager", 80.32, 75.216, -6.3546],
+        [7, 16, "fp8", "prefill", "eager", 76.208, 76.816, 0.7978]
       ]
     },
     {
@@ -76,10 +77,13 @@
       },
       "dependencies": {
         "torch": "2.9.0+cu130",
-        "triton": "3.7.1",
-        "nvidia-cutlass-dsl": "4.8.1",
-        "apache-tvm-ffi": "0.1.11"
+        "triton": "3.5.0",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "apache-tvm-ffi": "0.1.12"
       },
+      "declared_dependencies_satisfied": true,
+      "pip_check_passed": true,
+      "triton_ptxas": "CUDA 13.1.115",
       "paired_cases": 8,
       "paired_accuracy_checks": 16,
       "new_strict_reference_failures": 0,
@@ -90,20 +94,20 @@
       "kernel_events": 12,
       "all_kernel_names_have_atrex_prefix": true,
       "latencies": [
-        [0, 128, "bf16", "q1", "warm", 13.056, 13.168, 0.8578],
-        [0, 128, "bf16", "q1", "cold_l2", 14.24, 14.256, 0.1124],
-        [1, 128, "fp8", "q1", "warm", 12.576, 12.672, 0.7634],
-        [1, 128, "fp8", "q1", "cold_l2", 14.192, 14.176, -0.1127],
-        [2, 1056, "bf16", "q4", "warm", 22.656, 22.56, -0.4237],
-        [2, 1056, "bf16", "q4", "cold_l2", 26.096, 26.064, -0.1226],
-        [3, 1056, "fp8", "q4", "warm", 30.576, 30.592, 0.0523],
-        [3, 1056, "fp8", "q4", "cold_l2", 33.696, 33.76, 0.1899],
-        [4, 2112, "bf16", "q4_union", "warm", 67.264, 66.656, -0.9039],
-        [4, 2112, "bf16", "q4_union", "cold_l2", 75.232, 75.152, -0.1063],
-        [5, 2112, "fp8", "q4_union", "warm", 53.056, 53.248, 0.3619],
-        [5, 2112, "fp8", "q4_union", "cold_l2", 58.544, 58.608, 0.1093],
-        [6, 16, "bf16", "prefill", "eager", 51.568, 51.616, 0.0931],
-        [7, 16, "fp8", "prefill", "eager", 51.648, 51.888, 0.4647]
+        [0, 128, "bf16", "q1", "warm", 12.624, 12.64, 0.1267],
+        [0, 128, "bf16", "q1", "cold_l2", 14.4, 14.448, 0.3333],
+        [1, 128, "fp8", "q1", "warm", 12.528, 12.704, 1.4049],
+        [1, 128, "fp8", "q1", "cold_l2", 14.448, 14.512, 0.443],
+        [2, 1056, "bf16", "q4", "warm", 22.656, 22.768, 0.4944],
+        [2, 1056, "bf16", "q4", "cold_l2", 26.208, 26.096, -0.4274],
+        [3, 1056, "fp8", "q4", "warm", 30.32, 29.648, -2.2164],
+        [3, 1056, "fp8", "q4", "cold_l2", 32.816, 32.72, -0.2925],
+        [4, 2112, "bf16", "q4_union", "warm", 67.168, 66.736, -0.6432],
+        [4, 2112, "bf16", "q4_union", "cold_l2", 75.552, 75.568, 0.0212],
+        [5, 2112, "fp8", "q4_union", "warm", 53.264, 53.424, 0.3004],
+        [5, 2112, "fp8", "q4_union", "cold_l2", 58.432, 58.336, -0.1643],
+        [6, 16, "bf16", "prefill", "eager", 49.328, 49.12, -0.4217],
+        [7, 16, "fp8", "prefill", "eager", 49.856, 50.304, 0.8986]
       ]
     }
   ]
