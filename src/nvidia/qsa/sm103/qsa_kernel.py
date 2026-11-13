@@ -138,7 +138,7 @@ class QSAForward(Shared):
             scratch=cute.make_tensor(cute.make_ptr(Int32,sK.iterator.toint(),cute.AddressSpace.smem,assumed_align=16),cute.make_layout((8192,)))
             block=self._unit_blk(Int32(cta),nblocks,mCount)
             mWS,mCount,mRM=build_union_metadata(mWS,mCount,mRM,mBT,mK,meta,scratch,tidx,block,
-                self.local_entries,self.RB,self.page_size,self.metadata_request_span,self.union_hash_mix,self.union_full_first,self.union_physical,deterministic=self.deterministic_union)
+                self.local_entries,self.RB,self.page_size,self.metadata_request_span,self.union_hash_mix,self.union_full_first,self.union_physical,deterministic=self.deterministic_union,grouped_insert=getattr(self,"grouped_union",False),hash_shift=6 if self.group == 16 else 12)
         sG = None
         if cutlass.const_expr(self.decode_gate):
             sG=smem.allocate_tensor(self.dtype,cute.make_layout((4096,)),128)

@@ -15,7 +15,7 @@ def _standard_layout(q, k, v, ids, pos, table, req, gate, out):
             and k.stride(0) % 64 == 0 and k.stride(1) % 64 == 0)
 
 
-def _serving_layout(q, k, v, ids, pos, table, req, gate, out):
+def _serving_layout(q, k, v, ids, pos, table, req, gate, out, *, layers=18):
     """Aligned 18-layer serving strides; selection does not depend on aliasing.
 
     Every selected property is already part of the static launch signature.
@@ -23,14 +23,32 @@ def _serving_layout(q, k, v, ids, pos, table, req, gate, out):
     """
     if k.shape != v.shape or k.shape[-2:] != (1, 256) or q.shape[-1] != 256:
         return False
-    expected = (18 * k.shape[1] * 512, 512, 512, 1)
+    expected = (layers * k.shape[1] * 512, 512, 512, 1)
     return (k.stride() == v.stride() == expected
             and all(t.is_contiguous() for t in (q, ids, pos, table, req, gate, out))
             and all(t.data_ptr() % 32 == 0 for t in (q, k, v, gate, out)))
 
 
 def _select_decode_config(rows, requests, hkv, group, selected_blocks, sms,
-                          fp8, *, sm100, page, standard_layout, serving_layout=False):
+                          fp8, *, sm100, page, standard_layout, serving_layout=False,
+                          single_layer_layout=False, kv_capacity=0):
+    if (group == 16 and hkv == 1 and sms in (148, 152)
+            and selected_blocks == 512 and 1 <= requests <= 128
+            and page in (128, 1056, 2112)
+            and (standard_layout or serving_layout or single_layer_layout)):
+        if rows == requests:
+            if fp8 and sm100 and 64 <= requests <= 72 and 0 < kv_capacity <= 2112:
+                return 1, 1
+        elif rows == 4 * requests:
+            if fp8 and 32 <= requests <= 40:
+                return (1, 1) if 4 * requests <= sms else (2, 1)
+            if not fp8 and page == 128 and 48 <= requests <= sms // 2:
+                return 4, (3 if 3 * requests <= sms else 2)
+            if not fp8 and 48 <= requests <= 64:
+                return 2, 1
+            if requests > sms // 2:
+                return 4, 1
+        return None
     if ((serving_layout or (standard_layout and sms == 148))
             and sms in (148, 152) and selected_blocks == 512
             and group == 8 and hkv == 1 and rows == 4 * requests

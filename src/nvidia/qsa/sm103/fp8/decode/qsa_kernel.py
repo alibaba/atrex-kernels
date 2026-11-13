@@ -138,8 +138,11 @@ class QSAForward(Shared):
             scratch=cute.make_tensor(cute.make_ptr(Int32,sK.iterator.toint(),cute.AddressSpace.smem,assumed_align=16),cute.make_layout((8192,)))
             block=self._unit_blk(Int32(cta),nblocks,mCount)
             mWS,mCount,mRM=build_union_metadata(mWS,mCount,mRM,mBT,mK,meta,scratch,tidx,block,
-                self.local_entries,self.RB,self.page_size,self.metadata_request_span,self.union_hash_mix,self.union_full_first,self.union_physical,self.br)
+                self.local_entries,self.RB,self.page_size,self.metadata_request_span,self.union_hash_mix,self.union_full_first,self.union_physical,self.br,
+                direct_masks=self.group == 16 and getattr(self, "grouped_union", False), grouped_insert=getattr(self, "grouped_union", False))
         sG = None
+        if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+            sG = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=128), cute.make_layout((16384,)))
         if cutlass.const_expr(self.decode_gate):
             if cutlass.const_expr(self.gate_factor):
                 sG=smem.allocate_tensor(Float32,cute.make_layout((256*self.br*self.group,)),128)
@@ -180,6 +183,8 @@ class QSAForward(Shared):
             cute.arch.mbarrier_init(unit_taken, 32 * self.take_warps)
             if cutlass.const_expr(self.decode_gate):
                 cute.arch.mbarrier_init(gstaged,32*(4-self.live_softmax_warps))
+            if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                cute.arch.mbarrier_init(gstaged, 64)
             cute.arch.mbarrier_init_fence()
 
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads)
@@ -304,6 +309,8 @@ class QSAForward(Shared):
                                   nblocks, page, D, Int64(0), st1b, kfull,
                                   kfree, kst, lane, maxe, etile, False,
                                   0, self.k_load_warps, tmapK)
+                if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                    self._stage_q4_gate(mGate, sG, mCount, Int32(cta), nblocks, sfull, gstaged, lane)
             elif warp_idx == self.VLOAD_WARP:
                 self._gather_role(mK, sV, kvgcopy, kvgthr, mWS, mBT, mCount,
                                   unit_posted, unit_taken, sUnit, total_units,
@@ -317,6 +324,8 @@ class QSAForward(Shared):
                                   total_units, nblocks, page, D, Int64(0),
                                   st1b, kfull, kfree, kst, lane, maxe,
                                   etile, False, 1, self.k_load_warps)
+                if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                    self._stage_q4_gate(mGate, sG, mCount, Int32(cta), nblocks, sfull, gstaged, lane + 32)
             elif warp_idx == self.VLOAD_WARP2:
                 # gw=4 only: the second V-ring half
                 if cutlass.const_expr(self.gwr == 2):

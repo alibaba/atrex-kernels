@@ -113,7 +113,7 @@ class QSAForward(DeviceHelpers):
             cute.AddressSpace.tmem,assumed_align=16)
         r=cute.make_rmem_tensor((32,),self.acc)
         rg=cute.make_rmem_tensor((32,),Float32 if self.gate_factor else BFloat16);rw=cute.make_rmem_tensor((32,),BFloat16)
-        if cutlass.const_expr(self.decode_gate):self._mwait(gstaged,0)
+        if cutlass.const_expr(self.decode_gate or getattr(self, "q4_gate_stage", False)):self._mwait(gstaged,0)
         for chunk in cutlass.range_constexpr(4):
             qsa_sm_ptx.split_load(Int32((ptr+chunk*32).toint()),r,32,128)
             cute.arch.fence_view_async_tmem_load()
@@ -121,7 +121,7 @@ class QSAForward(DeviceHelpers):
                 row=row0+L//group;head=kvh*group+L%group;col=(sg%32//16)*128+chunk*32
                 gp=cute.make_ptr(BFloat16,_elem_pointer(mGate,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
                 op=cute.make_ptr(BFloat16,_elem_pointer(mOut,(row,head,col)).toint(),cute.AddressSpace.gmem,assumed_align=32)
-                if cutlass.const_expr(self.decode_gate):
+                if cutlass.const_expr(self.decode_gate or getattr(self, "q4_gate_stage", False)):
                     for part in cutlass.range_constexpr(4):
                         gate_warp = 0 if cutlass.const_expr(self.br==1) else sg//32
                         if cutlass.const_expr(self.gate_factor):

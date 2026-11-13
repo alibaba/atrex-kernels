@@ -8,7 +8,8 @@ from . import qsa_sm_ptx
 
 
 class QSAForward(M128):
-    def __init__(self,*args,decode_reuse_v=False,address_hoist=False,**kwargs):
+    def __init__(self,*args,decode_reuse_v=False,address_hoist=False,grouped_union=False,**kwargs):
+        self.grouped_union=grouped_union
         kwargs['m_tile']=64
         super().__init__(*args,**kwargs)
         assert self.br in (1,4) and self.br*self.group<=64 and self.kv_splits>=1 and self.gw==2

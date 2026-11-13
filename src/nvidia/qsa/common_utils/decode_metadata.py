@@ -33,7 +33,7 @@ def build_decode_metadata(mIds,mPos,mReq,mBT,mK,meta,tidx,blk,unit,nblocks,
     tail_safe=cutlass.min(cutlass.max(tail_page,Int32(0)),width-1)
     tail_pp=Int32(mBT[0,page_bias+tail_safe])
     tail_live=Int32((tail_count>0)&(tail_id>=0)&request_valid&(tail_page>=0)&(tail_page<width)&(tail_pp>=0)&(tail_pp<pages))
-    total=complete+tail_live
+    total=cutlass.select_(request_valid,complete+tail_live,Int32(0))
     tiles=(total+23)//24;chunk=(tiles+splits-1)//splits
     begin=(unit%splits)*chunk*24
     count=cutlass.max(cutlass.min(total-begin,chunk*24),Int32(0))

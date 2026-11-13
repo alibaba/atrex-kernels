@@ -362,7 +362,7 @@ def negative_pages(api):
 
 def small_case(page=128, ratio=8, rows=65):
     torch.manual_seed(100000 + page + ratio)
-    hkv = 1 if ratio == 8 else 2
+    hkv = 2 if ratio == 12 else 1
     npages = (4096 + page - 1) // page
     k = torch.randn((3 * npages, page, hkv, 256), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -1068,7 +1068,7 @@ def api():
 
 
 @pytest.mark.parametrize(
-    "page,ratio", [(16, 8), (128, 8), (256, 12), (1056, 12), (2112, 8)]
+    "page,ratio", [(16, 8), (128, 8), (256, 12), (1056, 12), (2112, 8), (1056, 16)]
 )
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 def test_prefill_reference(api, page, ratio, dtype):
@@ -1086,6 +1086,12 @@ def test_prefill_reference(api, page, ratio, dtype):
         (4, 64, 8, 1, 256, "fp8"),
         (4, 40, 12, 1, 1056, "bf16"),
         (4, 128, 8, 2, 2112, "fp8"),
+        (1, 64, 16, 1, 2112, "bf16"),
+        (1, 128, 16, 1, 2112, "fp8"),
+        (4, 48, 16, 1, 1056, "bf16"),
+        (4, 64, 16, 1, 128, "bf16"),
+        (4, 40, 16, 1, 128, "fp8"),
+        (4, 128, 16, 1, 2112, "fp8"),
     ],
 )
 def test_decode_graph(api, queries, batch, ratio, hkv, page, dtype):
