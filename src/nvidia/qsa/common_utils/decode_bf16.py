@@ -17,7 +17,8 @@ from . import qsa_sm_ptx
 
 
 class QSAForward(Base):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, pair_gate_stage=False, pair_direct_masks=False, **kwargs):
+        self.pair_direct_masks = pair_direct_masks
         rows_per_cta = kwargs.get('br', 1)
         if rows_per_cta == 2:
             # Reuse Q4's allocation and roles with the supplied pair-sized
@@ -25,7 +26,7 @@ class QSAForward(Base):
             kwargs['br'] = 4
         super().__init__(*args, **kwargs)
         if rows_per_cta == 2:
-            assert self.group <= 12 and self.kv_splits == 1
+            assert self.group <= 16 and self.kv_splits == 1
             assert self.fused_metadata and self.local_metadata
             self.br = 2
             self.RM = 2 * self.RB
@@ -35,9 +36,11 @@ class QSAForward(Base):
         assert self.mmasched
         self.sm100_q1_address_hoist = self.sm100_q1_address_hoist or (self.br == 1 and self.union_physical and self.kv_splits == 1)
         self.sm100_q1_single_unit = self.br == 1 and self.union_physical and self.kv_splits == 1
+        self.live_softmax_warps = 2 if self.br == 2 and self.group == 16 else (1 if self.decode_gate else 4)
         self.q4_gate_stage = (self.br == 4 and self.hkv > 1
                               and not self.fused_metadata and self.kv_splits == 1
                               and (self.br * self.group) % 16 == 0)
+        self.q4_gate_stage = self.q4_gate_stage or (pair_gate_stage and self.br == 2 and self.group == 16 and self.kv_splits == 1)
 
     @cute.jit
     def __call__(self, mQ, mK, mV, mWS, mCount, mRM, mTicket, mBT, mGate, mOut, softmax_scale: Float32, nblocks: Int32, ncta: Int32, tbase: Int32, tmapK: Int64, tmapV: Int64, stream):
@@ -107,9 +110,9 @@ class QSAForward(Base):
             block = self._unit_blk(Int32(cta), nblocks, mCount)
             if cutlass.const_expr(self.br == 2):
                 from .decode_union import build_pair_metadata
-                mWS, mCount, mRM = build_pair_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical)
+                mWS, mCount, mRM = build_pair_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical, grouped_insert=self.grouped_union, direct_masks=self.pair_direct_masks)
             else:
-                mWS, mCount, mRM = build_union_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical)
+                mWS, mCount, mRM = build_union_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical, deterministic=self.deterministic_union, grouped_insert=self.grouped_union, hash_shift=6 if self.group == 16 else 12)
         sG = None
         if cutlass.const_expr(self.q4_gate_stage):
             sG = cute.make_tensor(cute.make_ptr(self.dtype, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=128), cute.make_layout((16384,)))
@@ -138,8 +141,8 @@ class QSAForward(Base):
                 cute.arch.mbarrier_init(vfull + i, 32 * self.gwr)
             for i in cutlass.range_constexpr(ssts):
                 cute.arch.mbarrier_init(sfull + i, 1)
-                cute.arch.mbarrier_init(pfull + i, 32 if self.decode_gate else sm_threads)
-                cute.arch.mbarrier_init(pfull + ssts + i, 32 if self.decode_gate else sm_threads)
+                cute.arch.mbarrier_init(pfull + i, 32 * self.live_softmax_warps)
+                cute.arch.mbarrier_init(pfull + ssts + i, 32 * self.live_softmax_warps)
             for i in cutlass.range_constexpr(4):
                 cute.arch.mbarrier_init(pvdone + i, 1)
             cute.arch.mbarrier_init(qready, sm_threads)
@@ -192,8 +195,8 @@ class QSAForward(Base):
         cute.arch.sync_threads()
         if warp_idx < self.SOFTMAX_WARPS:
             cute.arch.setmaxregister_increase(208)
-            if cutlass.const_expr(self.decode_gate):
-                if warp_idx == 0:
+            if cutlass.const_expr(self.decode_gate or (self.br == 2 and self.group == 16)):
+                if warp_idx < self.live_softmax_warps:
                     self._softmax_split16(tidx, warp_idx // 4, unit_posted, unit_taken, sUnit, total_units, nblocks, mQ, mWS, mCount, mRM, mGate, mOut, tStS, tOtO, sfull, pfull, pvdone, qready, odrained, sMax, sSum, sG, gstaged, gconsumed, q_col, sQ, scale_log2, M, N, D, group, br, maxe, etile, ssts)
                 else:
                     if cutlass.const_expr(self.br == 2):
@@ -476,7 +479,7 @@ class QSAForward(Base):
     @cute.jit
     def _idle_pair_softmax(self, tidx, unit_posted, unit_taken, sUnit, total_units,
                            nblocks, mQ, mCount, tStS, q_col, sQ, qready, mGate, sG, gstaged):
-        assert self.br == 2 and self.br * self.group <= 16 and self.single_unit_mma
+        assert self.br == 2 and self.br * self.group <= 32 and self.single_unit_mma
         sg = tidx % 128
         self._mwait(unit_posted, 0)
         unit = Int32(sUnit.load())
@@ -487,21 +490,22 @@ class QSAForward(Base):
                             block * 2, kvh, self.group, Int32(2 * self.group), sg)
         cute.arch.fence_view_async_tmem_store()
         cute.arch.mbarrier_arrive(qready)
-        for iteration in cutlass.range_constexpr(6):
-            index = tidx - 32 + iteration * 96
-            if index < 512:
-                lane = index % 32
-                logical = lane % 16
-                col = (lane // 16) * 128 + (index // 32) * 8
-                safe = cutlass.min(logical, Int32(2 * self.group - 1))
-                src = _elem_pointer(mGate, (block * 2 + safe // self.group,
-                                            kvh * self.group + safe % self.group, col)).toint()
-                dst = Int32(Int64((sG.iterator + index * 8).toint()) & 0x3ffff)
-                size = cutlass.select_(logical < 2 * self.group, Int32(16), Int32(0))
-                qsa_sm_ptx.cp_async_16_zfill(dst, src, size)
-        cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(gstaged)
+        if cutlass.const_expr(self.decode_gate):
+            for iteration in cutlass.range_constexpr(6):
+                index = tidx - 32 + iteration * 96
+                if index < 512:
+                    lane = index % 32
+                    logical = lane % 16
+                    col = (lane // 16) * 128 + (index // 32) * 8
+                    safe = cutlass.min(logical, Int32(2 * self.group - 1))
+                    src = _elem_pointer(mGate, (block * 2 + safe // self.group,
+                                                kvh * self.group + safe % self.group, col)).toint()
+                    dst = Int32(Int64((sG.iterator + index * 8).toint()) & 0x3ffff)
+                    size = cutlass.select_(logical < 2 * self.group, Int32(16), Int32(0))
+                    qsa_sm_ptx.cp_async_16_zfill(dst, src, size)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_arrive(gstaged)
         self._mwait(unit_posted, 1)
         cute.arch.mbarrier_arrive(unit_taken)

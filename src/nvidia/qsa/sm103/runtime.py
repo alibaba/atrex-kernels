@@ -138,7 +138,10 @@ def run(
                 block_table, token_to_req, output_gate, out),
             serving_layout=_serving_layout(q, k_cache, v_cache, indexer_block_ids,
                                           query_positions, block_table, token_to_req,
-                                          output_gate, out))
+                                          output_gate, out),
+            single_layer_layout=_serving_layout(q, k_cache, v_cache, indexer_block_ids,
+                query_positions, block_table, token_to_req, output_gate, out, layers=1),
+            kv_capacity=S * (block_table.numel() // _request_count))
         if override is not None:
             br = override[0]
         assert br in (1,2,4)
@@ -181,6 +184,8 @@ def run(
     # exceed one SM wave; smaller grids avoid its launch/global-memory cost.
     union_separate=bool(mtp and br==4 and
         (Hkv>1 and nblocks>_sms))
+    ratio16_split = mtp and group == 16 and Hkv == 1 and br == 4 and kv_splits > 1
+    ratio16_union = mtp and group == 16 and br in (2, 4) and Hkv == 1 and (kv_splits == 1 or ratio16_split)
     union_v_warps=(2 if Hkv>1 else 1)
     if _strided_mtp_union:union_v_warps=1
     fused_meta = mtp and not union_separate
@@ -339,12 +344,14 @@ def run(
             from .mtp_m64 import QSAForward as kernel_cls
             if br == 2:
                 from ..common_utils.decode_bf16 import QSAForward as kernel_cls
-        kernel_options={"decode_reuse_v":decode_gate and br==1,"address_hoist":_balanced_mtp and union_physical,"deterministic_union":_strided_mtp_union} if m_tile==64 else {}
+        kernel_options={"decode_reuse_v":decode_gate and br==1,"address_hoist":_balanced_mtp and union_physical,"deterministic_union":_strided_mtp_union or ratio16_split,"grouped_union":ratio16_union} if m_tile==64 else {}
+        if ratio16_union and br == 2:
+            kernel_options.update(pair_gate_stage=True, pair_direct_masks=True)
         op = kernel_cls(**kernel_options, group=group, head_dim=D, page_size=S,
                         static_short=_static_short, q_load_align=_q_load_align, kv_splits=kv_splits,
                         zero_pad_q=zero_pad_q, active_softmax=active_softmax, fused_metadata=fused_meta, local_metadata=local_meta, single_unit_mma=single_unit_mma,
                         metadata_request_span=_request_span if fused_meta else 0,
-                        union_hash_mix=True,union_full_first=False,
+                        union_hash_mix=True,union_full_first=ratio16_union and br == 2,
                         union_v_warps=union_v_warps,
                         union_physical=union_physical,
                         decode_fixed=decode_fixed,decode_gate=decode_gate,decode_l2=decode_l2,
@@ -400,7 +407,7 @@ def run(
                   scale, nb, nct, tbase, tmk, tmv, stream)
     if kv_splits > 1:
         from ..common_utils.mtp_merge import merge
-        merge(kernel_out, kernel_gate, output_gate, out, kv_splits, wide=_strided_mtp_union)
+        merge(kernel_out, kernel_gate, output_gate, out, kv_splits, wide=_strided_mtp_union or ratio16_split)
     return out
 
 

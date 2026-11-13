@@ -24,15 +24,16 @@ def build_union_metadata(mIds,mPos,mReq,mBT,mK,meta,scratch,tidx,blk,
                          entries:cutlass.Constexpr,rb:cutlass.Constexpr,
                          page:cutlass.Constexpr,request_span:cutlass.Constexpr,
                          hash_mix:cutlass.Constexpr=False,full_first:cutlass.Constexpr=False,
-                         physical:cutlass.Constexpr=False,deterministic:cutlass.Constexpr=False):
+                         physical:cutlass.Constexpr=False,deterministic:cutlass.Constexpr=False,grouped_insert:cutlass.Constexpr=False,hash_shift:cutlass.Constexpr=12):
     # At most 4*(512+tail) distinct keys in 4096 slots. Full flattened keys
     # include request identity, so arbitrary request/row permutations are safe.
     # Keep the appended causal tail in a separate namespace: its token may
     # also occur in a selected block, and the oracle counts both occurrences.
     # The MTP domain bounds flattened tokens below 2**31, leaving group bit29
     # free for this tag. The tag is removed before storing gather addresses.
+    assert not (deterministic and full_first), "split metadata requires stable tail ranks"
     empty=Int32(2147483647) if cutlass.const_expr(deterministic) else Int32(-1)
-    if cutlass.const_expr(deterministic):
+    if cutlass.const_expr(deterministic and not grouped_insert):
         rKeys=cute.make_rmem_tensor((9,),Int32)
         rMasks=cute.make_rmem_tensor((9,),Int32)
         rKeys.fill(Int32(-1));rMasks.fill(Int32(0))
@@ -49,52 +50,57 @@ def build_union_metadata(mIds,mPos,mReq,mBT,mK,meta,scratch,tidx,blk,
     width=Int32(mBT.shape[1]);requests=Int32(1)
     if cutlass.const_expr(request_span>0):
         width=Int32(request_span//page);requests=Int32(mBT.shape[1])//width
-    for part in cutlass.range_constexpr(9):
-        item=tidx+part*256
-        if (item<2052)&(tidx<256):
-            rr=item//512;col=item%512
-            if item>=2048:rr=item-2048
-            row=blk*4+rr
-            visible=Int64(mPos[row])+Int64(1)
-            complete=cutlass.min(cutlass.max(visible//4,Int64(0)),Int64(512))
-            gid=Int32(0);nibble=Int32(15);live=Int32(0)
-            if item<2048:
-                gid=Int32(mIds[row,col]);live=Int32(col<complete)
-            else:
-                gid=Int32(visible//4);nibble=(Int32(1)<<Int32(visible%4))-1
-                live=Int32((visible>0)&(nibble!=0))
-            request=Int32(mReq[row])
-            safe_req=cutlass.min(cutlass.max(request,Int32(0)),requests-1)
-            lp=gid//(page//4);safe_lp=cutlass.min(cutlass.max(lp,Int32(0)),width-1)
-            physical_page=Int32(mBT[0,safe_req*width+safe_lp])
-            live=live&Int32((gid>=0)&(lp>=0)&(lp<width)&(request>=0)&(request<requests)&(physical_page>=0)&(physical_page<Int32(mK.shape[0])))
-            if live!=0:
-                key=gid+safe_req*width*(page//4)
-                if item>=2048:key=key|Int32(1<<29)
-                slot=key&4095
-                if cutlass.const_expr(hash_mix):slot=((key^(key>>12))*Int32(-1640531535))&4095
-                if cutlass.const_expr(deterministic):
-                    # Ordered insertion displaces the larger key. Attach masks
-                    # only after placement settles, so every split agrees.
-                    rKeys[part]=key;rMasks[part]=nibble<<(rr*4)
-                    current=key;done=Int32(0)
-                    while done==0:
-                        previous=Int32(cute.arch.atomic_min(scratch.iterator+slot,current,sem='relaxed',scope='cta'))
-                        done=Int32((previous==empty)|(previous==current))
-                        current=cutlass.max(previous,current)
-                        slot=(slot+1)&4095
+    if cutlass.const_expr(grouped_insert):
+        from .union_insert import insert_query_columns
+        insert_query_columns(mIds, mPos, mReq, mBT, mK, scratch, tidx, blk,
+                             page, request_span, 4, hash_mix, deterministic, hash_shift if deterministic else 6)
+    else:
+        for part in cutlass.range_constexpr(9):
+            item=tidx+part*256
+            if (item<2052)&(tidx<256):
+                rr=item//512;col=item%512
+                if item>=2048:rr=item-2048
+                row=blk*4+rr
+                visible=Int64(mPos[row])+Int64(1)
+                complete=cutlass.min(cutlass.max(visible//4,Int64(0)),Int64(512))
+                gid=Int32(0);nibble=Int32(15);live=Int32(0)
+                if item<2048:
+                    gid=Int32(mIds[row,col]);live=Int32(col<complete)
                 else:
-                    previous=_cas(scratch.iterator+slot,Int32(-1),key)
-                    while (previous!=Int32(-1))&(previous!=key):
-                        slot=(slot+1)&4095;previous=_cas(scratch.iterator+slot,Int32(-1),key)
-                    cute.arch.atomic_or(scratch.iterator+4096+slot,nibble<<(rr*4),sem='relaxed',scope='cta')
-    if cutlass.const_expr(deterministic):
+                    gid=Int32(visible//4);nibble=(Int32(1)<<Int32(visible%4))-1
+                    live=Int32((visible>0)&(nibble!=0))
+                request=Int32(mReq[row])
+                safe_req=cutlass.min(cutlass.max(request,Int32(0)),requests-1)
+                lp=gid//(page//4);safe_lp=cutlass.min(cutlass.max(lp,Int32(0)),width-1)
+                physical_page=Int32(mBT[0,safe_req*width+safe_lp])
+                live=live&Int32((gid>=0)&(lp>=0)&(lp<width)&(request>=0)&(request<requests)&(physical_page>=0)&(physical_page<Int32(mK.shape[0])))
+                if live!=0:
+                    key=gid+safe_req*width*(page//4)
+                    if item>=2048:key=key|Int32(1<<29)
+                    slot=key&4095
+                    if cutlass.const_expr(hash_mix):slot=((key^(key>>hash_shift))*Int32(-1640531535))&4095
+                    if cutlass.const_expr(deterministic and not grouped_insert):
+                        # Ordered insertion displaces the larger key. Attach masks
+                        # only after placement settles, so every split agrees.
+                        rKeys[part]=key;rMasks[part]=nibble<<(rr*4)
+                        current=key;done=Int32(0)
+                        while done==0:
+                            previous=Int32(cute.arch.atomic_min(scratch.iterator+slot,current,sem='relaxed',scope='cta'))
+                            done=Int32((previous==empty)|(previous==current))
+                            current=cutlass.max(previous,current)
+                            slot=(slot+1)&4095
+                    else:
+                        previous=_cas(scratch.iterator+slot,Int32(-1),key)
+                        while (previous!=Int32(-1))&(previous!=key):
+                            slot=(slot+1)&4095;previous=_cas(scratch.iterator+slot,Int32(-1),key)
+                        cute.arch.atomic_or(scratch.iterator+4096+slot,nibble<<(rr*4),sem='relaxed',scope='cta')
+    if cutlass.const_expr(deterministic and not grouped_insert):
         cute.arch.sync_threads()
         for part in cutlass.range_constexpr(9):
             key=Int32(rKeys[part])
             if (tidx<256)&(key>=0):
                 slot=key&4095
-                if cutlass.const_expr(hash_mix):slot=((key^(key>>12))*Int32(-1640531535))&4095
+                if cutlass.const_expr(hash_mix):slot=((key^(key>>hash_shift))*Int32(-1640531535))&4095
                 while Int32(scratch[slot])!=key:slot=(slot+1)&4095
                 cute.arch.atomic_or(scratch.iterator+4096+slot,Int32(rMasks[part]),sem='relaxed',scope='cta')
     cute.arch.sync_threads()

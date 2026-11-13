@@ -109,8 +109,10 @@ class QSAForward(Base):
             meta = smem.allocate_tensor(Int32, cute.make_layout((self.local_entries + 12 + 4 * self.RB + 8,)), 16)
             scratch = cute.make_tensor(cute.make_ptr(Int32, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=16), cute.make_layout((8192,)))
             block = self._unit_blk(Int32(cta), nblocks, mCount)
-            mWS, mCount, mRM = build_union_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical, self.br, direct_masks=self.br == 4 and self.threads == 256, live_rows_only=self.br == 2)
+            mWS, mCount, mRM = build_union_metadata(mWS, mCount, mRM, mBT, mK, meta, scratch, tidx, block, self.local_entries, self.RB, self.page_size, self.metadata_request_span, self.union_hash_mix, self.union_full_first, self.union_physical, self.br, direct_masks=(self.br == 4 and self.threads == 256) or (self.group == 16 and self.grouped_union), live_rows_only=self.br == 2, grouped_insert=self.grouped_union)
         sG = None
+        if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+            sG = cute.make_tensor(cute.make_ptr(cutlass.BFloat16, sK.iterator.toint(), cute.AddressSpace.smem, assumed_align=128), cute.make_layout((16384,)))
         if cutlass.const_expr(self.decode_gate):
             sG = smem.allocate_tensor(Float32 if self.gate_factor else cutlass.BFloat16, cute.make_layout((256 * self.br * self.group if self.gate_factor else 4096 * self.live_softmax_warps,)), 128)
         kfull = storage.kfull.data_ptr()
@@ -148,6 +150,8 @@ class QSAForward(Base):
             cute.arch.mbarrier_init(unit_taken, 32 * self.take_warps)
             if cutlass.const_expr(self.decode_gate):
                 cute.arch.mbarrier_init(gstaged, 32 * (4 - self.live_softmax_warps))
+            if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                cute.arch.mbarrier_init(gstaged, 64)
             cute.arch.mbarrier_init_fence()
         tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.threads)
         tmem = utils.TmemAllocator(storage.tmem_holding_buf.ptr, barrier_for_retrieve=tmem_bar)
@@ -200,10 +204,14 @@ class QSAForward(Base):
                 self._mma_role(unit_posted, unit_taken, sUnit, total_units, nblocks, mCount, mTicket, tbase, qk_mma, qk_sm_mma, pv_mma, tStS, tOtO, tQrQ, tQsQ, tSrK, tOrP, tOrV, kfull, kfree, vfull, vfree, sfull, pfull, pvdone, qready, odrained, etile, kst, vst, ssts, qk_idesc, pv_idesc, k_desc_hi, v_desc_hi, k_desc_lo0, v_desc_lo0, k_stage_d, v_stage_d, offs_aq, offs_bk, offs_ap, offs_bv, tmem_base, q_col, o_col)
             elif warp_idx == self.KLOAD_WARP:
                 self._gather_role(mK, sK, kvgcopy, kvgthr, mWS, mBT, mCount, unit_posted, unit_taken, sUnit, total_units, nblocks, page, D, Int64(0), st1b, kfull, kfree, kst, lane, maxe, etile, False, 0, 2, tmapK)
+                if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                    self._stage_q4_gate(mGate, sG, mCount, Int32(cta), nblocks, sfull, gstaged, lane)
             elif warp_idx == self.VLOAD_WARP:
                 self._gather_role(mK, sV, kvgcopy, kvgthr, mWS, mBT, mCount, unit_posted, unit_taken, sUnit, total_units, nblocks, page, D, voff, st1b, vfull, vfree, vst, lane, maxe, etile, True, 0, self.gwr, tmapV)
             elif warp_idx == self.KLOAD_WARP2:
                 self._gather_role(mK, sK, kvgcopy, kvgthr, mWS, mBT, mCount, unit_posted, unit_taken, sUnit, total_units, nblocks, page, D, Int64(0), st1b, kfull, kfree, kst, lane, maxe, etile, False, 1, 2)
+                if cutlass.const_expr(getattr(self, "q4_gate_stage", False)):
+                    self._stage_q4_gate(mGate, sG, mCount, Int32(cta), nblocks, sfull, gstaged, lane + 32)
             elif warp_idx == self.VLOAD_WARP2:
                 if cutlass.const_expr(self.gwr == 2):
                     self._gather_role(mK, sV, kvgcopy, kvgthr, mWS, mBT, mCount, unit_posted, unit_taken, sUnit, total_units, nblocks, page, D, voff, st1b, vfull, vfree, vst, lane, maxe, etile, True, 1, 2)

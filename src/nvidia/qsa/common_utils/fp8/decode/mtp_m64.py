@@ -8,7 +8,9 @@ from ... import qsa_sm_ptx
 
 
 class QSAForward(M128):
-    def __init__(self,*args,decode_reuse_v=False,k_load_warps=2,relative_address32=False,metadata_ready=False,**kwargs):
+    def __init__(self,*args,decode_reuse_v=False,k_load_warps=2,relative_address32=False,metadata_ready=False,q4_gate_stage=False,grouped_union=False,**kwargs):
+        self.grouped_union=grouped_union
+        self.q4_gate_stage=q4_gate_stage
         self.metadata_ready=metadata_ready
         self.relative_address32=relative_address32 or getattr(self,'relative_address32',False)
         kwargs['m_tile']=64
@@ -34,6 +36,7 @@ class QSAForward(M128):
             self.take_warps=8
             self.threads=384
 
+        assert not self.q4_gate_stage or (self.br == 4 and self.group == 16 and self.kv_splits == 1 and self.k_stages == 2)
         assert k_load_warps in (2,4)
         if k_load_warps==4:
             # Same K entries and order, divided across four producers.
@@ -130,3 +133,30 @@ class QSAForward(M128):
                         s0,s1=cute.arch.fma_packed_f32x2((t0,t1),(Float32(.5),Float32(.5)),(Float32(.5),Float32(.5)))
                         factors[j]=s0;factors[j+1]=s1
                     cute.autovec_copy(factors,cute.make_tensor(sG.iterator+vector*8,cute.make_layout((8,))))
+
+    @cute.jit
+    def _stage_q4_gate(self, mGate, sG, mCount, unit, nblocks, sfull, gstaged, helper):
+        block = self._unit_blk(unit, nblocks, mCount)
+        kvh = self._unit_kvh(unit, nblocks)
+        count = self._full_count(mCount, block)
+        tiles = (count + self.ent_tile - 1) // self.ent_tile
+        if tiles > 0:
+            last = tiles - 1
+            self._mwait(sfull + last % self.s_stages, (last // self.s_stages) & 1)
+        vectors = self.br * self.group * 32
+        for iteration in cutlass.range_constexpr((self.br * self.group * 32 + 63) // 64):
+            i = helper + iteration * 64
+            group_warp = i // 512
+            local = i % 512
+            glane = local % 32
+            logical = group_warp * 16 + glane % 16
+            col = (glane // 16) * 128 + (local // 32) * 8
+            if i < vectors:
+                src = _elem_pointer(mGate, (block * self.br + logical // self.group,
+                                           kvh * self.group + logical % self.group, col)).toint()
+                dst = Int32(Int64((sG.iterator + i * 8).toint()) & 0x3ffff)
+                qsa_sm_ptx.cp_async_16(dst, src)
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.fence_view_async_shared()
+        cute.arch.mbarrier_arrive(gstaged)

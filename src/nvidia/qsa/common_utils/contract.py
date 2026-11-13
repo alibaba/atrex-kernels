@@ -43,8 +43,8 @@ def _validate(q, k, v, ids, pos, table, req, gate, out=None):
     p, s, hkv, d = k.shape
     if p < 1 or s < 16 or s % 16 or hkv not in (1, 2) or d != 256:
         raise ValueError("K/V require P>0, page size a positive multiple of 16, Hkv=1/2, D=256")
-    if q.shape[1] not in (8*hkv, 12*hkv):
-        raise ValueError("GQA ratio must be 8 or 12")
+    if q.shape[1] not in (8*hkv, 12*hkv) and not (q.shape[1] == 16 and hkv == 1):
+        raise ValueError("QSA supports GQA ratios 8/12, and Hq=16 with Hkv=1")
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn) or any(t.dtype != q.dtype for t in (k,v)):
         raise ValueError("Q/K/V must all be BF16 or all be FP8 E4M3FN")
     if gate.dtype != torch.bfloat16:

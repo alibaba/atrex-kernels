@@ -111,7 +111,10 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
             block_table, token_to_req, output_gate, out),
         serving_layout=_serving_layout(q, k_cache, v_cache, indexer_block_ids,
                                       query_positions, block_table, token_to_req,
-                                      output_gate, out))
+                                      output_gate, out),
+        single_layer_layout=_serving_layout(q, k_cache, v_cache, indexer_block_ids,
+            query_positions, block_table, token_to_req, output_gate, out, layers=1),
+        kv_capacity=width * page)
     br, splits, separate, stages, decode_gate = _configuration(
         rows, requests, hkv, group, indexer_block_ids.shape[1], sms, fp8, override)
     fp8_mtp_mid_batch = (fp8 and override == (4, 1) and rows == 4 * requests
@@ -129,12 +132,17 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
                 and group == 12 and requests > sms and address32_ok)
     if deep_fp8 or fp8_mtp_mid_batch:
         stages = 3
+    ratio16_split = not fp8 and group == 16 and hkv == 1 and br == 4 and splits > 1
+    ratio16_union = group == 16 and br in (2, 4) and hkv == 1 and (splits == 1 or ratio16_split)
+    ratio16_q4 = ratio16_union and br == 4
+    if fp8 and ratio16_q4:
+        stages = 2
     unit_order = (fp8 and br == 4 and splits == 1 and (hkv > 1 or group > 8)
                   and (rows // br) * hkv > sms and not (hkv > 1 and group > 8 and rows // br > sms))
     if unit_order:
         separate = True
     order_args = ((rows // br), hkv) if unit_order else None
-    gate_factor = fp8 and splits == 1 and (br == 2 or rows == requests) and br * group < 64
+    gate_factor = fp8 and splits == 1 and (br == 2 or rows == requests or (group == 16 and br == 1)) and br * group < 64
     if gate_factor:
         decode_gate = True
     # A 64-byte unit retains the full address range with one shuffle.
@@ -199,14 +207,20 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
         else:
             from ..common_utils.decode_bf16 import QSAForward
         kernel_options = dict(gate_factor=gate_factor, unit_order=unit_order,
-                              relative_address32=relative_address32, softmax_packed=balanced_fp8 or fp8_mtp_mid_batch) if fp8 else dict(address_hoist=balanced_mtp and physical)
+                              q4_gate_stage=ratio16_q4, grouped_union=ratio16_union,
+                              relative_address32=relative_address32, softmax_packed=balanced_fp8 or fp8_mtp_mid_batch or ratio16_q4) if fp8 else dict(
+                                  address_hoist=balanced_mtp and physical,
+                                  deterministic_union=ratio16_split,
+                                  grouped_union=ratio16_union,
+                                  pair_gate_stage=ratio16_union and br == 2,
+                                  pair_direct_masks=ratio16_union and br == 2)
         op = QSAForward(**kernel_options,
             group=group, head_dim=dim, page_size=page, static_short=True,
             q_load_align=q_align, kv_splits=splits, zero_pad_q=True,
             active_softmax=True, fused_metadata=fused, local_metadata=fused,
             single_unit_mma=True, metadata_request_span=request_span if fused else 0,
-            union_hash_mix=True, union_full_first=False,
-            union_v_warps=2 if hkv > 1 else 1, union_physical=physical,
+            union_hash_mix=True, union_full_first=ratio16_union and br == 2,
+            union_v_warps=2 if hkv > 1 or (fp8 and ratio16_q4) else 1, union_physical=physical,
             decode_fixed=physical and rows == requests, decode_gate=decode_gate,
             decode_l2=64 if rows == requests or balanced_mtp else 128,
             n_tile=128 if fp8 else 96, ent_tile=32 if fp8 else 24,
@@ -237,7 +251,7 @@ def _run(q, k_cache, v_cache, indexer_block_ids, query_positions,
                 MERGE_BLOCK_D = 256
         else:
             from ..common_utils.mtp_merge import atrex_mtp_merge, merge_block_d, MERGE_WARPS
-            MERGE_BLOCK_D = merge_block_d(rows, heads, splits)
+            MERGE_BLOCK_D = 256 if ratio16_split else merge_block_d(rows, heads, splits)
         merge_args = (heads, splits, triton.next_power_of_2(splits), dim, MERGE_BLOCK_D)
         if fp8:
             merge_args += (v_scale,)
