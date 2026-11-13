@@ -114,9 +114,9 @@ validation requirements.
 
 `atrex.qsa_compact` provides gated, paged sparse attention on NVIDIA SM100/SM103.
 It consumes native four-token block IDs with BF16 or FP8 E4M3FN Q/K/V and BF16
-output. It supports D256, GQA ratios 8/12, one or two KV heads, page sizes that
-are positive multiples of 16, ragged prefill, and Q1/Q4 decode. Warmed Q1/Q4 calls
-support CUDA Graph replay with a preallocated output. Dispatch is static and
+output. It supports D256, GQA ratios 8/12 with one or two KV heads, Hq/Hkv=16/1,
+page sizes that are positive multiples of 16, ragged prefill, and Q1/Q4 decode.
+Warmed Q1/Q4 calls support CUDA Graph replay with a preallocated output. Dispatch is static and
 compilation is lazy. The validated environment uses CUDA 13+, CuTeDSL 4.6.2
 and TVM-FFI 0.1.12, matching the declared package dependencies.
 

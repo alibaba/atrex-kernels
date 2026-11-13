@@ -31,7 +31,7 @@ out = atrex.qsa_compact(
 | `token_to_req` | int32 `[T]` | 连续；每行 query 的请求归属，可交错排列 |
 | `output_gate`, `out` | BF16 `[T,Hq,256]` | 连续、32B 对齐；out 不与任何输入共享 storage |
 
-`Hq/Hkv` 为 8 或 12。所有张量位于同一设备，维度不重叠，仅支持推理。
+`Hq/Hkv` 比值为 8 或 12，另支持 `Hq=16, Hkv=1`。所有张量位于同一设备，维度不重叠，仅支持推理。
 K/V 可独立分配，也可为同一交错 pool 的两个 view。输入不被修改；传入 out 时返回
 该张量，否则分配输出。`use_prefill_config` 仅用于调用兼容，实际路径由形状决定。
 
