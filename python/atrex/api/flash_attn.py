@@ -7,6 +7,7 @@ _TARGET_FA_VERSIONS = {
     ("nvidia", "sm103"): frozenset({4}),
     ("nvidia", "sm120"): frozenset({3}),
     ("alibaba_ppu", "zwm890p"): frozenset({2, 3}),
+    ("alibaba_ppu", "zwm890l"): frozenset({2, 3}),
 }
 
 
@@ -240,7 +241,8 @@ def _validate_flash_attn_call(call):
     if supported_versions is None:
         raise NotImplementedError(
             "Atrex attention supports only nvidia/sm103, nvidia/sm120, and "
-            f"alibaba_ppu/zwm890p; detected {target.family}/{target.arch}"
+            f"alibaba_ppu/zwm890p, alibaba_ppu/zwm890l; "
+            f"detected {target.family}/{target.arch}"
         )
     if fa_version is not None and fa_version not in supported_versions:
         versions = ", ".join(str(version) for version in sorted(supported_versions))
@@ -384,7 +386,8 @@ def flash_attn_varlen_func(
         from atrex.src.nvidia.flash_attn.sm103.launch import forward
     elif target.family == "nvidia" and target.arch == "sm120":
         from atrex.src.nvidia.flash_attn.sm120.launch import forward
-    elif target.family == "alibaba_ppu" and target.arch == "zwm890p":
+    elif target.family == "alibaba_ppu" and target.arch in ("zwm890p", "zwm890l"):
+        # Reuse the PPU implementation without changing its workspace policy.
         from functools import partial
         from atrex.src.ppu.flash_attn.zwm890p.launch import forward as ppu_forward
 

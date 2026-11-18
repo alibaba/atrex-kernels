@@ -1,4 +1,4 @@
-"""PPU prefill and native direct-paged FP8 decode contracts."""
+"""Shared ZW-M890P/ZW-M890L prefill and direct-paged FP8 decode contracts."""
 
 import pytest
 import torch
@@ -13,7 +13,8 @@ def require_target():
     from atrex.utils.device_target import detect_device_target
 
     target = detect_device_target()
-    assert (target.family, target.arch) == ("alibaba_ppu", "zwm890p")
+    assert target.family == "alibaba_ppu"
+    assert target.arch in ("zwm890p", "zwm890l")
 
 
 def _case(page_size, q_lens, kv_lens, *, contiguous=False):
