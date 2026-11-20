@@ -6,7 +6,8 @@ __device__ __forceinline__ u32 scaled_query_bits(u32 bits, bool zero, u32 sign) 
   return (zero ? bits & nan_mask : bits) ^ sign;
 }
 
-template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4, int FIXED_HEADS = 0, bool SCALED = false>
+template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4,
+          int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false>
 __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex_ppu_attn_general(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
@@ -17,7 +18,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   constexpr bool GENERAL = FIXED_HEADS == 0 || SCALED;
   constexpr bool PACKED = FIXED_HEADS != 0;
   constexpr int buffers = NBUF;
-  extern __shared__ unsigned char sm[];
+  extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + buffers * KPAGE_BYTES;
 
@@ -115,19 +116,27 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 
   const unsigned char* kg = k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
   const unsigned char* vg = v_fp8 + ((size_t)packed_request * max_pages + p_lo) * VPAGE_BYTES;
+  const int copy_warp = LINEAR_AIU ? __shfl_sync(0xffffffffu, warp, 0) : -1;
 #define STAGE_NC(buf, page)                                                            \
   do {                                                                                 \
     const unsigned char* _ks = kg + (size_t)(npg - (page))*KPAGE_BYTES;                 \
     const unsigned char* _vs = vg + (size_t)(npg - (page))*VPAGE_BYTES;                 \
     unsigned char* _kd = Ks + (buf)*KPAGE_BYTES;                                       \
     unsigned char* _vd = Vs + (buf)*VPAGE_BYTES;                                       \
-    _Pragma("unroll") for (int c = 0; c < (KPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
-      const int _o = (c * threads + tid) * 16;                                         \
-      if (_o < KPAGE_BYTES) cp_async16(_kd + _o, _ks + _o);                             \
-    }                                                                                  \
-    _Pragma("unroll") for (int c = 0; c < (VPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
-      const int _o = (c * threads + tid) * 16;                                         \
-      if (_o < VPAGE_BYTES) cp_async16(_vd + _o, _vs + _o);                             \
+    if constexpr (LINEAR_AIU) {                                                        \
+      if (copy_warp == 0) {                                                           \
+        aiu_stage_packed_page(_kd, _ks);                                              \
+        aiu_stage_packed_page(_vd, _vs);                                              \
+      }                                                                                \
+    } else {                                                                           \
+      _Pragma("unroll") for (int c = 0; c < (KPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
+        const int _o = (c * threads + tid) * 16;                                       \
+        if (_o < KPAGE_BYTES) cp_async16(_kd + _o, _ks + _o);                           \
+      }                                                                                \
+      _Pragma("unroll") for (int c = 0; c < (VPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
+        const int _o = (c * threads + tid) * 16;                                       \
+        if (_o < VPAGE_BYTES) cp_async16(_vd + _o, _vs + _o);                           \
+      }                                                                                \
     }                                                                                  \
   } while (0)
 
@@ -530,7 +539,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   }
 }
 
-template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false>
+template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false>
 void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
@@ -547,9 +556,9 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
-    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     once = true;
   }
   const auto qp = reinterpret_cast<const unsigned char*>(q.data_ptr());
@@ -559,19 +568,19 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   auto stream = at::cuda::getCurrentCUDAStream();
   if (nsplit <= 1) {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups) : dim3((unsigned)launch_nblk, head_groups);
-    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU><<<grid, threads, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1,
         query_heads, (int)kv_heads, scales, (float)softmax_scale);
   } else {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups, 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, head_groups, (unsigned)nsplit);
     if (nsplit == 2)
-      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
     else
-      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
@@ -583,6 +592,15 @@ void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_f
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
           int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
   const int group = q.size(1) / kv_heads;
+  // A complete packed page can be staged by one warp without changing its MMA layout.
+  const bool use_linear_aiu = q.size(1) == 32 && kv_heads == 2 &&
+      ((reinterpret_cast<uintptr_t>(k_fp8.data_ptr()) |
+        reinterpret_cast<uintptr_t>(v_fp8.data_ptr())) & 127) == 0;
+  if (use_linear_aiu) {
+    launch_attn_head_group<4, 0, false, true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens,
+        out, o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+    return;
+  }
   if (q.size(1) == 6 && kv_heads == 1 && descales.numel() == 0 && softmax_scale == 0.0625)
     launch_attn_head_group<4, 6>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
         o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);

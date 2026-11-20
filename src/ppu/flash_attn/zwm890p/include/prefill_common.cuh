@@ -440,6 +440,24 @@ typedef unsigned short u16;
 #define KPAGE_BYTES 16384  // 64 kv x 256 d, e4m3, swizzled
 #define VPAGE_BYTES 16384  // 256 d x 64 kv, E4M3 bytes, swizzled
 
+// Copy the packed page bytes to shared without changing the fragment layout.
+static __device__ __forceinline__ void aiu_stage_packed_page(
+    unsigned char* destination, const unsigned char* source) {
+  constexpr int width = 128;
+  constexpr int height = 64;
+  constexpr int planes = 2;
+  constexpr uint64_t row_stride = width;
+  constexpr uint64_t plane_stride = width * height;
+  static_assert(KPAGE_BYTES == width * height * planes && VPAGE_BYTES == KPAGE_BYTES);
+  const u32 shared_addr = static_cast<u32>(__cvta_generic_to_shared(destination));
+  asm volatile("ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.padz.linear.b8 "
+      "[%0], [%1], {%2,%3,%4}, {%5,%6,%7}, {%8,%9}, {%10,%11,%12}, %13;"
+      :: "r"(shared_addr), "l"(source), "r"(width), "r"(height), "r"(planes),
+         "r"(width), "r"(height), "r"(planes), "l"(row_stride), "l"(plane_stride),
+         "r"(0), "r"(0), "r"(0), "r"(0)
+      : "memory");
+}
+
 // ---------------------------------------------------------------------------------------- swizzles
 // Both are "one 16 B TSM block == exactly one lane's B fragment half-pair", so every B fragment is a
 // single conflict-free ld.shared.b128 and the four registers come out in natural uint4 order.

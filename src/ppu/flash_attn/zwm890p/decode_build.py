@@ -17,7 +17,7 @@ from atrex.core.compile_cu import _jit_cache_root, _process_lock
 ROOT = Path(__file__).resolve().parent
 LOCK = threading.Lock()
 LIBRARIES = {}
-VARIANTS = ("q1", "q4", "q4_wide")
+VARIANTS = ("q1", "q4", "q4_wide", "q16_dual")
 BACKEND_FLAGS = (
     "-ppu-max-vreg-count=256", "-ppu-sink-matrix-addr=true",
     "-ppu-max-alloca-byte-size=1024", "-ppu-sink-async-addr=true",

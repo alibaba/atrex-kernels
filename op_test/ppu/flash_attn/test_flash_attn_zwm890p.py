@@ -216,25 +216,14 @@ def test_real_kernel_events():
     assert not any("atrex_ppu_attn_general" in name for name in names)
 
 
-def test_prefill_fast_path_source_matches_main():
-    import hashlib
-
+def test_prefill_native_translation_units():
     from atrex.core.compile_cu import _atrex_source_root
     from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     root = _atrex_source_root() / "ppu/flash_attn/zwm890p"
     source = (root / "prefill.cu").read_text()
-    expected = (
-        ("template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>",
-         "// ==================================================================================== KERNEL 3",
-         "9a3f45b8c00c7c87bbed21c8a741e4b8dcfe2d3d24f454b6cdbab2d3cedcc8e5"),
-        ("template <bool GROUPED>\nvoid launch_attn", "\nvoid combine(",
-         "0b7459b26861ad2caae904ce40bc9d0884c0b8929e298b839b72f347aa83bf91"),
-    )
-    for first, last, digest in expected:
-        start = source.index(first)
-        segment = source[start:source.index(last, start)].rstrip() + "\n"
-        assert hashlib.sha256(segment.encode()).hexdigest() == digest
+    assert "void atrex_ppu_attn(" in source
+    assert "void atrex_ppu_attn_general(" not in source
     general = (root / "prefill_general.cu").read_text()
     assert "void atrex_ppu_attn_general(" in general
     assert "void atrex_ppu_attn(" not in general
@@ -424,50 +413,46 @@ def test_unsupported_row_stride():
 ])
 def test_prefill_decode_dispatch(query, hq, hkv, path, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = build_case(64, [query, query], [1025, 2049], hq=hq, hkv=hkv)
     if path == "prefill":
         for name in ("q_descale", "k_descale", "v_descale"):
             case[name] = None
     calls = []
-    attempted = []
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
 
-    def decode(**kwargs):
-        attempted.append("decode")
-        decode_runtime.validate(launch._normalized_call(kwargs))
+    def decode(*_args):
         calls.append("decode")
-        return kwargs["out"], None
+        return out
 
     def prefill(**kwargs):
         calls.append("prefill")
         return kwargs["out"], None
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     assert flash_attn_varlen_func(**case, out=out).data_ptr() == out.data_ptr()
     assert calls == [path]
-    assert attempted == (["decode"] if query <= 5 else [])
 
 
 @pytest.mark.parametrize("error", [ValueError("invalid metadata"), RuntimeError("launch failed"),
                                   NotImplementedError("selected kernel failure")])
 def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = _case(64, [4, 4], [1025, 2049])
     calls = []
 
-    def decode(**kwargs):
+    def decode(*_args):
         raise error
 
     def prefill(**kwargs):
         calls.append("prefill")
         raise AssertionError("Runtime failures must not use fallback")
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     with pytest.raises(type(error), match=str(error)):
         flash_attn_varlen_func(**case)
@@ -478,27 +463,25 @@ def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
 @pytest.mark.parametrize("version", [None, 2, 3])
 def test_fa_version_preserves_dispatch(query, version, monkeypatch):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = _case(64, [query, query], [1025, 2049])
     case["fa_version"] = version
     calls = []
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
 
-    def decode(**kwargs):
-        assert kwargs["fa_version"] == version
-        decode_runtime.validate(launch._normalized_call(kwargs))
+    def decode(*_args):
         calls.append("decode")
-        return kwargs["out"], None
+        return out
 
     def prefill(**kwargs):
         assert "fa_version" not in kwargs
         calls.append("prefill")
         return kwargs["out"], None
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     assert can_use_flash_attn_varlen_func(**case)
-    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
     assert flash_attn_varlen_func(**case, out=out).data_ptr() == out.data_ptr()
     assert calls == ["prefill" if version == 2 else "decode"]
 
@@ -676,7 +659,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide"}
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q16_dual"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
@@ -762,11 +745,12 @@ def test_decode_vector_output_rejects_unaligned_out():
     torch.testing.assert_close(aligned.float(), expected, atol=.03, rtol=.05)
 
 
-def test_decode_historical_page_order_replays_current_metadata():
+@pytest.mark.parametrize("batch", [8, 64])
+def test_decode_historical_page_order_replays_current_metadata(batch):
     from atrex import flash_attn_varlen_func
 
     long_length = 128 * 1024 + 2
-    case = build_case(64, [4, 4] + [1] * 62, [long_length] * 2 + [193] * 62, hq=32, hkv=2)
+    case = build_case(64, [4, 4] + [1] * (batch - 2), [long_length] * 2 + [193] * (batch - 2), hq=32, hkv=2)
     for name, scale in (("q_descale", .875), ("k_descale", 1.125), ("v_descale", .75)):
         case[name].fill_(scale)
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
@@ -901,6 +885,38 @@ def test_general_prefill_real_kernel_events():
     assert any("atrex_ppu_prep_raw" in name for name in names)
     assert any("atrex_ppu_attn_general" in name for name in names)
     assert not any("atrex_ppu_native_decode_kernel" in name for name in names)
+
+
+@pytest.mark.parametrize("lengths", [[16401], [16401, 127, 129, 63, 257, 513, 1025, 2049]])
+def test_direct_paged_q16_prefill_graph(lengths, monkeypatch):
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, [16] * len(lengths), lengths, hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+
+    def unpacked_only(_device):
+        pytest.fail("Q16 direct paging unexpectedly launches the prepared path")
+
+    monkeypatch.setattr(prefill_runtime, "_extension", unpacked_only)
+    _check(case, graph=True)
+
+
+@pytest.mark.parametrize("query", [1, 4])
+def test_single_request_long_decode_graph(query):
+    case = build_case(64, [query], [16401], hq=32, hkv=2)
+    _check(case, graph=True)
+
+
+def test_q16_prefill_preserves_eight_byte_aligned_query():
+    case = build_case(64, [16], [16401], hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    q = case["q"]
+    storage = torch.empty(q.numel() + 8, dtype=q.dtype, device=q.device)
+    case["q"] = storage[8:].view(q.shape).copy_(q)
+    assert case["q"].data_ptr() % 16 == 8
+    _check(case)
 
 
 @pytest.mark.parametrize("scale", [0., -.5, .75])

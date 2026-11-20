@@ -90,10 +90,11 @@ def _validate_nvidia_call(call, torch, target_key, batch_size, window):
 
 
 def _validate_ppu_call(call, torch, window, softcap):
-    from atrex.src.ppu.flash_attn.zwm890p.launch import validate
+    from atrex.src.ppu.flash_attn.zwm890p.launch import _select
 
-    validate(dict(call, window_size=window, softcap=softcap))
+    selection = _select(dict(call, window_size=window, softcap=softcap))
     _validate_out(call, torch, require_contiguous=True)
+    return selection
 
 
 def _validate_flash_attn_call(call):
@@ -271,12 +272,13 @@ def _validate_flash_attn_call(call):
     if call["max_seqlen_q"] < 0 or call["max_seqlen_k"] < 0:
         raise ValueError("maximum sequence lengths must be nonnegative")
 
+    ppu_selection = None
     if target_key in (("nvidia", "sm103"), ("nvidia", "sm120")):
         _validate_nvidia_call(call, torch, target_key, batch_size, window)
     else:
-        _validate_ppu_call(call, torch, window, softcap)
+        ppu_selection = _validate_ppu_call(call, torch, window, softcap)
 
-    return target, window, softcap
+    return target, window, softcap, ppu_selection
 
 
 def can_use_flash_attn_varlen_func(
@@ -381,7 +383,17 @@ def flash_attn_varlen_func(
     """Run attention and return ``out`` or ``(out, lse)`` when requested."""
     import torch
 
-    target, window, softcap = _validate_flash_attn_call(locals())
+    target, window, softcap, ppu_selection = _validate_flash_attn_call(locals())
+    if ppu_selection == "decode":
+        from atrex.src.ppu.flash_attn.zwm890p.decode_runtime import _forward_validated
+
+        with torch.cuda.device(q.device):
+            return _forward_validated(
+                q, k, v, cu_seqlens_q, seqused_k, max_seqlen_q, max_seqlen_k,
+                block_table, q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale,
+                out, q_descale, k_descale, v_descale, num_splits,
+            )
+
     if target.family == "nvidia" and target.arch == "sm103":
         from atrex.src.nvidia.flash_attn.sm103.launch import forward
     elif target.family == "nvidia" and target.arch == "sm120":

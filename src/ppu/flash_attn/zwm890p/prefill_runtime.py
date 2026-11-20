@@ -116,8 +116,16 @@ def _group_geometry(query_heads, kv_heads, device):
             max(1, properties.multi_processor_count * blocks))
 
 
-def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k):
-    """Preserve the source revision's graph-static launch policy."""
+def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k, *, query_heads=0, kv_heads=0, page_size=0):
+    """Select a launch policy from graph-static shape bounds."""
+    if requests == 1 and (query_heads, kv_heads, page_size) == (32, 2, 64):
+        if max_seqlen_q == 128:
+            # A single request launches 32 CTAs. Deeper history amortizes the
+            # merge and gains utilization from shorter KV shards.
+            return 2 if max_seqlen_k - max_seqlen_q <= 32 * 1024 else 12
+        if max_seqlen_q == 512:
+            # Three splits place 384 CTAs into five two-CTA waves on 39 CUs.
+            return 3
     if requests == 1 or max_seqlen_q > 16:
         return 1
     query_blocks = (tokens + 31) // 32 + requests
@@ -172,8 +180,6 @@ def forward(
     from .prefill_contract import validate
 
     validate(_normalized_call(locals()))
-    key_view, virtual_stride, subpages = _page_view(k)
-    value_view = _page_view(v)[0]
     if cu_seqlens_k is not None:
         raise NotImplementedError("PPU attention requires paged KV and seqused_k")
     requests = cu_seqlens_q.numel() - 1
@@ -201,9 +207,35 @@ def forward(
     if max_seqlen_k == 0:
         out.zero_()
         return out, None
-    # Preserve the existing Split-KV policy independently of request grouping.
+    if (num_splits == 0 and max_seqlen_q == 16 and q.shape[0] == 16 * requests
+            and requests in (1, 8, 64, 128) and q.shape[1] == 32 and k.shape[1:3] == (64, 2)
+            and max_seqlen_k >= 16 * 1024 and softmax_scale in (None, 0.0625)
+            and q.data_ptr() % 16 == 0 and out.data_ptr() % 16 == 0
+            and q_descale is None and k_descale is None and v_descale is None):
+        from .decode_runtime import _forward_validated
+
+        # Small query tiles can consume the original pages. Keep long-Q
+        # prefill on the prepared layout, which its mainloop reuses across CTAs.
+        if requests == 1:
+            splits = 19  # Two KV heads fill 38 of the 39 compute units.
+        elif requests == 8:
+            splits = 2 if max_seqlen_k <= 32 * 1024 + 16 else 12
+        else:
+            splits = 1 if max_seqlen_k <= 32 * 1024 + 16 else 3
+        out = _forward_validated(
+            q, k, v, cu_seqlens_q, seqused_k, max_seqlen_q, max_seqlen_k,
+            page_table, 0.0625, out, q_descale, k_descale, v_descale, splits,
+        )
+        return out, None
+    key_view, virtual_stride, subpages = _page_view(k)
+    value_view = _page_view(v)[0]
+    # Keep the existing long-prefill policy. Short-Q calls may split the KV
+    # range; all requests are processed without host-side batch partitioning.
     if num_splits == 0:
-        num_splits = _default_splits(q.shape[0], requests, max_seqlen_q, max_seqlen_k)
+        num_splits = _default_splits(
+            q.shape[0], requests, max_seqlen_q, max_seqlen_k,
+            query_heads=q.shape[1], kv_heads=k.shape[2], page_size=k.shape[1],
+        )
     num_splits = min(num_splits, max(1, (max_seqlen_k + 63) // 64))
     extension = _extension(q.device)
     max_pages = (max_seqlen_k + 63) // 64

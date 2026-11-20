@@ -1,5 +1,4 @@
 #include "prefill_common.cuh"
-
 // ==================================================================================== KERNEL 0
 // GLOBAL per-(request, channel) amax of V.  This pass exists so that `v_scale` does NOT depend on the
 // page, so the same V scale is valid across the full KV sweep.
@@ -346,18 +345,19 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 // (q-block, slice) pair, snapped to PAGE granularity because the page loop carries a barrier. Each
 // slice keeps its own reference max and writes fp32 (O_s, m_s, l_s); atrex_ppu_comb merges them. SPLIT=0
 // constant-folds every line of that away.
-template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>
+template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4,
+          int QUERY_HEADS = NHEADS, int KV_HEADS = 1, bool LINEAR_AIU = false>
 __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
     const float* __restrict__ vamax, const int* __restrict__ cu_q,
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out,
     float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit) {
-  extern __shared__ unsigned char sm[];
+  extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + NBUF * KPAGE_BYTES;
 
-  int bx = GROUPED ? blockIdx.x / (NHEADS / 4) : blockIdx.x;
+  int bx = GROUPED ? blockIdx.x / (QUERY_HEADS / 4) : blockIdx.x;
   int req = -1, qbi = 0, nb_req = 0;
   for (int r = 0; r < n_req; ++r) {
     const int nb = ((cu_q[r + 1] - cu_q[r]) + MQ - 1) / MQ;
@@ -387,7 +387,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int unit = warp >> 1, wq = warp & 1;   // head within the CTA / which 16-row half
-  const int head = (GROUPED ? blockIdx.x % (NHEADS / 4) : blockIdx.y) * 4 + unit;
+  const int head_group = GROUPED ? blockIdx.x % (QUERY_HEADS / 4) : blockIdx.y;
+  const int head = head_group * 4 + unit;
+  const int packed_request = KV_HEADS == 1 ? req :
+      req * KV_HEADS + head_group / (QUERY_HEADS / KV_HEADS / 4);
   const int lq = lane >> 2, la = lane & 3;         // A side: row group / k group
   const int lp = lane >> 3, lb = (lane >> 2) & 1;  // B side: row index is lb + 2*(r>>1) + 4*lp
 
@@ -431,7 +434,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
   const int first_mask_page = bp >= 0 ? min(bp / PAGE, (kv_len - kv_lo) / PAGE) : -1;
 
   // ------------------------------------------------------------- Q: raw E4M3 fragment loads
-  const unsigned char* qbase = q + (size_t)q_start * NHEADS * HEAD_DIM + head * HEAD_DIM;
+  const unsigned char* qbase = q + (size_t)q_start * QUERY_HEADS * HEAD_DIM + head * HEAD_DIM;
   const int rowa = min(q0 + wq * MW + 2 * lq, q_len - 1);
   const int rowb = min(q0 + wq * MW + 2 * lq + 1, q_len - 1);
 
@@ -440,9 +443,9 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
   for (int ks = 0; ks < KSTEPS; ++ks) {
     const int d0 = ks * 32 + la * 8;
     const uint2 a = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowa * NHEADS * HEAD_DIM + d0);
+        qbase + (size_t)rowa * QUERY_HEADS * HEAD_DIM + d0);
     const uint2 b = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowb * NHEADS * HEAD_DIM + d0);
+        qbase + (size_t)rowb * QUERY_HEADS * HEAD_DIM + d0);
     qf[ks][0] = a.x;  // row even, d&7 = 0..3
     qf[ks][1] = b.x;  // row odd,  d&7 = 0..3
     qf[ks][2] = a.y;  // row even, d&7 = 4..7
@@ -466,21 +469,29 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
 #endif
 
   // bases pre-offset to this slice's first page, so the loop indexes them by the relative page
-  const unsigned char* kg = k_fp8 + ((size_t)req * max_pages + p_lo) * KPAGE_BYTES;
-  const unsigned char* vg = v_fp8 + ((size_t)req * max_pages + p_lo) * VPAGE_BYTES;
+  const unsigned char* kg = k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
+  const unsigned char* vg = v_fp8 + ((size_t)packed_request * max_pages + p_lo) * VPAGE_BYTES;
+  const int copy_warp = LINEAR_AIU ? __shfl_sync(0xffffffffu, warp, 0) : -1;
 #define STAGE_NC(buf, page)                                                            \
   do {                                                                                 \
     const unsigned char* _ks = kg + (size_t)(npg - (page))*KPAGE_BYTES;                 \
     const unsigned char* _vs = vg + (size_t)(npg - (page))*VPAGE_BYTES;                 \
     unsigned char* _kd = Ks + (buf)*KPAGE_BYTES;                                       \
     unsigned char* _vd = Vs + (buf)*VPAGE_BYTES;                                       \
-    _Pragma("unroll") for (int c = 0; c < KPAGE_BYTES / (NTHREADS * 16); ++c) {         \
-      const int _o = (c * NTHREADS + tid) * 16;                                        \
-      cp_async16(_kd + _o, _ks + _o);                                                  \
-    }                                                                                  \
-    _Pragma("unroll") for (int c = 0; c < VPAGE_BYTES / (NTHREADS * 16); ++c) {         \
-      const int _o = (c * NTHREADS + tid) * 16;                                        \
-      cp_async16(_vd + _o, _vs + _o);                                                  \
+    if constexpr (LINEAR_AIU) {                                                        \
+      if (copy_warp == 0) {                                                           \
+        aiu_stage_packed_page(_kd, _ks);                                              \
+        aiu_stage_packed_page(_vd, _vs);                                              \
+      }                                                                                \
+    } else {                                                                           \
+      _Pragma("unroll") for (int c = 0; c < KPAGE_BYTES / (NTHREADS * 16); ++c) {       \
+        const int _o = (c * NTHREADS + tid) * 16;                                      \
+        cp_async16(_kd + _o, _ks + _o);                                                \
+      }                                                                                \
+      _Pragma("unroll") for (int c = 0; c < VPAGE_BYTES / (NTHREADS * 16); ++c) {       \
+        const int _o = (c * NTHREADS + tid) * 16;                                      \
+        cp_async16(_vd + _o, _vs + _o);                                                \
+      }                                                                                \
     }                                                                                  \
   } while (0)
 
@@ -841,12 +852,12 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (1.f / ls[pr]) : 0.f;
     unsigned char* row0 =
         reinterpret_cast<unsigned char*>(o_part) +
-        ((size_t)sl * n_tok * NHEADS + (size_t)(q_start + q0) * NHEADS + head) * PRECB;
+        ((size_t)sl * n_tok * QUERY_HEADS + (size_t)(q_start + q0) * QUERY_HEADS + head) * PRECB;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
       const int rr = wq * MW + 2 * lq + pr;
       if (q0 + rr >= q_len) continue;
-      unsigned char* row = row0 + (size_t)rr * NHEADS * PRECB;
+      unsigned char* row = row0 + (size_t)rr * QUERY_HEADS * PRECB;
       const bool nul = !(ls[pr] > 0.f);
       const float sc = inv[pr];
 #pragma unroll
@@ -866,12 +877,12 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     // O_s is UNNORMALISED on purpose -- the combine divides by the merged l. A row with l_s == 0 saw
     // no key in this slice; publishing m_s = -inf lets the combine's guarded weight drop it outright.
     float* row0 = o_part +
-                  ((size_t)sl * n_tok * NHEADS + (size_t)(q_start + q0) * NHEADS + head) * PREC;
+                  ((size_t)sl * n_tok * QUERY_HEADS + (size_t)(q_start + q0) * QUERY_HEADS + head) * PREC;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
       const int rr = wq * MW + 2 * lq + pr;
       if (q0 + rr >= q_len) continue;
-      float* row = row0 + (size_t)rr * NHEADS * PREC;
+      float* row = row0 + (size_t)rr * QUERY_HEADS * PREC;
       const bool nul = !(ls[pr] > 0.f);
 #pragma unroll
       for (int dt = 0; dt <= NDT; ++dt) {
@@ -890,12 +901,12 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     float inv[2];
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) inv[pr] = (ls[pr] > 0.f) ? (1.f / ls[pr]) : 0.f;
-    __nv_bfloat16* obase = out + (size_t)q_start * NHEADS * HEAD_DIM + head * HEAD_DIM;
+    __nv_bfloat16* obase = out + (size_t)q_start * QUERY_HEADS * HEAD_DIM + head * HEAD_DIM;
 #pragma unroll
     for (int pr = 0; pr < 2; ++pr) {
       const int rr = wq * MW + 2 * lq + pr;
       if (q0 + rr >= q_len) continue;
-      __nv_bfloat16* row = obase + (size_t)(q0 + rr) * NHEADS * HEAD_DIM;
+      __nv_bfloat16* row = obase + (size_t)(q0 + rr) * QUERY_HEADS * HEAD_DIM;
       const float sc = inv[pr];
 #pragma unroll
       for (int dt = 0; dt < NDT; ++dt) {
@@ -1179,7 +1190,7 @@ void prep_kv(torch::Tensor key_cache, torch::Tensor value_cache, torch::Tensor b
 
 // nsplit <= 1 launches atrex_ppu_attn<0>: 2D grid, no partial buffers touched, bf16 written straight from the
 // accumulator, and NO combine launch at all.
-template <bool GROUPED>
+template <bool GROUPED, int QUERY_HEADS = NHEADS, int KV_HEADS = 1, bool LINEAR_AIU = false>
 void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit) {
@@ -1189,9 +1200,9 @@ void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torc
   const int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
-    cudaFuncSetAttribute(atrex_ppu_attn<0, GROUPED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn<1, GROUPED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn<1, GROUPED, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn<0, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn<1, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn<1, GROUPED, 2, QUERY_HEADS, KV_HEADS, LINEAR_AIU>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     once = true;
   }
   const auto qp = reinterpret_cast<const unsigned char*>(q.data_ptr());
@@ -1200,19 +1211,19 @@ void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torc
   const auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   auto stream = at::cuda::getCurrentCUDAStream();
   if (nsplit <= 1) {
-    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (NHEADS / 4)) : dim3((unsigned)launch_nblk, NHEADS / 4);
-    atrex_ppu_attn<0, GROUPED><<<grid, NTHREADS, smem, stream>>>(
+    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (QUERY_HEADS / 4)) : dim3((unsigned)launch_nblk, QUERY_HEADS / 4);
+    atrex_ppu_attn<0, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1);
   } else {
-    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (NHEADS / 4), 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, NHEADS / 4, (unsigned)nsplit);
+    dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (QUERY_HEADS / 4), 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, QUERY_HEADS / 4, (unsigned)nsplit);
     if (nsplit == 2)
-      atrex_ppu_attn<1, GROUPED, 2><<<grid, NTHREADS, smem, stream>>>(
+      atrex_ppu_attn<1, GROUPED, 2, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit);
     else
-      atrex_ppu_attn<1, GROUPED><<<grid, NTHREADS, smem, stream>>>(
+      atrex_ppu_attn<1, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit);
@@ -1283,13 +1294,25 @@ void attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tens
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
           int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
-  if (q.size(1) == NHEADS && kv_heads == 1 && descales.numel() == 0 && softmax_scale == 0.0625) {
-    launch_attn<true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out, o_part,
-        max_pages, nblk, nsplit);
-  } else {
-    launch_attn_general(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out, o_part,
-        max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+  const bool unit_scale = descales.numel() == 0 && softmax_scale == 0.0625;
+  const bool aligned = ((reinterpret_cast<uintptr_t>(k_fp8.data_ptr()) |
+                         reinterpret_cast<uintptr_t>(v_fp8.data_ptr())) & 127) == 0;
+  if (unit_scale && q.size(1) == NHEADS && kv_heads == 1) {
+    if (aligned)
+      launch_attn<true, NHEADS, 1, true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+          o_part, max_pages, nblk, nsplit);
+    else
+      launch_attn<true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out, o_part,
+          max_pages, nblk, nsplit);
+    return;
   }
+  if (unit_scale && aligned && q.size(1) == 32 && kv_heads == 2) {
+    launch_attn<true, 32, 2, true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
+        o_part, max_pages, nblk, nsplit);
+    return;
+  }
+  launch_attn_general(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out, o_part,
+      max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
