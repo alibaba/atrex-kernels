@@ -88,11 +88,6 @@ def forward(
     page_size, kv_heads = k.shape[1:3]
     if out is None:
         out = torch.empty(q.shape, device=q.device, dtype=torch.bfloat16)
-    if any(scale is None for scale in (q_descale, k_descale, v_descale)):
-        unit = torch.ones((batch, kv_heads), device=q.device, dtype=torch.float32)
-        q_descale = unit if q_descale is None else q_descale
-        k_descale = unit if k_descale is None else k_descale
-        v_descale = unit if v_descale is None else v_descale
     selected_splits = num_splits or 32
     table_width = page_table.shape[1]
     sort_history = (
@@ -117,10 +112,15 @@ def forward(
     tensors = (q, k, v, out, cu_seqlens_q, seqused_k, page_table,
                q_descale, k_descale, v_descale, partial, partial_lse, plan)
     pointers = (ctypes.c_void_p * len(tensors))(*(tensor.data_ptr() if tensor is not None else 0 for tensor in tensors))
+    descale_strides = [
+        stride
+        for scale in (q_descale, k_descale, v_descale)
+        for stride in ((0, 0) if scale is None else scale.stride())
+    ]
     values = [batch, total, max_seqlen_q, page_table.shape[1] * page_size, k.shape[0], page_size,
               page_table.stride(0), q.stride(0), q.stride(1), *k.stride()[:3],
               *v.stride()[:3], out.stride(0), out.stride(1),
-              *q_descale.stride(), *k_descale.stride(), *v_descale.stride(),
+              *descale_strides,
               compute_units, query_heads, kv_heads]
     metadata = (ctypes.c_int64 * len(values))(*values)
     # A private ABI selector enables the native sorter and its appended workspace.

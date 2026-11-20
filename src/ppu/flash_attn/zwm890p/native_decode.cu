@@ -103,6 +103,11 @@ __device__ __forceinline__ int native_warp() {
     return __shfl_sync(0xffffffff, static_cast<int>(threadIdx.x >> 5), 0);
 }
 
+__device__ __forceinline__ float native_descale(
+    const float* descales, int request, int head, int64_t batch_stride, int64_t head_stride) {
+    return descales ? __ldg(descales + request * batch_stride + head * head_stride) : 1.f;
+}
+
 __device__ __forceinline__ unsigned int native_bfloat_pair(float first, float second) {
     unsigned int packed;
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;"
@@ -540,13 +545,13 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
               "=r"(query_fragments[tile][2]), "=r"(query_fragments[tile][3]) : "r"(address));
     }
     __syncthreads();
-    const float* query_descales = static_cast<const float*>(params.query_descales);
-    const float* key_descales = static_cast<const float*>(params.key_descales);
-    const float* value_descales = static_cast<const float*>(params.value_descales);
     float log_scale = params.scale * 1.4426950408889634f
-        * __ldg(query_descales + request * params.query_descale_batch_stride + head * params.query_descale_head_stride)
-        * __ldg(key_descales + request * params.key_descale_batch_stride + head * params.key_descale_head_stride);
-    float value_scale = __ldg(value_descales + request * params.value_descale_batch_stride + head * params.value_descale_head_stride);
+        * native_descale(params.query_descales, request, head,
+                         params.query_descale_batch_stride, params.query_descale_head_stride)
+        * native_descale(params.key_descales, request, head,
+                         params.key_descale_batch_stride, params.key_descale_head_stride);
+    float value_scale = native_descale(params.value_descales, request, head,
+                                       params.value_descale_batch_stride, params.value_descale_head_stride);
     float output[OutputTiles][8] = {};
     float running_max[2] = {-INFINITY, -INFINITY};
     float running_sum[2] = {0.f, 0.f};
@@ -761,10 +766,10 @@ void atrex_ppu_native_decode_sort_history(DecodeParams params, int* sorted_table
         bool valid_scale = true;
         if (threadIdx.x < params.kv_heads) {
             int head = threadIdx.x;
-            float scale = __ldg(params.query_descales + request * params.query_descale_batch_stride
-                                + head * params.query_descale_head_stride)
-                * __ldg(params.key_descales + request * params.key_descale_batch_stride
-                        + head * params.key_descale_head_stride);
+            float scale = native_descale(params.query_descales, request, head,
+                                         params.query_descale_batch_stride, params.query_descale_head_stride)
+                * native_descale(params.key_descales, request, head,
+                                 params.key_descale_batch_stride, params.key_descale_head_stride);
             unsigned int bits = __float_as_uint(scale);
             valid_scale = bits != 0 && bits < 0x7f800000u;
         }
