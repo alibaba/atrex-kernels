@@ -2,11 +2,12 @@
 #include <stdint.h>
 #include <math.h>
 
-enum class DecodeVariant { q1, q4, q4_wide, q16_dual };
+enum class DecodeVariant { q1, q4, q4_wide, q16_dual, q16_history };
 
 constexpr auto NativeVariant = DecodeVariant::DECODE_VARIANT;
 constexpr bool NativeQ1Only = NativeVariant == DecodeVariant::q1;
-constexpr bool NativeQ16Dual = NativeVariant == DecodeVariant::q16_dual;
+constexpr bool NativeQ16History = NativeVariant == DecodeVariant::q16_history;
+constexpr bool NativeQ16Dual = NativeQ16History || NativeVariant == DecodeVariant::q16_dual;
 constexpr bool NativeWide = NativeVariant == DecodeVariant::q4_wide || NativeQ16Dual;
 constexpr int NativeKeyRows = NativeWide ? 64 : 32;
 constexpr int NativePlanRows = 32;
@@ -553,7 +554,8 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
               "=r"(query_fragments[tile][2]), "=r"(query_fragments[tile][3]) : "r"(address));
     }
     __syncthreads();
-    float log_scale = params.scale * 1.4426950408889634f
+    const float log_scale = NativeQ16History ? 0.0625f * 1.4426950408889634f :
+        params.scale * 1.4426950408889634f
         * native_descale(params.query_descales, request, head,
                          params.query_descale_batch_stride, params.query_descale_head_stride)
         * native_descale(params.key_descales, request, head,
@@ -563,6 +565,16 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     float output[OutputTiles][8] = {};
     float running_max[2] = {-INFINITY, -INFINITY};
     float running_sum[2] = {0.f, 0.f};
+    float history_limit[2] = {-INFINITY, -INFINITY};
+    float history_shift[2] = {8.f, 8.f};
+    auto refresh_history = [&](int row, float maximum, float shift) {
+        // P is scaled by 256, so a 0.75 log2 margin stays below E4M3's maximum of 448.
+        constexpr float ReferenceMargin = 0.75f / (0.0625f * 1.4426950408889634f);
+        // Preserve the usual max update for very large logits, where the
+        // ULP of the scale/shift pair consumes more of E4M3's headroom.
+        history_limit[row] = fabsf(maximum) <= 262144.f ? maximum + ReferenceMargin : maximum;
+        history_shift[row] = shift;
+    };
     unsigned char* current = NativeQ16Dual ? shared_keys : shared_transposed;
     unsigned char* next = NativeQ16Dual ? shared_keys + NativeTileBytes * 2 : shared_keys;
     const unsigned char* next_value = nullptr;
@@ -623,7 +635,9 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                 }
             }
         }
+        constexpr bool GuardedHistory = NativeQ16History && !First && !Masked;
         float alpha[2] = {1.f, 1.f};
+        float tile_maximum[2];
         float exponent_shift[2] = {};
         #pragma unroll
         for (int row = 0; row < ActiveRows; ++row) {
@@ -649,16 +663,52 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                     }
                 }
             }
-            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
-            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
-            float next_max = First ? maximum : fmaxf(running_max[row], maximum);
-            float safe_max = Masked && next_max == -INFINITY ? 0.f : next_max;
-            if constexpr (First) alpha[row] = 0.f;
-            else if constexpr (Masked) alpha[row] = running_max[row] == -INFINITY ? 0.f : __exp2f((running_max[row] - safe_max) * log_scale);
-            else alpha[row] = __exp2f((running_max[row] - safe_max) * log_scale);
-            exponent_shift[row] = fmaf(-safe_max, log_scale, 8.f);
-            running_sum[row] *= alpha[row];
-            running_max[row] = next_max;
+            if constexpr (GuardedHistory) {
+                tile_maximum[row] = maximum;
+            } else {
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
+                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
+                float next_max = First ? maximum : fmaxf(running_max[row], maximum);
+                float safe_max = Masked && next_max == -INFINITY ? 0.f : next_max;
+                if constexpr (First) alpha[row] = 0.f;
+                else if constexpr (Masked) alpha[row] = running_max[row] == -INFINITY ? 0.f : __exp2f((running_max[row] - safe_max) * log_scale);
+                else alpha[row] = __exp2f((running_max[row] - safe_max) * log_scale);
+                exponent_shift[row] = fmaf(-safe_max, log_scale, 8.f);
+                running_sum[row] *= alpha[row];
+                running_max[row] = next_max;
+                if constexpr (NativeQ16History) refresh_history(row, next_max, exponent_shift[row]);
+            }
+        }
+        if constexpr (GuardedHistory) {
+            // A warp-wide vote on lane-local maxima avoids cross-lane reductions on steady pages.
+            const bool any_exceeds_reference =
+                tile_maximum[0] > history_limit[0] || tile_maximum[1] > history_limit[1];
+            if (__any_sync(0xffffffff, any_exceeds_reference)) {
+                #pragma unroll
+                for (int row = 0; row < ActiveRows; ++row) {
+                    float maximum = tile_maximum[row];
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
+                    tile_maximum[row] = maximum;
+                }
+                if (tile_maximum[0] > history_limit[0]) {
+                    alpha[0] = __exp2f((running_max[0] - tile_maximum[0]) * log_scale);
+                    running_sum[0] *= alpha[0];
+                    running_max[0] = tile_maximum[0];
+                    refresh_history(0, running_max[0],
+                                    fmaf(-running_max[0], log_scale, 8.f));
+                }
+                if (tile_maximum[1] > history_limit[1]) {
+                    alpha[1] = __exp2f((running_max[1] - tile_maximum[1]) * log_scale);
+                    running_sum[1] *= alpha[1];
+                    running_max[1] = tile_maximum[1];
+                    refresh_history(1, running_max[1],
+                                    fmaf(-running_max[1], log_scale, 8.f));
+                }
+                native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
+            }
+            exponent_shift[0] = history_shift[0];
+            exponent_shift[1] = history_shift[1];
         }
         #pragma unroll
         for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
@@ -682,7 +732,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                 }
             }
         }
-        if constexpr (Query != 1 && !First) {
+        if constexpr (Query != 1 && !First && !GuardedHistory) {
             if (__any_sync(0xffffffff, alpha[0] != 1.f || alpha[1] != 1.f)) native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
         }
         unsigned int probabilities[NativeKeyRows / 32][4];
@@ -1505,6 +1555,11 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     params.page_shift = __builtin_ctz(static_cast<unsigned int>(metadata[5]));
     params.automatic = splits <= 0;
     params.splits = splits > 0 ? splits : 32;
+    if constexpr (NativeQ16History) {
+        if (scale != 0.0625f || params.query_descales || params.key_descales || params.value_descales) {
+            return static_cast<int>(hggcErrorInvalidValue);
+        }
+    }
     if constexpr (NativeQ16Dual) {
         if (params.max_query != 16 || params.query_heads != 32 || params.kv_heads != 2
             || params.page_size != 64 || splits < 1 || splits > 32) {

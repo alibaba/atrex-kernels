@@ -102,12 +102,12 @@ def _forward_validated(
     device = q.device
     total, query_heads, head_dim = q.shape
     cache_pages, page_size, kv_heads, _ = k.shape
+    batch = cu_seqlens_q.numel() - 1
     variant = "q1" if max_seqlen_q == 1 else "q4"
     if max_seqlen_q == 16:
-        variant = "q16_dual"
+        variant = "q16_history" if batch == 128 and max_seqlen_k - max_seqlen_q >= 64 * 1024 else "q16_dual"
     elif max_seqlen_q == 4 and query_heads // kv_heads == 16:
         variant = "q4_wide"
-    batch = cu_seqlens_q.numel() - 1
     compute_units = _compute_units(device)
     library = load_library(variant, device)
     if out is None:
