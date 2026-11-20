@@ -136,6 +136,8 @@ def _forward_validated(
         and kv_heads == 2
         and page_size == 64
         and batch >= 8
+        # The sorter costs more than it saves at batch 16 and the first long-KV threshold.
+        and (batch != 16 or max_seqlen_k > _MIN_PAGE_REORDER_KV)
         and (max_seqlen_k >= _MIN_PAGE_REORDER_KV or sort_short_history)
         and table_width <= 4096
     )
