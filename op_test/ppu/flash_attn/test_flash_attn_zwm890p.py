@@ -659,7 +659,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q16_dual"}
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q16_dual", "q16_history"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
@@ -902,7 +902,16 @@ def test_direct_paged_q16_prefill_graph(lengths, monkeypatch):
     _check(case, graph=True)
 
 
-def test_q16_high_batch_prefill_history_and_graph_tail():
+def test_q16_high_batch_prefill_history_and_graph_tail(monkeypatch):
+    from atrex.src.ppu.flash_attn.zwm890p import decode_build
+
+    load_library = decode_build.load_library
+
+    def load_history(variant, device):
+        assert variant == "q16_history"
+        return load_library(variant, device)
+
+    monkeypatch.setattr(decode_build, "load_library", load_history)
     lengths = [64 * 1024 + 17] + [131, 64, 17, 257] * 31 + [129, 67, 511]
     case = build_case(64, [16] * len(lengths), lengths, hq=32, hkv=2)
     for name in ("q_descale", "k_descale", "v_descale"):
