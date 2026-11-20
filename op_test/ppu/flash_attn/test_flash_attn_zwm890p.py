@@ -762,6 +762,35 @@ def test_decode_vector_output_rejects_unaligned_out():
     torch.testing.assert_close(aligned.float(), expected, atol=.03, rtol=.05)
 
 
+def test_decode_historical_page_order_replays_current_metadata():
+    from atrex import flash_attn_varlen_func
+
+    long_length = 128 * 1024 + 2
+    case = build_case(64, [4, 4] + [1] * 62, [long_length] * 2 + [193] * 62, hq=32, hkv=2)
+    for name, scale in (("q_descale", .875), ("k_descale", 1.125), ("v_descale", .75)):
+        case[name].fill_(scale)
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    lengths = case["seqused_k"]
+    table = case["block_table"]
+    for first, second in ((long_length, long_length), (long_length - 1, 4097), (33, long_length)):
+        lengths[:2].copy_(torch.tensor([first, second], dtype=lengths.dtype, device=lengths.device))
+        table[:2, 0].copy_(table[:2, 0].flip(0))
+        expected_table = table.clone()
+        out.fill_(float("nan"))
+        graph.replay()
+        eager = flash_attn_varlen_func(**case)
+        torch.testing.assert_close(out, eager, atol=0., rtol=0.)
+        expected, _ = reference(case)
+        torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
+        assert torch.equal(table, expected_table)
+
+
 def test_eligibility_does_not_compile_or_launch(monkeypatch):
     from atrex import can_use_flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import launch

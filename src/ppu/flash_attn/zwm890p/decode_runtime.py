@@ -6,6 +6,9 @@ import math
 import torch
 
 
+_MIN_PAGE_REORDER_KV = 64 * 1024
+
+
 def validate(call):
     q, k, v = (call[name] for name in ("q", "k", "v"))
     table = call["block_table"]
@@ -91,11 +94,26 @@ def forward(
         k_descale = unit if k_descale is None else k_descale
         v_descale = unit if v_descale is None else v_descale
     selected_splits = num_splits or 32
+    table_width = page_table.shape[1]
+    sort_history = (
+        variant == "q4_wide"
+        and num_splits == 0
+        and kv_heads == 2
+        and page_size == 64
+        and batch >= 64
+        and max_seqlen_k >= _MIN_PAGE_REORDER_KV
+        and table_width <= 4096
+    )
     partial = partial_lse = None
     if selected_splits > 1:
         partial = torch.empty((selected_splits, query_heads, total, head_dim), device=q.device, dtype=torch.float32)
         partial_lse = torch.empty((selected_splits, query_heads, total), device=q.device, dtype=torch.float32)
-    plan = torch.empty(4 + batch + batch * kv_heads * selected_splits, device=q.device, dtype=torch.int32) if num_splits == 0 else None
+    plan = None
+    if num_splits == 0:
+        plan_entries = 4 + batch + batch * kv_heads * selected_splits
+        if sort_history:
+            plan_entries += batch * table_width
+        plan = torch.empty(plan_entries, device=q.device, dtype=torch.int32)
     tensors = (q, k, v, out, cu_seqlens_q, seqused_k, page_table,
                q_descale, k_descale, v_descale, partial, partial_lse, plan)
     pointers = (ctypes.c_void_p * len(tensors))(*(tensor.data_ptr() if tensor is not None else 0 for tensor in tensors))
@@ -105,8 +123,10 @@ def forward(
               *q_descale.stride(), *k_descale.stride(), *v_descale.stride(),
               compute_units, query_heads, kv_heads]
     metadata = (ctypes.c_int64 * len(values))(*values)
+    # A private ABI selector enables the native sorter and its appended workspace.
+    native_splits = -1 if sort_history else num_splits
     status = library.atrex_ppu_decode(
-        pointers, metadata, softmax_scale, num_splits,
+        pointers, metadata, softmax_scale, native_splits,
         torch.cuda.current_stream(q.device).cuda_stream,
     )
     if status:
