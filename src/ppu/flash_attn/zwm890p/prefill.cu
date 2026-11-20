@@ -528,15 +528,24 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
   u32 qf[KSTEPS][4];
 #pragma unroll
   for (int ks = 0; ks < KSTEPS; ++ks) {
-    const int d0 = ks * 32 + la * 8;
-    const uint2 a = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowa * QUERY_HEADS * HEAD_DIM + d0);
-    const uint2 b = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowb * QUERY_HEADS * HEAD_DIM + d0);
-    qf[ks][0] = a.x;  // row even, d&7 = 0..3
-    qf[ks][1] = b.x;  // row odd,  d&7 = 0..3
-    qf[ks][2] = a.y;  // row even, d&7 = 4..7
-    qf[ks][3] = b.y;  // row odd,  d&7 = 4..7
+    const auto* a = qbase + (size_t)rowa * QUERY_HEADS * HEAD_DIM + ks * 32;
+    const auto* b = qbase + (size_t)rowb * QUERY_HEADS * HEAD_DIM + ks * 32;
+    if constexpr (DIRECT_K) {
+      // Raw AIU K pairs with the native A fragment: two groups of four
+      // channels from opposite 16-channel slabs of the contraction tile.
+      const int channel = 4 * la;
+      qf[ks][0] = *reinterpret_cast<const u32*>(a + channel);
+      qf[ks][1] = *reinterpret_cast<const u32*>(b + channel);
+      qf[ks][2] = *reinterpret_cast<const u32*>(a + channel + 16);
+      qf[ks][3] = *reinterpret_cast<const u32*>(b + channel + 16);
+    } else {
+      const uint2 even = *reinterpret_cast<const uint2*>(a + 8 * la);
+      const uint2 odd = *reinterpret_cast<const uint2*>(b + 8 * la);
+      qf[ks][0] = even.x;
+      qf[ks][1] = odd.x;
+      qf[ks][2] = even.y;
+      qf[ks][3] = odd.y;
+    }
   }
 
   // ------------------------------------------------------------------------------ accumulators
