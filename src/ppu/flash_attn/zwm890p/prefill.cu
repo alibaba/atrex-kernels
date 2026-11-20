@@ -254,6 +254,12 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep(
 
 // Raw-FP8 prep performs layout conversion only. Identity K/V scales are folded
 // into the attention math, so no scale metadata is materialised here.
+// AIU K is kept in its native swizzle. The N16 score slots use this
+// token permutation, so prepared V and the causal mask use the same map.
+__device__ __forceinline__ int direct_key_token(int logical) {
+  return 2 * (logical >> 2) + (logical & 1) + 8 * ((logical >> 1) & 1);
+}
+
 __device__ __forceinline__ u32 prep_v_word(
     const unsigned char* values, int channel, int word_index) {
   const int first_kv = 32 * (word_index >> 3) + 16 * (word_index & 1) +
@@ -279,7 +285,58 @@ __device__ __forceinline__ void prep_store_v_page(
   }
 }
 
-template <bool MULTI_HEAD = false>
+__device__ __forceinline__ int direct_v_stage_offset(int token, int channel) {
+  // Preserve 16-byte vector alignment while moving token bits 2, 4, and 5 into bank bits.
+  const int bank_group = ((token >> 2) & 1) | ((token >> 3) & 6);
+  return token * HEAD_DIM + (channel ^ (16 * bank_group));
+}
+
+__device__ __forceinline__ uint4 prep_direct_v_transpose(uint4 rows) {
+  const u32 low_xy = __byte_perm(rows.x, rows.y, 0x5410);
+  const u32 high_xy = __byte_perm(rows.x, rows.y, 0x7632);
+  const u32 low_zw = __byte_perm(rows.z, rows.w, 0x5410);
+  const u32 high_zw = __byte_perm(rows.z, rows.w, 0x7632);
+  return make_uint4(__byte_perm(low_xy, low_zw, 0x6420), __byte_perm(low_xy, low_zw, 0x7531),
+                    __byte_perm(high_xy, high_zw, 0x6420), __byte_perm(high_xy, high_zw, 0x7531));
+}
+
+__device__ __forceinline__ uint4 prep_direct_v_quad(const unsigned char* values, int channel, int word) {
+  const int first = 32 * (word >> 3) + 16 * (word & 1) + 4 * ((word >> 1) & 3);
+  const int token_base = first & ~15;
+  const int within = first & 15;
+  u32 rows[4];
+#pragma unroll
+  for (int row = 0; row < 4; ++row) {
+    const int token = token_base + direct_key_token(within + row);
+    rows[row] = *reinterpret_cast<const u32*>(values + direct_v_stage_offset(token, channel));
+  }
+  return prep_direct_v_transpose(make_uint4(rows[0], rows[1], rows[2], rows[3]));
+}
+
+__device__ __forceinline__ void prep_store_v_direct_vec(unsigned char* destination,
+                                                        const unsigned char* values, int tid) {
+  static_assert(PAGE == 64 && HEAD_DIM == 256 && NTHREADS == 256);
+  // Adjacent lanes write adjacent 8-byte chunks for each group of four channels.
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    const int vector = pass * NTHREADS + tid;
+    const int chunk = vector & 7;
+    const int channel = (vector >> 3) * 4;
+    const int row_quarter = (channel & 15) >> 2;
+    int first_word = 8 * (chunk >> 2) + 4 * (chunk & 1) + ((chunk >> 1) & 1);
+    first_word ^= (row_quarter & 1) | ((row_quarter & 2) << 2);
+    const uint4 first = prep_direct_v_quad(values, channel, first_word);
+    const uint4 second = prep_direct_v_quad(values, channel, first_word + 2);
+    const int base = (channel >> 5) * 1024 + ((channel >> 4) & 1) * 256 + 64 * row_quarter;
+    unsigned char* out = destination + 2 * (base + 4 * chunk);
+    *reinterpret_cast<uint2*>(out) = make_uint2(first.x, second.x);
+    *reinterpret_cast<uint2*>(out + 64) = make_uint2(first.y, second.y);
+    *reinterpret_cast<uint2*>(out + 1024) = make_uint2(first.z, second.z);
+    *reinterpret_cast<uint2*>(out + 1088) = make_uint2(first.w, second.w);
+  }
+}
+
+template <bool MULTI_HEAD = false, bool DIRECT_K = false>
 __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
     const unsigned char* __restrict__ key_cache,
     const unsigned char* __restrict__ value_cache,
@@ -297,25 +354,28 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 
   for (int p = blockIdx.x; p < n_pages; p += gridDim.x) {
     const int pid = block_table[req * bt_stride + p];
-    const unsigned char* kp = key_cache + ((size_t)pid * PAGE * head_count + kv_head) * HEAD_DIM;
     const unsigned char* vp = value_cache + ((size_t)pid * PAGE * head_count + kv_head) * HEAD_DIM;
-    unsigned char* kdst = k_fp8 + ((size_t)blockIdx.y * max_pages + p) * KPAGE_BYTES;
     unsigned char* vdst = v_fp8 + ((size_t)blockIdx.y * max_pages + p) * VPAGE_BYTES;
 
-    const int kv = tid >> 2, ka = tid & 3;
+    if constexpr (!DIRECT_K) {
+      const unsigned char* kp = key_cache + ((size_t)pid * PAGE * head_count + kv_head) * HEAD_DIM;
+      unsigned char* kdst = k_fp8 + ((size_t)blockIdx.y * max_pages + p) * KPAGE_BYTES;
+      const int kv = tid >> 2, ka = tid & 3;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const uint2 code = *reinterpret_cast<const uint2*>(
-          kp + kv * head_count * HEAD_DIM + ka * 8 + j * 32);
-      const int dimension = 32 * j + 8 * ka;
-      reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension) / 2] = code.x;
-      reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension + 4) / 2] = code.y;
+      for (int j = 0; j < 8; ++j) {
+        const uint2 code = *reinterpret_cast<const uint2*>(
+            kp + kv * head_count * HEAD_DIM + ka * 8 + j * 32);
+        const int dimension = 32 * j + 8 * ka;
+        reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension) / 2] = code.x;
+        reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension + 4) / 2] = code.y;
+      }
     }
     if ((p + 1) * PAGE <= kv_len) {
 #pragma unroll
       for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
         const int e = (c * NTHREADS + tid) * 16;
-        *reinterpret_cast<uint4*>(Vs + e) = *reinterpret_cast<const uint4*>(
+        const int staged = DIRECT_K ? direct_v_stage_offset(e / HEAD_DIM, e % HEAD_DIM) : e;
+        *reinterpret_cast<uint4*>(Vs + staged) = *reinterpret_cast<const uint4*>(
             vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
       }
     } else {
@@ -323,16 +383,18 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 #pragma unroll
       for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
         const int e = (c * NTHREADS + tid) * 16;
+        const int staged = DIRECT_K ? direct_v_stage_offset(e / HEAD_DIM, e % HEAD_DIM) : e;
         uint4 value = make_uint4(0, 0, 0, 0);
         if (p * PAGE + e / HEAD_DIM < kv_len) {
           value = *reinterpret_cast<const uint4*>(
               vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
         }
-        *reinterpret_cast<uint4*>(Vs + e) = value;
+        *reinterpret_cast<uint4*>(Vs + staged) = value;
       }
     }
     __syncthreads();
-    prep_store_v_page(vdst, Vs, tid);
+    if constexpr (DIRECT_K) prep_store_v_direct_vec(vdst, Vs, tid);
+    else prep_store_v_page(vdst, Vs, tid);
     __syncthreads();
   }
 }
@@ -345,14 +407,39 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 // (q-block, slice) pair, snapped to PAGE granularity because the page loop carries a barrier. Each
 // slice keeps its own reference max and writes fp32 (O_s, m_s, l_s); atrex_ppu_comb merges them. SPLIT=0
 // constant-folds every line of that away.
+// Same one-request, D-major 64 x 256 K tile as native wide decode.
+template <int KV_HEADS>
+__device__ __forceinline__ void direct_stage_key(
+    unsigned char* destination, const unsigned char* source, int valid_rows) {
+  constexpr unsigned long long row_stride = KV_HEADS * HEAD_DIM;
+  constexpr unsigned long long slab_stride = 128;
+  const u32 shared = static_cast<u32>(__cvta_generic_to_shared(destination));
+  asm volatile("ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.LLC::128B.padz.swzl.b8 "
+      "[%0], [%1], {%2,%3,%4}, {%5,%6,%7}, {%8,%9}, {%10,%11,%12}, %13;"
+      :: "r"(shared), "l"(source), "r"(128), "r"(valid_rows), "r"(2),
+         "r"(128), "r"(PAGE), "r"(2), "l"(row_stride), "l"(slab_stride),
+         "r"(0), "r"(0), "r"(0), "r"(0)
+      : "memory");
+}
+
+template <bool DIRECT_K>
+__device__ __forceinline__ void load_prefill_key(u32 (&fragment)[4], u32 key_block,
+                                                 int channel_tile, int key_half) {
+  const int slab = channel_tile >> 2;
+  const int cube = DIRECT_K ? (4 * slab + key_half) : (4 * (key_half >> 1) + 2 * slab + (key_half & 1));
+  load_k_ldmatrix(fragment, key_block + 128 * cube + 2 * (channel_tile & 3));
+}
+
 template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4,
-          int QUERY_HEADS = NHEADS, int KV_HEADS = 1, bool LINEAR_AIU = false>
+          int QUERY_HEADS = NHEADS, int KV_HEADS = 1, bool LINEAR_AIU = false, bool DIRECT_K = false>
 __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
     const float* __restrict__ vamax, const int* __restrict__ cu_q,
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out,
-    float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit) {
+    float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit,
+    const int* __restrict__ raw_block_table, int raw_table_stride) {
+  static_assert(!DIRECT_K || (LINEAR_AIU && !SPLIT));
   extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + NBUF * KPAGE_BYTES;
@@ -389,8 +476,8 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
   const int unit = warp >> 1, wq = warp & 1;   // head within the CTA / which 16-row half
   const int head_group = GROUPED ? blockIdx.x % (QUERY_HEADS / 4) : blockIdx.y;
   const int head = head_group * 4 + unit;
-  const int packed_request = KV_HEADS == 1 ? req :
-      req * KV_HEADS + head_group / (QUERY_HEADS / KV_HEADS / 4);
+  const int kv_head = KV_HEADS == 1 ? 0 : head_group / (QUERY_HEADS / KV_HEADS / 4);
+  const int packed_request = req * KV_HEADS + kv_head;
   const int lq = lane >> 2, la = lane & 3;         // A side: row group / k group
   const int lp = lane >> 3, lb = (lane >> 2) & 1;  // B side: row index is lb + 2*(r>>1) + 4*lp
 
@@ -469,7 +556,8 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
 #endif
 
   // bases pre-offset to this slice's first page, so the loop indexes them by the relative page
-  const unsigned char* kg = k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
+  const unsigned char* kg = DIRECT_K ? k_fp8 + kv_head * HEAD_DIM :
+      k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
   const unsigned char* vg = v_fp8 + ((size_t)packed_request * max_pages + p_lo) * VPAGE_BYTES;
   const int copy_warp = LINEAR_AIU ? __shfl_sync(0xffffffffu, warp, 0) : -1;
 #define STAGE_NC(buf, page)                                                            \
@@ -480,7 +568,15 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     unsigned char* _vd = Vs + (buf)*VPAGE_BYTES;                                       \
     if constexpr (LINEAR_AIU) {                                                        \
       if (copy_warp == 0) {                                                           \
-        aiu_stage_packed_page(_kd, _ks);                                              \
+        if constexpr (DIRECT_K) {                                                    \
+          const int logical_page = p_lo + npg - (page);                              \
+          const int physical_page = raw_block_table[req * raw_table_stride + logical_page]; \
+          const int valid_rows = min(PAGE, kv_len - logical_page * PAGE);             \
+          const size_t page_offset = (size_t)physical_page * PAGE * KV_HEADS * HEAD_DIM; \
+          direct_stage_key<KV_HEADS>(_kd, kg + page_offset, valid_rows);       \
+        } else {                                                                     \
+          aiu_stage_packed_page(_kd, _ks);                                            \
+        }                                                                            \
         aiu_stage_packed_page(_vd, _vs);                                              \
       }                                                                                \
     } else {                                                                           \
@@ -618,7 +714,8 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
       if (pg > npg) continue;
     const unsigned char* Kb = Ks + (pg & (NBUF - 1)) * KPAGE_BYTES;
     const unsigned char* Vb = Vs + (pg & (NBUF - 1)) * VPAGE_BYTES;
-    const u32 key_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
+    const u32 key_block = DIRECT_K ? static_cast<u32>(__cvta_generic_to_shared(Kb) >> 4) :
+        static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
     const u32 value_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Vb) / 16);
 #if !SPG4
     const float aa = 0.0625f * 1.4426950408889634f;
@@ -631,11 +728,10 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     }
 #pragma unroll
     for (int step = 0; step < KSTEPS; ++step) {
-      const int base_offset = 8192 + 4096 * (step >> 2) + 32 * (step & 3);
       u32 first_key[4];
       u32 second_key[4];
-      load_k_ldmatrix(first_key, key_block + base_offset / 16);
-      load_k_ldmatrix(second_key, key_block + base_offset / 16 + 128);
+      load_prefill_key<DIRECT_K>(first_key, key_block, step, 2);
+      load_prefill_key<DIRECT_K>(second_key, key_block, step, 3);
       MMA_E4M3(page_scores[2], qf[step], first_key);
       MMA_E4M3(page_scores[3], qf[step], second_key);
     }
@@ -646,17 +742,21 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
       for (int tile = 2; tile < 4; ++tile) {
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
-        for (int element = 0; element < 8; ++element)
-          if (2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit ||
-              4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
+        for (int element = 0; element < 8; ++element) {
+          const int logical = 4 * la + 2 * (element >> 2) + (element & 1);
+          const int key = DIRECT_K ? direct_key_token(logical) : logical;
+          if (key - 4 * la - ((element >> 1) & 1) > mask_limit ||
+              key >= kv_len - kv_lo - physical_page * PAGE - tile * 16) {
             page_scores[tile][element] = -INFINITY;
+          }
+        }
       }
     }
 
     u32 future_first_key[4];
     u32 future_second_key[4];
-    load_k_ldmatrix(future_first_key, key_block);
-    load_k_ldmatrix(future_second_key, key_block + 128);
+    load_prefill_key<DIRECT_K>(future_first_key, key_block, 0, 0);
+    load_prefill_key<DIRECT_K>(future_second_key, key_block, 0, 1);
     u32 first_probability[4];
     {
       const int group = 1;
@@ -704,7 +804,6 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
 #pragma unroll
             for (int substep = 0; substep < 2; ++substep) {
               const int step = 2 * (2 * tile_half + row_half) + substep;
-              const int base_offset = 4096 * (step >> 2) + 32 * (step & 3);
               u32 first_key[4];
               u32 second_key[4];
               if (step == 0) {
@@ -714,8 +813,8 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
                   second_key[word] = future_second_key[word];
                 }
               } else {
-                load_k_ldmatrix(first_key, key_block + base_offset / 16);
-                load_k_ldmatrix(second_key, key_block + base_offset / 16 + 128);
+                load_prefill_key<DIRECT_K>(first_key, key_block, step, 0);
+                load_prefill_key<DIRECT_K>(second_key, key_block, step, 1);
               }
               MMA_E4M3(page_scores[0], qf[step], first_key);
               MMA_E4M3(page_scores[1], qf[step], second_key);
@@ -730,10 +829,14 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
       for (int tile = 0; tile < 2; ++tile) {
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
-        for (int element = 0; element < 8; ++element)
-          if (2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit ||
-              4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
+        for (int element = 0; element < 8; ++element) {
+          const int logical = 4 * la + 2 * (element >> 2) + (element & 1);
+          const int key = DIRECT_K ? direct_key_token(logical) : logical;
+          if (key - 4 * la - ((element >> 1) & 1) > mask_limit ||
+              key >= kv_len - kv_lo - physical_page * PAGE - tile * 16) {
             page_scores[tile][element] = -INFINITY;
+          }
+        }
       }
     }
     float future_scale[2] = {1.f, 1.f};
@@ -1214,19 +1317,19 @@ void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torc
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (QUERY_HEADS / 4)) : dim3((unsigned)launch_nblk, QUERY_HEADS / 4);
     atrex_ppu_attn<0, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
-        seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1);
+        seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1, nullptr, 0);
   } else {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * (QUERY_HEADS / 4), 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, QUERY_HEADS / 4, (unsigned)nsplit);
     if (nsplit == 2)
       atrex_ppu_attn<1, GROUPED, 2, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
-          (int)nsplit);
+          (int)nsplit, nullptr, 0);
     else
       atrex_ppu_attn<1, GROUPED, 4, QUERY_HEADS, KV_HEADS, LINEAR_AIU><<<grid, NTHREADS, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
-          (int)nsplit);
+          (int)nsplit, nullptr, 0);
   }
 }
 
@@ -1315,9 +1418,63 @@ void attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tens
       max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
 }
 
+void prep_v_direct_k(torch::Tensor value_cache, torch::Tensor block_table,
+                     torch::Tensor seq_lens, torch::Tensor v_fp8, int64_t max_pages) {
+  const int kv_heads = (int)value_cache.size(2);
+  const dim3 grid(312, block_table.size(0) * kv_heads);
+  const auto kernel = kv_heads == 1 ? atrex_ppu_prep_raw<false, true> : atrex_ppu_prep_raw<true, true>;
+  kernel<<<grid, NTHREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+      nullptr, reinterpret_cast<const unsigned char*>(value_cache.data_ptr()),
+      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(), nullptr,
+      reinterpret_cast<unsigned char*>(v_fp8.data_ptr()), nullptr, nullptr,
+      (int)block_table.stride(0), (int)max_pages, kv_heads);
+}
+
+template <int QUERY_HEADS, int KV_HEADS>
+void launch_prefill_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8,
+                            torch::Tensor table, torch::Tensor cu_q, torch::Tensor seq_lens,
+                            torch::Tensor out, int64_t max_pages, int64_t nblk) {
+  constexpr auto kernel = atrex_ppu_attn<0, true, 4, QUERY_HEADS, KV_HEADS, true, true>;
+  constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
+  const int n_req = (int)cu_q.size(0) - 1;
+  const int n_tok = (int)out.size(0);
+  const int launch_nblk = n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk;
+  const dim3 grid(launch_nblk * (QUERY_HEADS / 4));
+  static const bool configured = [] {
+    TORCH_CHECK(cudaFuncSetAttribute(atrex_ppu_attn<0, true, 4, QUERY_HEADS, KV_HEADS, true, true>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     NBUF * (KPAGE_BYTES + VPAGE_BYTES)) == cudaSuccess,
+                "direct-K attention dynamic shared configuration failed");
+    return true;
+  }();
+  (void)configured;
+  kernel<<<grid, NTHREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const unsigned char*>(q.data_ptr()),
+      reinterpret_cast<const unsigned char*>(raw_k.data_ptr()),
+      reinterpret_cast<const unsigned char*>(v_fp8.data_ptr()),
+      nullptr, nullptr, cu_q.data_ptr<int>(), seq_lens.data_ptr<int>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, n_req, (int)max_pages,
+      n_tok, 1, table.data_ptr<int>(), (int)table.stride(0));
+}
+
+void attn_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8, torch::Tensor table,
+                   torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
+                   int64_t max_pages, int64_t nblk) {
+  TORCH_CHECK((reinterpret_cast<uintptr_t>(raw_k.data_ptr()) & 127) == 0,
+              "direct-K requires 128-byte-aligned key pages");
+  if (q.size(1) == 8 && raw_k.size(2) == 1) {
+    launch_prefill_direct_k<8, 1>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, max_pages, nblk);
+  } else {
+    TORCH_CHECK(q.size(1) == 32 && raw_k.size(2) == 2, "unsupported direct-K head shape");
+    launch_prefill_direct_k<32, 2>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, max_pages, nblk);
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("launch_plan", &launch_plan);
   m.def("prep_kv", &prep_kv);
+  m.def("prep_v_direct_k", &prep_v_direct_k);
+  m.def("attn_direct_k", &attn_direct_k);
   m.def("attn", &attn);
   m.def("combine", &combine);
 }

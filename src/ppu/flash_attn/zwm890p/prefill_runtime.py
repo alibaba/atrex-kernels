@@ -50,15 +50,16 @@ def _aligned_bytes(size):
     return (size + 511) // 512 * 512
 
 
-def _group_layout(batch, capacity, heads, pages, scaled):
+def _group_layout(batch, capacity, heads, pages, scaled, direct_k=False):
     minimum = max(1, capacity // 2) if capacity < batch else batch
     slots = (batch + minimum - 1) // minimum
     # One allocation owns every prep temporary, including full-call descales.
+    packed_pages = capacity * heads * pages
     specifications = (
-        ("k", (capacity * heads * pages * 16384,), torch.uint8, 1),
-        ("v", (capacity * heads * pages * 16384,), torch.uint8, 1),
-        ("k_scale", (capacity * heads * pages,), torch.float32, 4),
-        ("v_amax", (capacity * heads * 256,), torch.float32, 4),
+        ("k", (0 if direct_k else packed_pages * 16384,), torch.uint8, 1),
+        ("v", (packed_pages * 16384,), torch.uint8, 1),
+        ("k_scale", (0 if direct_k else packed_pages,), torch.float32, 4),
+        ("v_amax", (0 if direct_k else capacity * heads * 256,), torch.float32, 4),
         ("table", (capacity, pages), torch.int32, 4),
         ("cu", (capacity + 1,), torch.int32, 4),
         ("lengths", (capacity,), torch.int32, 4),
@@ -77,19 +78,20 @@ def _group_layout(batch, capacity, heads, pages, scaled):
     return layout, total, minimum, slots
 
 
-def _group_workspace(batch, heads, pages, scaled, device):
-    lower, upper = 1, min(batch, _PREP_WORKSPACE_BYTES // (2 * heads * pages * 16384))
+def _group_workspace(batch, heads, pages, scaled, device, direct_k=False):
+    packed_planes = 1 if direct_k else 2
+    lower, upper = 1, min(batch, _PREP_WORKSPACE_BYTES // (packed_planes * heads * pages * 16384))
     capacity = 0
     while lower <= upper:
         middle = (lower + upper) // 2
-        if _group_layout(batch, middle, heads, pages, scaled)[1] <= _PREP_WORKSPACE_BYTES:
+        if _group_layout(batch, middle, heads, pages, scaled, direct_k)[1] <= _PREP_WORKSPACE_BYTES:
             capacity, lower = middle, middle + 1
         else:
             upper = middle - 1
     # Requests cannot be split here. Allow one request above the target and
     # let the allocator report an OOM only if the actual allocation fails.
     capacity = max(1, capacity)
-    layout, size, minimum, slots = _group_layout(batch, capacity, heads, pages, scaled)
+    layout, size, minimum, slots = _group_layout(batch, capacity, heads, pages, scaled, direct_k)
     storage = torch.empty(size, dtype=torch.uint8, device=device)
     views = {
         name: storage[offset:offset + length].view(dtype).view(shape)
@@ -168,6 +170,15 @@ def _remap_block_table(table, virtual_stride, subpages):
     return remapped
 
 
+def _fill_descales(descales, sources):
+    if descales.numel():
+        for index, scale in enumerate(sources):
+            if scale is None:
+                descales[index].fill_(1.0)
+            else:
+                descales[index].copy_(scale)
+
+
 def forward(
     *, q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k,
     max_seqlen_q, max_seqlen_k, page_table, softmax_scale, causal,
@@ -242,45 +253,55 @@ def forward(
     kv_heads = k.shape[2]
     scales = (q_descale, k_descale, v_descale)
     scaled = any(scale is not None for scale in scales)
-    packed_bytes = requests * kv_heads * max_pages * 16384
+    descale_shape = (3, requests, kv_heads) if scaled else (0,)
+    query_blocks = (q.shape[0] + 31) // 32 + requests
+    use_direct_k = (q.shape[1], kv_heads) == (32, 2) and requests in (8, 64, 128)
+    use_direct_k |= (q.shape[1], kv_heads, requests) == (8, 1, 8)
+    direct_k = (
+        use_direct_k and num_splits == 1 and max_seqlen_q == 128 and k.shape[1] == 64
+        and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
+        and softmax_scale in (None, 0.0625)
+        and not scaled
+    )
+
+    partial = torch.empty(
+        num_splits * q.shape[0] * q.shape[1] * 272 if num_splits > 1 else 0,
+        dtype=torch.float32, device=q.device,
+    )
+    packed_pages = requests * kv_heads * max_pages
+    packed_bytes = packed_pages * 16384
     full_bytes = sum(_aligned_bytes(size) for size in (
-        packed_bytes, packed_bytes, requests * kv_heads * max_pages * 4,
-        requests * kv_heads * 256 * 4, 3 * requests * kv_heads * 4 if scaled else 0,
+        0 if direct_k else packed_bytes,
+        packed_bytes,
+        0 if direct_k else packed_pages * 4,
+        0 if direct_k else requests * kv_heads * 256 * 4,
+        3 * requests * kv_heads * 4 if scaled else 0,
         requests * page_table.shape[1] * subpages * 4 if virtual_stride != 1 else 0,
         subpages * 4 if virtual_stride != 1 and subpages > 1 else 0,
     ))
     workspace = None
+    slots = 1
     if full_bytes > _PREP_WORKSPACE_BYTES:
         workspace, capacity, minimum, slots = _group_workspace(
-            requests, kv_heads, max_pages, scaled, q.device,
+            requests, kv_heads, max_pages, scaled, q.device, direct_k,
         )
         descales = workspace["scales"]
         packed_k, packed_v = workspace["k"], workspace["v"]
         k_scale, v_amax = workspace["k_scale"], workspace["v_amax"]
         remapped_table = workspace["table"]
     else:
-        # Preserve the original single-launch path when its complete prep
-        # scratch fits. No planner or group metadata kernels run on this path.
         remapped_table = _remap_block_table(page_table, virtual_stride, subpages)
-        descales = torch.empty(
-            (3, requests, kv_heads) if scaled else (0,),
-            dtype=torch.float32, device=q.device,
-        )
-        packed_k = torch.empty(packed_bytes, dtype=torch.uint8, device=q.device)
-        packed_v = torch.empty_like(packed_k)
-        k_scale = torch.empty(requests * kv_heads * max_pages, dtype=torch.float32, device=q.device)
-        v_amax = torch.empty(requests * kv_heads * 256, dtype=torch.float32, device=q.device)
-    if scaled:
-        for index, scale in enumerate(scales):
-            if scale is None:
-                descales[index].fill_(1.0)
-            else:
-                descales[index].copy_(scale)
-    partial = torch.empty(
-        num_splits * q.shape[0] * q.shape[1] * 272 if num_splits > 1 else 0,
-        dtype=torch.float32, device=q.device,
-    )
+        descales = torch.empty(descale_shape, dtype=torch.float32, device=q.device)
+        packed_v = torch.empty(packed_bytes, dtype=torch.uint8, device=q.device)
+        if not direct_k:
+            packed_k = torch.empty_like(packed_v)
+            k_scale = torch.empty(packed_pages, dtype=torch.float32, device=q.device)
+            v_amax = torch.empty(requests * kv_heads * 256, dtype=torch.float32, device=q.device)
+    _fill_descales(descales, scales)
+
     out.zero_()
+
+    group_cu, group_lengths, group_scales = cu_seqlens_q, seqused_k, descales
     if workspace is not None:
         planner = _workspace_extension(q.device)
         query_multiplier, query_tile, head_groups, resident = _group_geometry(q.shape[1], kv_heads, q.device)
@@ -289,31 +310,34 @@ def forward(
             workspace["next"], workspace["starts"], capacity, minimum,
             query_multiplier, query_tile, head_groups, num_splits, resident,
         )
-    # The launch count is graph-static; the GPU recomputes group boundaries on
-    # every invocation. Unused slots have zero lengths and do no attention work.
-    for slot in range(slots if workspace is not None else 1):
+        group_cu, group_lengths, group_scales = workspace["cu"], workspace["lengths"], workspace["group_scales"]
+        query_blocks = (q.shape[0] + 31) // 32 + capacity
+
+    # Group count is graph-static. Each replay rebuilds live group metadata and
+    # reuses the same packed workspace, with global Q offsets for the writes.
+    for slot in range(slots):
         if workspace is not None:
             planner.prepare(
                 page_table, cu_seqlens_q, seqused_k, descales, workspace["starts"],
-                remapped_table, workspace["cu"], workspace["lengths"],
-                workspace["group_scales"], slot, virtual_stride, subpages,
+                remapped_table, group_cu, group_lengths, group_scales,
+                slot, virtual_stride, subpages,
             )
-            group_cu, group_lengths, group_scales = (
-                workspace["cu"], workspace["lengths"], workspace["group_scales"],
+        if direct_k:
+            extension.prep_v_direct_k(value_view, remapped_table, group_lengths, packed_v, max_pages)
+            extension.attn_direct_k(
+                q, key_view, packed_v, remapped_table, group_cu, group_lengths,
+                out, max_pages, query_blocks,
             )
-            group_requests = capacity
         else:
-            group_cu, group_lengths, group_scales = cu_seqlens_q, seqused_k, descales
-            group_requests = requests
-        extension.prep_kv(
-            key_view, value_view, remapped_table, group_lengths,
-            packed_k, packed_v, k_scale, v_amax, max_pages,
-        )
-        extension.attn(
-            q, packed_k, packed_v, k_scale, v_amax, group_cu, group_lengths,
-            out, partial, max_pages, (q.shape[0] + 31) // 32 + group_requests, num_splits,
-            kv_heads, group_scales, softmax_scale,
-        )
+            extension.prep_kv(
+                key_view, value_view, remapped_table, group_lengths,
+                packed_k, packed_v, k_scale, v_amax, max_pages,
+            )
+            extension.attn(
+                q, packed_k, packed_v, k_scale, v_amax, group_cu, group_lengths,
+                out, partial, max_pages, query_blocks, num_splits,
+                kv_heads, group_scales, softmax_scale,
+            )
     if num_splits > 1:
         extension.combine(partial, out, num_splits)
     return out, None

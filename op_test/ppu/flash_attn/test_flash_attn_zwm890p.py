@@ -902,6 +902,19 @@ def test_direct_paged_q16_prefill_graph(lengths, monkeypatch):
     _check(case, graph=True)
 
 
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_q128_prefill_paged_keys_and_value_tail(heads):
+    lengths = [16385, 129, 511, 513, 135, 257, 1025, 2049]
+    case = build_case(64, [128] * len(lengths), lengths, hq=heads[0], hkv=heads[1])
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    for request, length in enumerate(lengths):
+        page, tail = divmod(length, 64)
+        physical_page = int(case["block_table"][request, page])
+        case["v"][physical_page, tail:].view(torch.uint8).fill_(0x7f)
+    _check(case, graph=True)
+
+
 @pytest.mark.parametrize("query", [1, 4])
 def test_single_request_long_decode_graph(query):
     case = build_case(64, [query], [16401], hq=32, hkv=2)
