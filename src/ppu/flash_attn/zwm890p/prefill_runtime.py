@@ -260,8 +260,7 @@ def forward(
     direct_k = (
         use_direct_k and num_splits == 1 and max_seqlen_q == 128 and k.shape[1] == 64
         and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
-        and softmax_scale in (None, 0.0625)
-        and not scaled
+        and softmax_scale in (None, 0.0625) and not scaled
     )
 
     partial = torch.empty(
@@ -299,7 +298,14 @@ def forward(
             v_amax = torch.empty(requests * kv_heads * 256, dtype=torch.float32, device=q.device)
     _fill_descales(descales, scales)
 
-    out.zero_()
+    full_q_tiles = q.shape[0] == max_seqlen_q * requests and (
+        direct_k or ((q.shape[1], kv_heads) == (32, 2) and max_seqlen_q == 512
+                     and not scaled and softmax_scale in (None, 0.0625))
+    )
+    if workspace is None and full_q_tiles:
+        query_blocks = q.shape[0] // 32
+    else:
+        out.zero_()
 
     group_cu, group_lengths, group_scales = cu_seqlens_q, seqused_k, descales
     if workspace is not None:

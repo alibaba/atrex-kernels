@@ -260,38 +260,14 @@ __device__ __forceinline__ int direct_key_token(int logical) {
   return 2 * (logical >> 2) + (logical & 1) + 8 * ((logical >> 1) & 1);
 }
 
-__device__ __forceinline__ u32 prep_v_word(
-    const unsigned char* values, int channel, int word_index) {
-  const int first_kv = 32 * (word_index >> 3) + 16 * (word_index & 1) +
-                       4 * ((word_index >> 1) & 3);
-  const unsigned char* source = values + first_kv * HEAD_DIM + channel;
-  return pack4(source[0], source[HEAD_DIM], source[2 * HEAD_DIM], source[3 * HEAD_DIM]);
-}
-
-__device__ __forceinline__ void prep_store_v_page(
-    unsigned char* destination, const unsigned char* values, int channel) {
-  const int local_row = channel & 15;
-  const int row_quarter = local_row >> 2;
-  int base = (channel >> 5) * 1024 + ((channel >> 4) & 1) * 256;
-  base += 64 * row_quarter + 32 * (local_row & 1) + 512 * ((local_row >> 1) & 1);
-#pragma unroll
-  for (int chunk = 0; chunk < 8; ++chunk) {
-    int first_word = 8 * (chunk >> 2) + 4 * (chunk & 1) + ((chunk >> 1) & 1);
-    first_word ^= (row_quarter & 1) | ((row_quarter & 2) << 2);
-    const u32 first = prep_v_word(values, channel, first_word);
-    const u32 second = prep_v_word(values, channel, first_word + 2);
-    *reinterpret_cast<uint2*>(destination + 2 * (base + 4 * chunk)) =
-        make_uint2(first, second);
-  }
-}
-
-__device__ __forceinline__ int direct_v_stage_offset(int token, int channel) {
-  // Preserve 16-byte vector alignment while moving token bits 2, 4, and 5 into bank bits.
-  const int bank_group = ((token >> 2) & 1) | ((token >> 3) & 6);
+template <bool DIRECT_K>
+__device__ __forceinline__ int prep_v_stage_offset(int token, int channel) {
+  // Keep each 16-byte vector aligned and distribute token groups across banks.
+  const int bank_group = DIRECT_K ? (((token >> 2) & 1) | ((token >> 3) & 6)) : ((token >> 3) & 7);
   return token * HEAD_DIM + (channel ^ (16 * bank_group));
 }
 
-__device__ __forceinline__ uint4 prep_direct_v_transpose(uint4 rows) {
+__device__ __forceinline__ uint4 prep_v_transpose(uint4 rows) {
   const u32 low_xy = __byte_perm(rows.x, rows.y, 0x5410);
   const u32 high_xy = __byte_perm(rows.x, rows.y, 0x7632);
   const u32 low_zw = __byte_perm(rows.z, rows.w, 0x5410);
@@ -300,20 +276,22 @@ __device__ __forceinline__ uint4 prep_direct_v_transpose(uint4 rows) {
                     __byte_perm(high_xy, high_zw, 0x6420), __byte_perm(high_xy, high_zw, 0x7531));
 }
 
-__device__ __forceinline__ uint4 prep_direct_v_quad(const unsigned char* values, int channel, int word) {
+template <bool DIRECT_K>
+__device__ __forceinline__ uint4 prep_v_quad(const unsigned char* values, int channel, int word) {
   const int first = 32 * (word >> 3) + 16 * (word & 1) + 4 * ((word >> 1) & 3);
   const int token_base = first & ~15;
   const int within = first & 15;
   u32 rows[4];
 #pragma unroll
   for (int row = 0; row < 4; ++row) {
-    const int token = token_base + direct_key_token(within + row);
-    rows[row] = *reinterpret_cast<const u32*>(values + direct_v_stage_offset(token, channel));
+    const int token = DIRECT_K ? token_base + direct_key_token(within + row) : first + row;
+    rows[row] = *reinterpret_cast<const u32*>(values + prep_v_stage_offset<DIRECT_K>(token, channel));
   }
-  return prep_direct_v_transpose(make_uint4(rows[0], rows[1], rows[2], rows[3]));
+  return prep_v_transpose(make_uint4(rows[0], rows[1], rows[2], rows[3]));
 }
 
-__device__ __forceinline__ void prep_store_v_direct_vec(unsigned char* destination,
+template <bool DIRECT_K>
+__device__ __forceinline__ void prep_store_v_vector(unsigned char* destination,
                                                         const unsigned char* values, int tid) {
   static_assert(PAGE == 64 && HEAD_DIM == 256 && NTHREADS == 256);
   // Adjacent lanes write adjacent 8-byte chunks for each group of four channels.
@@ -325,8 +303,8 @@ __device__ __forceinline__ void prep_store_v_direct_vec(unsigned char* destinati
     const int row_quarter = (channel & 15) >> 2;
     int first_word = 8 * (chunk >> 2) + 4 * (chunk & 1) + ((chunk >> 1) & 1);
     first_word ^= (row_quarter & 1) | ((row_quarter & 2) << 2);
-    const uint4 first = prep_direct_v_quad(values, channel, first_word);
-    const uint4 second = prep_direct_v_quad(values, channel, first_word + 2);
+    const uint4 first = prep_v_quad<DIRECT_K>(values, channel, first_word);
+    const uint4 second = prep_v_quad<DIRECT_K>(values, channel, first_word + 2);
     const int base = (channel >> 5) * 1024 + ((channel >> 4) & 1) * 256 + 64 * row_quarter;
     unsigned char* out = destination + 2 * (base + 4 * chunk);
     *reinterpret_cast<uint2*>(out) = make_uint2(first.x, second.x);
@@ -374,7 +352,7 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 #pragma unroll
       for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
         const int e = (c * NTHREADS + tid) * 16;
-        const int staged = DIRECT_K ? direct_v_stage_offset(e / HEAD_DIM, e % HEAD_DIM) : e;
+        const int staged = prep_v_stage_offset<DIRECT_K>(e / HEAD_DIM, e % HEAD_DIM);
         *reinterpret_cast<uint4*>(Vs + staged) = *reinterpret_cast<const uint4*>(
             vp + (e / HEAD_DIM) * head_count * HEAD_DIM + e % HEAD_DIM);
       }
@@ -383,7 +361,7 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 #pragma unroll
       for (int c = 0; c < (PAGE * HEAD_DIM) / (NTHREADS * 16); ++c) {
         const int e = (c * NTHREADS + tid) * 16;
-        const int staged = DIRECT_K ? direct_v_stage_offset(e / HEAD_DIM, e % HEAD_DIM) : e;
+        const int staged = prep_v_stage_offset<DIRECT_K>(e / HEAD_DIM, e % HEAD_DIM);
         uint4 value = make_uint4(0, 0, 0, 0);
         if (p * PAGE + e / HEAD_DIM < kv_len) {
           value = *reinterpret_cast<const uint4*>(
@@ -393,8 +371,7 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
       }
     }
     __syncthreads();
-    if constexpr (DIRECT_K) prep_store_v_direct_vec(vdst, Vs, tid);
-    else prep_store_v_page(vdst, Vs, tid);
+    prep_store_v_vector<DIRECT_K>(vdst, Vs, tid);
     __syncthreads();
   }
 }
