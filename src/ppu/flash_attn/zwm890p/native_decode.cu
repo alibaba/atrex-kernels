@@ -183,7 +183,7 @@ __device__ __forceinline__ void native_load_key(const unsigned char* keys, int c
         : "l"(address), "r"(64), "r"(1), "r"(0));
 }
 
-template<int Threads, bool Keys, bool Values, bool FullTile = false>
+template<int Threads, bool Keys, bool Values, bool FullTile = false, bool CommitGroup = true>
 __device__ __forceinline__ const unsigned char* native_stage(const DecodeParams& params, const int* page_table,
                                             const unsigned char* source, int tile, int length,
                                             unsigned char* keys, unsigned char* values,
@@ -237,7 +237,7 @@ __device__ __forceinline__ const unsigned char* native_stage(const DecodeParams&
             }
         }
     }
-    asm volatile("ppu.cp.async.commit_group;");
+    if constexpr (CommitGroup) asm volatile("ppu.cp.async.commit_group;");
     return next_value;
 }
 
@@ -569,7 +569,8 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     auto stage_pair = [&](int tile, unsigned char* key, auto full_flag) {
         constexpr bool FullTile = decltype(full_flag)::value;
         unsigned char* value = key + NativeTileBytes;
-        const auto* source = native_stage<Threads, true, false, FullTile>(
+        // One wait_group 0 already covers the complete tile, so issue both copies in one group.
+        const auto* source = native_stage<Threads, true, false, FullTile, false>(
             params, page_table, key_source, tile, length, key, value, value_source);
         native_stage<Threads, false, true, FullTile>(params, page_table, source, tile, length, key, value);
     };
