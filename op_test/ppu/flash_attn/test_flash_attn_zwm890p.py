@@ -933,6 +933,17 @@ def test_q128_prefill_paged_keys_and_value_tail(heads):
     _check(case, graph=True)
 
 
+def test_q512_short_prefix_prefill_paged_keys():
+    lengths = [16 * 1024 + 513, 1025, 1537, 2177, 1026, 641, 769, 5119]
+    case = build_case(64, [512] * len(lengths), lengths, hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    page, tail = divmod(lengths[0], 64)
+    physical_page = int(case["block_table"][0, page])
+    case["v"][physical_page, tail:].view(torch.uint8).fill_(0x7f)
+    _check(case, graph=True)
+
+
 @pytest.mark.parametrize("query", [1, 4])
 def test_single_request_long_decode_graph(query):
     case = build_case(64, [query], [16401], hq=32, hkv=2)

@@ -256,15 +256,19 @@ def forward(
     scaled = any(scale is not None for scale in scales)
     descale_shape = (3, requests, kv_heads) if scaled else (0,)
     query_blocks = (q.shape[0] + 31) // 32 + requests
-    use_direct_k = (q.shape[1], kv_heads) == (32, 2) and requests in (8, 64, 128)
-    use_direct_k |= (q.shape[1], kv_heads, requests) == (8, 1, 8)
+    heads = (q.shape[1], kv_heads)
+    direct_q128 = max_seqlen_q == 128 and (
+        (heads == (32, 2) and requests in (8, 64, 128)) or (heads == (8, 1) and requests == 8)
+    )
+    direct_q512 = (max_seqlen_q == 512 and heads == (32, 2) and requests == 8
+                   and max_seqlen_k - max_seqlen_q <= 32 * 1024)
     direct_k = (
-        use_direct_k and num_splits == 1 and max_seqlen_q == 128 and k.shape[1] == 64
+        (direct_q128 or direct_q512) and num_splits == 1 and k.shape[1] == 64
         and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
         and softmax_scale in (None, 0.0625) and not scaled
     )
     if direct_k:
-        if (automatic_splits and kv_heads == 1 and q.shape[0] == 128 * requests
+        if (automatic_splits and heads == (8, 1) and q.shape[0] == 128 * requests
                 and max_seqlen_k - max_seqlen_q >= 64 * 1024):
             num_splits = 6
 
@@ -304,7 +308,7 @@ def forward(
     _fill_descales(descales, scales)
 
     full_q_tiles = q.shape[0] == max_seqlen_q * requests and (
-        direct_k or ((q.shape[1], kv_heads) == (32, 2) and max_seqlen_q == 512
+        direct_k or (heads == (32, 2) and max_seqlen_q == 512
                      and not scaled and softmax_scale in (None, 0.0625))
     )
     if workspace is None and full_q_tiles:
