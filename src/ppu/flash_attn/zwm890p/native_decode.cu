@@ -12,6 +12,8 @@ constexpr int NativeKeyRows = NativeWide ? 64 : 32;
 constexpr int NativePlanRows = 32;
 constexpr int NativeMinSortKV = 64 * 1024;
 constexpr int NativeMinSortHistory = 32 * 1024;
+constexpr int NativeMinShortSortHistory = 16 * 1024;
+constexpr int NativeMaxShortSortPages = 513;
 constexpr int NativeKeyHalves = NativeKeyRows / 16;
 constexpr int NativeTileBytes = NativeKeyRows * 256;
 constexpr int NativeKeyWindow = NativeKeyHalves == 2 ? 3 : 2;
@@ -785,13 +787,14 @@ void atrex_ppu_native_decode_sort_history(DecodeParams params, int* sorted_table
     int64_t query_count = static_cast<int64_t>(__ldg(params.offsets + request + 1))
         - __ldg(params.offsets + request);
     int length = __ldg(params.lengths + request);
+    constexpr int MinimumLength = Capacity <= 512 ? NativeMinShortSortHistory : NativeMinSortHistory;
     int history = 0;
     if (query_count > 0 && query_count <= params.max_query
-        && length >= NativeMinSortHistory && length <= params.max_kv) {
+        && length >= MinimumLength && length <= params.max_kv) {
         // For the earliest query, the visible prefix contains length - query_count + 1 tokens.
         // Leave the partial or causally masked page and every later entry in its original slot.
         int visible = max(0, length - static_cast<int>(query_count) + 1);
-        history = min(width, visible >> params.page_shift);
+        history = min(min(Capacity, width), visible >> params.page_shift);
     }
     bool reorder = false;
     if (history >= 2) {
@@ -1382,7 +1385,9 @@ int native_launch(DecodeParams params, hggcStream_t stream) {
             int width = params.max_kv >> params.page_shift;
             int* sorted_table = params.plan + 4 + params.batch + params.batch * params.kv_heads * params.splits;
             dim3 rows(params.batch);
-            if (width <= 1024) atrex_ppu_native_decode_sort_history<1024><<<rows, 256, 0, stream>>>(params, sorted_table, width);
+            if (width <= 257) atrex_ppu_native_decode_sort_history<256><<<rows, 256, 0, stream>>>(params, sorted_table, width);
+            else if (width <= NativeMaxShortSortPages) atrex_ppu_native_decode_sort_history<512><<<rows, 256, 0, stream>>>(params, sorted_table, width);
+            else if (width <= 1024) atrex_ppu_native_decode_sort_history<1024><<<rows, 256, 0, stream>>>(params, sorted_table, width);
             else if (width <= 2048) atrex_ppu_native_decode_sort_history<2048><<<rows, 256, 0, stream>>>(params, sorted_table, width);
             else atrex_ppu_native_decode_sort_history<4096><<<rows, 256, 0, stream>>>(params, sorted_table, width);
             auto status = hggcGetLastError();
@@ -1487,9 +1492,11 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     params.kv_heads = metadata[25];
     params.scale = scale;
     params.sort_history = splits == -1;
+    const bool short_sort = params.batch >= 64 && params.max_kv >= NativeMinShortSortHistory
+        && params.max_kv <= NativeMaxShortSortPages * 64;
     if (splits < 0 && (!params.sort_history || NativeVariant != DecodeVariant::q4_wide
         || params.max_query != 4 || params.query_heads != 32 || params.kv_heads != 2
-        || params.batch < 8 || params.max_kv < NativeMinSortKV || params.plan == nullptr
+        || params.batch < 8 || (params.max_kv < NativeMinSortKV && !short_sort) || params.plan == nullptr
         || params.page_size != 64
         || params.max_kv % params.page_size || params.max_kv / params.page_size > 4096)) {
         return static_cast<int>(hggcErrorInvalidValue);

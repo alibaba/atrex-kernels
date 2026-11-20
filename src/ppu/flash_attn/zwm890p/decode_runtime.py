@@ -8,6 +8,8 @@ import torch
 
 
 _MIN_PAGE_REORDER_KV = 64 * 1024
+_MIN_SHORT_PAGE_REORDER_KV = 16 * 1024
+_MAX_SHORT_PAGE_REORDER_KV = 32 * 1024 + 4
 _DecodePointers = ctypes.c_void_p * 13
 _DecodeMetadata = ctypes.c_int64 * 26
 
@@ -123,13 +125,18 @@ def _forward_validated(
             num_splits = 96 // batch
     selected_splits = num_splits or 32
     table_width = page_table.shape[1]
+    sort_short_history = (
+        batch >= 64
+        and _MIN_SHORT_PAGE_REORDER_KV <= max_seqlen_k <= _MAX_SHORT_PAGE_REORDER_KV
+        and table_width <= 513
+    )
     sort_history = (
         variant == "q4_wide"
         and num_splits == 0
         and kv_heads == 2
         and page_size == 64
         and batch >= 8
-        and max_seqlen_k >= _MIN_PAGE_REORDER_KV
+        and (max_seqlen_k >= _MIN_PAGE_REORDER_KV or sort_short_history)
         and table_width <= 4096
     )
     partial = partial_lse = None
