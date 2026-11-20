@@ -904,7 +904,8 @@ def test_direct_paged_q16_prefill_graph(lengths, monkeypatch):
 
 @pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
 def test_q128_prefill_paged_keys_and_value_tail(heads):
-    lengths = [16385, 129, 511, 513, 135, 257, 1025, 2049]
+    longest = 64 * 1024 + 129 if heads == (8, 1) else 16385
+    lengths = [longest, 129, 511, 513, 135, 257, 1025, 2049]
     case = build_case(64, [128] * len(lengths), lengths, hq=heads[0], hkv=heads[1])
     for name in ("q_descale", "k_descale", "v_descale"):
         case[name] = None

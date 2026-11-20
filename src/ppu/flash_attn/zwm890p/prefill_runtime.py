@@ -242,7 +242,8 @@ def forward(
     value_view = _page_view(v)[0]
     # Keep the existing long-prefill policy. Short-Q calls may split the KV
     # range; all requests are processed without host-side batch partitioning.
-    if num_splits == 0:
+    automatic_splits = num_splits == 0
+    if automatic_splits:
         num_splits = _default_splits(
             q.shape[0], requests, max_seqlen_q, max_seqlen_k,
             query_heads=q.shape[1], kv_heads=k.shape[2], page_size=k.shape[1],
@@ -262,6 +263,10 @@ def forward(
         and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
         and softmax_scale in (None, 0.0625) and not scaled
     )
+    if direct_k:
+        if (automatic_splits and kv_heads == 1 and q.shape[0] == 128 * requests
+                and max_seqlen_k - max_seqlen_q >= 64 * 1024):
+            num_splits = 6
 
     partial = torch.empty(
         num_splits * q.shape[0] * q.shape[1] * 272 if num_splits > 1 else 0,
@@ -332,7 +337,7 @@ def forward(
             extension.prep_v_direct_k(value_view, remapped_table, group_lengths, packed_v, max_pages)
             extension.attn_direct_k(
                 q, key_view, packed_v, remapped_table, group_cu, group_lengths,
-                out, max_pages, query_blocks,
+                out, partial, max_pages, query_blocks, num_splits,
             )
         else:
             extension.prep_kv(

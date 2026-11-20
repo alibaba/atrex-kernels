@@ -416,7 +416,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out,
     float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit,
     const int* __restrict__ raw_block_table, int raw_table_stride) {
-  static_assert(!DIRECT_K || (LINEAR_AIU && !SPLIT));
+  static_assert(!DIRECT_K || LINEAR_AIU);
   extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + NBUF * KPAGE_BYTES;
@@ -1416,18 +1416,18 @@ void prep_v_direct_k(torch::Tensor value_cache, torch::Tensor block_table,
       (int)block_table.stride(0), (int)max_pages, kv_heads);
 }
 
-template <int QUERY_HEADS, int KV_HEADS>
+template <int QUERY_HEADS, int KV_HEADS, bool SPLIT>
 void launch_prefill_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8,
                             torch::Tensor table, torch::Tensor cu_q, torch::Tensor seq_lens,
-                            torch::Tensor out, int64_t max_pages, int64_t nblk) {
-  constexpr auto kernel = atrex_ppu_attn<0, true, 4, QUERY_HEADS, KV_HEADS, true, true>;
+                            torch::Tensor out, torch::Tensor partial, int64_t max_pages, int64_t nblk, int64_t nsplit) {
+  constexpr auto kernel = atrex_ppu_attn<SPLIT, true, 4, QUERY_HEADS, KV_HEADS, true, true>;
   constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
   const int n_req = (int)cu_q.size(0) - 1;
   const int n_tok = (int)out.size(0);
   const int launch_nblk = n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk;
-  const dim3 grid(launch_nblk * (QUERY_HEADS / 4));
+  const dim3 grid(launch_nblk * (QUERY_HEADS / 4), 1, nsplit);
   static const bool configured = [] {
-    TORCH_CHECK(cudaFuncSetAttribute(atrex_ppu_attn<0, true, 4, QUERY_HEADS, KV_HEADS, true, true>,
+    TORCH_CHECK(cudaFuncSetAttribute(atrex_ppu_attn<SPLIT, true, 4, QUERY_HEADS, KV_HEADS, true, true>,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      NBUF * (KPAGE_BYTES + VPAGE_BYTES)) == cudaSuccess,
                 "direct-K attention dynamic shared configuration failed");
@@ -1439,20 +1439,24 @@ void launch_prefill_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor
       reinterpret_cast<const unsigned char*>(raw_k.data_ptr()),
       reinterpret_cast<const unsigned char*>(v_fp8.data_ptr()),
       nullptr, nullptr, cu_q.data_ptr<int>(), seq_lens.data_ptr<int>(),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, n_req, (int)max_pages,
-      n_tok, 1, table.data_ptr<int>(), (int)table.stride(0));
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), SPLIT ? partial.data_ptr<float>() : nullptr,
+      n_req, (int)max_pages, n_tok, (int)nsplit, table.data_ptr<int>(), (int)table.stride(0));
 }
 
 void attn_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8, torch::Tensor table,
                    torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
-                   int64_t max_pages, int64_t nblk) {
+                   torch::Tensor partial, int64_t max_pages, int64_t nblk, int64_t nsplit) {
   TORCH_CHECK((reinterpret_cast<uintptr_t>(raw_k.data_ptr()) & 127) == 0,
               "direct-K requires 128-byte-aligned key pages");
   if (q.size(1) == 8 && raw_k.size(2) == 1) {
-    launch_prefill_direct_k<8, 1>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, max_pages, nblk);
+    TORCH_CHECK(nsplit == 1 || nsplit == 6, "unsupported direct-K split count");
+    if (nsplit == 6)
+      launch_prefill_direct_k<8, 1, true>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, nsplit);
+    else
+      launch_prefill_direct_k<8, 1, false>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, 1);
   } else {
-    TORCH_CHECK(q.size(1) == 32 && raw_k.size(2) == 2, "unsupported direct-K head shape");
-    launch_prefill_direct_k<32, 2>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, max_pages, nblk);
+    TORCH_CHECK(q.size(1) == 32 && raw_k.size(2) == 2 && nsplit == 1, "unsupported direct-K shape");
+    launch_prefill_direct_k<32, 2, false>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, 1);
   }
 }
 
