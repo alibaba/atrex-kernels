@@ -1460,7 +1460,12 @@ int native_launch(DecodeParams params, hggcStream_t stream) {
         auto status = hggcOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_cu,
             atrex_ppu_native_decode_kernel<Query, Group, true>, Threads, 0);
         if (status != hggcSuccess) return static_cast<int>(status);
-        int resident_blocks = Query == 4 && Group == 12 ? blocks_per_cu : 0;
+        // Plan against the resident CTAs for the tuned high-concurrency Q1 shapes.
+        // The fallback counts warps, while each Q1 CTA uses two warps.
+        const bool q1_residency = Query == 1 && Group == 16 && params.kv_heads == 2
+            && params.page_size == 64 && (params.batch == 64 || params.batch == 128)
+            && params.max_kv >= 16 * 1024;
+        const int resident_blocks = q1_residency || (Query == 4 && Group == 12) ? blocks_per_cu : 0;
         params.average_splits = native_average_splits(params, resident_blocks);
         atrex_ppu_native_decode_prepare<<<1, 1024, 0, stream>>>(params, resident_blocks);
         status = hggcGetLastError();
