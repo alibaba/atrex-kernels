@@ -81,10 +81,13 @@ def _build(variant, device_index):
 def load_library(variant, device):
     if variant not in VARIANTS:
         raise ValueError(f"Unknown PPU decode variant: {variant}")
-    device_index = torch.device(device).index
+    device_index = device.index if isinstance(device, torch.device) else torch.device(device).index
     if device_index is None:
         device_index = torch.cuda.current_device()
     key = (variant, device_index)
+    library = LIBRARIES.get(key)
+    if library is not None:
+        return library
     with LOCK:
         if key not in LIBRARIES:
             if torch.cuda.is_current_stream_capturing():

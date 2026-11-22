@@ -1,5 +1,14 @@
 """Select native decode or prefill using the same side-effect-free contract."""
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _decode_runtime():
+    from . import decode_runtime
+
+    return decode_runtime
+
 
 def _normalized_call(arguments):
     call = dict(arguments)
@@ -20,12 +29,10 @@ def _is_short_q(call):
     return query is not None and 1 <= query <= 5
 
 
-def _select(call):
+def _select(call, *, common_validated=False):
     if _is_short_q(call):
-        from .decode_runtime import validate as validate_decode
-
         try:
-            validate_decode(call)
+            _decode_runtime().validate(call, common_validated=common_validated)
             return "decode"
         except NotImplementedError:
             pass
@@ -42,9 +49,7 @@ def validate(arguments):
 def forward(*, fa_version=None, **kwargs):
     call = _normalized_call(dict(kwargs, fa_version=fa_version))
     if _select(call) == "decode":
-        from .decode_runtime import forward as decode_forward
-
-        return decode_forward(fa_version=fa_version, **kwargs)
+        return _decode_runtime().forward(fa_version=fa_version, **kwargs)
     from .prefill_runtime import forward as prefill_forward
 
     return prefill_forward(**kwargs)

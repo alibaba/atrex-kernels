@@ -6,12 +6,15 @@ import math
 
 import torch
 
+from . import decode_build
+
 
 _MIN_PAGE_REORDER_KV = 64 * 1024
 _MIN_SHORT_PAGE_REORDER_KV = 16 * 1024
 _MAX_SHORT_PAGE_REORDER_KV = 32 * 1024 + 4
 _DecodePointers = ctypes.c_void_p * 13
 _DecodeMetadata = ctypes.c_int64 * 26
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
 @lru_cache(maxsize=None)
@@ -21,28 +24,26 @@ def _compute_units(device):
 
 @lru_cache(maxsize=None)
 def _q4_half_occupancy(device):
-    from .decode_build import load_library
-
-    library = load_library("q4_halves", device)
+    library = decode_build.load_library("q4_halves", device)
     resources = (ctypes.c_int * 4)()
     if (status := library.atrex_ppu_decode_resources(resources)):
         raise RuntimeError(f"PPU decode occupancy query failed: {status}")
     return library, resources[3]
 
 
-def validate(call):
-    q, k, v = (call[name] for name in ("q", "k", "v"))
+def validate(call, *, common_validated=False):
+    q, k, v = call["q"], call["k"], call["v"]
     table = call["block_table"]
     offsets, lengths = call["cu_seqlens_q"], call["seqused_k"]
     batch = offsets.numel() - 1
     query = call["max_seqlen_q"]
     if call.get("fa_version") not in (None, 3):
         raise NotImplementedError("PPU decode requires fa_version=3")
-    if q.dtype != torch.float8_e4m3fn or q.ndim != 3 or q.shape[-1] != 256:
+    if q.dtype != torch.float8_e4m3fn or (not common_validated and (q.ndim != 3 or q.shape[-1] != 256)):
         raise NotImplementedError("PPU decode requires FP8 E4M3 packed HD256 Q")
-    if table is None or k.ndim != 4 or k.shape[-1] != 256 or v.shape != k.shape:
+    if table is None or (not common_validated and (k.ndim != 4 or k.shape[-1] != 256 or v.shape != k.shape)):
         raise NotImplementedError("PPU decode requires paged HD256 K/V")
-    if k.dtype != q.dtype or v.dtype != q.dtype:
+    if not common_validated and (k.dtype != q.dtype or v.dtype != q.dtype):
         raise NotImplementedError("PPU decode requires matching FP8 E4M3 Q/K/V")
     page_size, kv_heads = k.shape[1:3]
     query_heads = q.shape[1]
@@ -52,9 +53,13 @@ def validate(call):
         raise NotImplementedError("PPU decode supports GQA=6, 8, 12, or 16")
     if query not in range(1, 6) or not 0 < batch <= 992 or not batch <= q.shape[0] <= batch * query:
         raise NotImplementedError("PPU decode supports nonempty Q1-Q5 requests and batch <= 992")
-    if lengths is None or lengths.shape != (batch,) or table.ndim != 2 or table.shape[0] != batch:
+    if not common_validated and (
+        lengths is None or lengths.shape != (batch,) or table.ndim != 2 or table.shape[0] != batch
+    ):
         raise ValueError("Inconsistent PPU decode sequence metadata")
-    if not offsets.is_contiguous() or not lengths.is_contiguous() or table.stride(-1) != 1:
+    if not offsets.is_contiguous() or not lengths.is_contiguous() or (
+        not common_validated and table.stride(-1) != 1
+    ):
         raise ValueError("PPU decode metadata requires contiguous rows")
     if not 0 < call["max_seqlen_k"] <= table.shape[1] * page_size:
         raise ValueError("PPU decode block_table must cover positive max_seqlen_k")
@@ -67,19 +72,24 @@ def validate(call):
     splits = call["num_splits"]
     if not isinstance(splits, int) or splits not in range(33):
         raise NotImplementedError("PPU decode supports num_splits from 0 to 32")
-    for tensor in (q, k, v):
-        if tensor.stride(-1) != 1 or any(stride <= 0 for stride in tensor.stride()) or tensor.data_ptr() % 16:
-            raise ValueError("PPU decode requires positive strides and aligned pointers")
-        if any(stride % 16 for stride in tensor.stride()[:-1]):
-            raise ValueError("PPU decode requires 16-byte aligned vector strides")
+    q_row, q_head, q_last = q.stride()
+    k_page, k_row, k_head, k_last = k.stride()
+    v_page, v_row, v_head, v_last = v.stride()
+    # Combine offsets before testing for 16-byte vector alignment.
+    if (q_last != 1 or k_last != 1 or v_last != 1
+            or min(q_row, q_head, k_page, k_row, k_head, v_page, v_row, v_head) <= 0
+            or (q.data_ptr() | k.data_ptr() | v.data_ptr()) % 16):
+        raise ValueError("PPU decode requires positive strides and aligned pointers")
+    if (q_row | q_head | k_page | k_row | k_head | v_page | v_row | v_head) % 16:
+        raise ValueError("PPU decode requires 16-byte aligned vector strides")
     out = call["out"]
-    if out is not None and (not out.is_contiguous() or out.data_ptr() % 16):
+    if out is not None and (out.data_ptr() % 16 or (not common_validated and not out.is_contiguous())):
         raise ValueError("PPU decode requires contiguous aligned BF16 out")
-    for name in ("q_descale", "k_descale", "v_descale"):
-        scale = call[name]
+    device = q.device
+    for scale in (call["q_descale"], call["k_descale"], call["v_descale"]):
         if scale is not None and (
-            scale.dtype != torch.float32 or scale.shape != (batch, kv_heads) or scale.device != q.device
-            or any(stride < 0 for stride in scale.stride())
+            scale.dtype != torch.float32 or scale.shape != (batch, kv_heads) or scale.device != device
+            or min(scale.stride()) < 0
         ):
             raise ValueError("PPU decode descales must be float32 [batch,KV heads] on Q's device")
     scale = call["softmax_scale"]
@@ -108,8 +118,6 @@ def _forward_validated(
     softmax_scale, out, q_descale, k_descale, v_descale, num_splits,
 ):
     """Launch after the caller validates the public decode contract."""
-    from .decode_build import load_library
-
     device = q.device
     total, query_heads, head_dim = q.shape
     cache_pages, page_size, kv_heads, _ = k.shape
@@ -131,9 +139,9 @@ def _forward_validated(
             library = half_library
             num_splits = 1
         else:
-            library = load_library("q4_wide", device)
+            library = decode_build.load_library("q4_wide", device)
     else:
-        library = load_library(variant, device)
+        library = decode_build.load_library(variant, device)
     if out is None:
         out = torch.empty(q.shape, device=device, dtype=torch.bfloat16)
     if num_splits == 0 and (query_heads, kv_heads, page_size) == (32, 2, 64) and max_seqlen_k >= 16 * 1024:
@@ -176,34 +184,40 @@ def _forward_validated(
         and (max_seqlen_k >= _MIN_PAGE_REORDER_KV or sort_short_history)
         and table_width <= 4096
     )
-    partial = partial_lse = None
+    partial_pointer = lse_pointer = 0
     if selected_splits > 1:
-        partial = torch.empty((selected_splits, query_heads, total, head_dim), device=device, dtype=torch.float32)
-        partial_lse = torch.empty((selected_splits, query_heads, total), device=device, dtype=torch.float32)
+        rows = selected_splits * query_heads * total
+        scratch = torch.empty(rows * (head_dim + 1), device=device, dtype=torch.float32)
+        partial_pointer = scratch.data_ptr()
+        lse_pointer = partial_pointer + rows * head_dim * scratch.element_size()
     plan = None
     if num_splits == 0:
         plan_entries = 4 + batch + batch * kv_heads * selected_splits
         if sort_history:
             plan_entries += batch * table_width
         plan = torch.empty(plan_entries, device=device, dtype=torch.int32)
-    tensors = (q, k, v, out, cu_seqlens_q, seqused_k, page_table,
-               q_descale, k_descale, v_descale, partial, partial_lse, plan)
-    pointers = _DecodePointers(*(tensor.data_ptr() if tensor is not None else 0 for tensor in tensors))
-    descale_strides = [
-        stride
-        for scale in (q_descale, k_descale, v_descale)
-        for stride in ((0, 0) if scale is None else scale.stride())
-    ]
+    pointers = _DecodePointers(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+        cu_seqlens_q.data_ptr(), seqused_k.data_ptr(), page_table.data_ptr(),
+        q_descale.data_ptr() if q_descale is not None else 0,
+        k_descale.data_ptr() if k_descale is not None else 0,
+        v_descale.data_ptr() if v_descale is not None else 0,
+        partial_pointer, lse_pointer, plan.data_ptr() if plan is not None else 0,
+    )
     metadata = _DecodeMetadata(
         batch, total, max_seqlen_q, table_width * page_size, cache_pages, page_size,
         page_table.stride(0), *q.stride()[:2], *k.stride()[:3], *v.stride()[:3], *out.stride()[:2],
-        *descale_strides, compute_units, query_heads, kv_heads,
+        *((0, 0) if q_descale is None else q_descale.stride()),
+        *((0, 0) if k_descale is None else k_descale.stride()),
+        *((0, 0) if v_descale is None else v_descale.stride()),
+        compute_units, query_heads, kv_heads,
     )
     # A private ABI selector enables the native sorter and its appended workspace.
     native_splits = -1 if sort_history else num_splits
     status = library.atrex_ppu_decode(
         pointers, metadata, softmax_scale, native_splits,
-        torch.cuda.current_stream(device).cuda_stream,
+        _get_current_raw_stream(device.index) if _get_current_raw_stream is not None
+        else torch.cuda.current_stream(device).cuda_stream,
     )
     if status:
         raise RuntimeError(f"PPU FP8 decode launch failed: {status}")
