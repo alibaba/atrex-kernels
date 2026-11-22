@@ -659,7 +659,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q4_halves", "q16_dual", "q16_history"}
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q4_air_columns", "q16_dual", "q16_history"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
@@ -987,13 +987,21 @@ def test_single_request_long_decode_graph(query):
     _check(case, graph=True)
 
 
-@pytest.mark.parametrize("batch,query,length", [(1, 1, 1024), (1, 4, 16385), (8, 1, 2049)])
-def test_air_decode_auto_split_with_padded_graph_table(batch, query, length):
-    case = build_case(256, [query] * batch, [length - request for request in range(batch)], hq=24, hkv=2)
-    table = case["block_table"].new_full((batch, 4096), -1)
+@pytest.mark.parametrize("batch,query,length,capacity", [
+    (1, 1, 1024, 1048576), (1, 4, 16385, 1048576), (8, 1, 2049, 1048576),
+    (64, 4, 2049, 8192), (128, 4, 1025, 4096), (128, 4, 2049, 8192),
+])
+def test_air_decode_auto_split_with_padded_graph_table(batch, query, length, capacity):
+    page_size = 256
+    case = build_case(page_size, [query] * batch, [length - request for request in range(batch)], hq=24, hkv=2)
+    table = case["block_table"].new_full((batch, capacity // page_size), -1)
     table[:, :case["block_table"].shape[1]] = case["block_table"]
     case["block_table"] = table
-    case["max_seqlen_k"] = 1048576
+    case["max_seqlen_k"] = capacity
+    if batch >= 64:
+        # Keep the per-request and per-head descales bounded in the high-batch fixture.
+        for name in ("q_descale", "k_descale", "v_descale"):
+            case[name] = case[name][:4].repeat(batch // 4, 1)
     _check(case, graph=True)
 
 

@@ -22,15 +22,6 @@ def _compute_units(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-@lru_cache(maxsize=None)
-def _q4_half_occupancy(device):
-    library = decode_build.load_library("q4_halves", device)
-    resources = (ctypes.c_int * 4)()
-    if (status := library.atrex_ppu_decode_resources(resources)):
-        raise RuntimeError(f"PPU decode occupancy query failed: {status}")
-    return library, resources[3]
-
-
 def validate(call, *, common_validated=False):
     q, k, v = call["q"], call["k"], call["v"]
     table = call["block_table"]
@@ -129,17 +120,14 @@ def _forward_validated(
         variant = "q4_wide"
     compute_units = _compute_units(device)
     table_capacity = page_table.shape[1] * page_size
-    if (max_seqlen_q == 4 and (query_heads, kv_heads, page_size) == (24, 2, 256)
-            and batch in (64, 128) and total == 4 * batch
-            and num_splits == 0 and table_capacity <= 4096):
-        half_library, resident_blocks = _q4_half_occupancy(device)
-        # Shorter histories can amortize the duplicated QK over two waves.
-        waves = 2 if table_capacity <= 2048 else 1
-        if batch * kv_heads * 2 <= waves * compute_units * resident_blocks:
-            library = half_library
-            num_splits = 1
-        else:
-            library = decode_build.load_library("q4_wide", device)
+    air_q4 = (max_seqlen_q == 4 and (query_heads, kv_heads, page_size) == (24, 2, 256)
+              and batch in (64, 128) and total == 4 * batch and num_splits == 0)
+    if air_q4 and ((batch == 64 and table_capacity <= 8192) or (batch == 128 and table_capacity <= 4096)):
+        library = decode_build.load_library("q4_air_columns", device)
+        num_splits = 1
+    elif air_q4 and table_capacity == 8192:
+        # The device planner skips inactive rows on padded graph replay.
+        library = decode_build.load_library("q4_wide", device)
     else:
         library = decode_build.load_library(variant, device)
     if out is None:

@@ -2,15 +2,15 @@
 #include <stdint.h>
 #include <math.h>
 
-enum class DecodeVariant { q1, q4, q4_wide, q4_halves, q16_dual, q16_history };
+enum class DecodeVariant { q1, q4, q4_wide, q4_air_columns, q16_dual, q16_history };
 
 constexpr auto NativeVariant = DecodeVariant::DECODE_VARIANT;
 constexpr bool NativeQ1Only = NativeVariant == DecodeVariant::q1;
-constexpr bool NativeHalfOutput = NativeVariant == DecodeVariant::q4_halves;
-constexpr int NativeOutputColumns = NativeHalfOutput ? 128 : 256;
 constexpr bool NativeQ16History = NativeVariant == DecodeVariant::q16_history;
 constexpr bool NativeQ16Dual = NativeQ16History || NativeVariant == DecodeVariant::q16_dual;
-constexpr bool NativeWide = NativeVariant == DecodeVariant::q4_wide || NativeQ16Dual;
+constexpr bool NativeAirColumns = NativeVariant == DecodeVariant::q4_air_columns;
+constexpr int NativeAirColumnRows = 3;
+constexpr bool NativeWide = NativeVariant == DecodeVariant::q4_wide || NativeQ16Dual || NativeAirColumns;
 constexpr int NativeKeyRows = NativeWide ? 64 : 32;
 constexpr int NativePlanRows = 32;
 constexpr int NativeMinSortKV = 64 * 1024;
@@ -23,10 +23,10 @@ constexpr int NativeKeyWindow = NativeKeyHalves == 2 ? 3 : 2;
 
 template<int Query, int Group>
 struct NativeGeometry {
-    static constexpr int Rows = Query == 1 ? 16 : ((Query * Group + 15) / 16) * 16;
+    static constexpr int Rows = NativeAirColumns ? 64 : (Query == 1 ? 16 : ((Query * Group + 15) / 16) * 16);
     static constexpr int Threads = Query == 1 ? 64 : Rows * 2;
     static constexpr int KeyOffset = Rows * 256 > NativeTileBytes * 2 ? Rows * 256 : NativeTileBytes * 2;
-    static constexpr int SharedBytes = NativeQ16Dual ? NativeTileBytes * 4 : KeyOffset + NativeTileBytes;
+    static constexpr int SharedBytes = (NativeQ16Dual || NativeAirColumns) ? NativeTileBytes * 4 : KeyOffset + NativeTileBytes;
 };
 
 template<bool Value>
@@ -211,9 +211,8 @@ __device__ __forceinline__ const unsigned char* native_stage(const DecodeParams&
         int valid_rows = FullTile ? NativeKeyRows : min(NativeKeyRows, max(0, length - base));
         // The wide decode stages both 128-channel slabs with one AIU request.
         constexpr int SlabsPerTransfer = NativeWide ? 2 : 1;
-        constexpr int Slabs = Values && NativeHalfOutput ? 1 : 2;
         #pragma unroll
-        for (int slab = 0; slab < Slabs; slab += SlabsPerTransfer) {
+        for (int slab = 0; slab < 2; slab += SlabsPerTransfer) {
             if (page_valid && valid_rows > 0) {
                 unsigned int destination = static_cast<unsigned int>(__cvta_generic_to_shared(target + slab * NativeKeyRows * 128));
                 unsigned long long stride = row_stride;
@@ -327,9 +326,9 @@ __device__ __forceinline__ void native_pv_scoped(float (&output)[Count][8], cons
 }
 
 template<int Tile, int Part = 0>
-__device__ __forceinline__ void native_value_pair(const unsigned char* values, unsigned int (&fragments)[2][4]) {
+__device__ __forceinline__ void native_value_pair(const unsigned char* values, unsigned int (&fragments)[2][4], int output_base = 0) {
     unsigned int shared = static_cast<unsigned int>(__cvta_generic_to_shared(values));
-    int column = Tile * 16;
+    int column = output_base + Tile * 16;
     unsigned long long address = static_cast<unsigned long long>(shared >> 4) + (column / 128) * (NativeKeyRows * 8) + Part * 256 + ((column / 32) % 4) * 2;
     unsigned int lower[4], upper[4];
     asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans {%0,%1,%2,%3}, [%4], %5, %6, %7;"
@@ -438,6 +437,47 @@ __device__ __forceinline__ void native_qk_ring(float (&scores)[NativeKeyHalves][
     if constexpr (Channel + 1 < 8) native_qk_ring<Channel + 1>(scores, queries, keys, ring);
 }
 
+template<int Index>
+__device__ __forceinline__ void native_qk_flow(float (&scores)[NativeKeyHalves][8], const unsigned int (&queries)[8][4],
+                                             const unsigned char* keys, unsigned int (&ring)[6][4]) {
+    native_mma(scores[Index % NativeKeyHalves], queries[Index / NativeKeyHalves], ring[Index % 6]);
+    if constexpr (Index + 6 < 8 * NativeKeyHalves) {
+        native_load_key(keys, (Index + 6) / NativeKeyHalves, (Index + 6) % NativeKeyHalves, ring[Index % 6]);
+    }
+    if constexpr (Index + 1 < 8 * NativeKeyHalves) native_qk_flow<Index + 1>(scores, queries, keys, ring);
+}
+
+__device__ __forceinline__ void native_qk_window(float (&scores)[NativeKeyHalves][8], const unsigned int (&queries)[8][4],
+                                               const unsigned char* keys) {
+    unsigned int ring[6][4];
+    __ppu_sched_bound();
+    #pragma unroll
+    for (int index = 0; index < 6; ++index) native_load_key(keys, index / NativeKeyHalves, index % NativeKeyHalves, ring[index]);
+    #pragma hggc mmatiestrictly
+    {
+        native_qk_flow<0>(scores, queries, keys, ring);
+    }
+    __ppu_sched_bound();
+}
+
+template<int Tile, int Part>
+__device__ __forceinline__ void native_pv_columns(float (&output)[NativeAirColumnRows * 4][8], const unsigned int (&probabilities)[NativeAirColumnRows][4],
+                                                 const unsigned char* values, int output_base) {
+    __ppu_sched_bound();
+    unsigned int fragments[2][4];
+    native_value_pair<Tile, Part>(values, fragments, output_base);
+    #pragma hggc mmatiestrictly
+    {
+        #pragma unroll
+        for (int row = 0; row < NativeAirColumnRows; ++row) {
+            native_mma(output[row * 4 + Tile], probabilities[row], fragments[0]);
+            native_mma(output[row * 4 + Tile + 1], probabilities[row], fragments[1]);
+        }
+    }
+    __ppu_sched_bound();
+    if constexpr (Tile + 2 < 4) native_pv_columns<Tile + 2, Part>(output, probabilities, values, output_base);
+}
+
 template<int Tile, int Count, int Group>
 __device__ __forceinline__ void native_store(const DecodeParams& params, const float (&output)[Count][8],
                                            const float (&multipliers)[2], const float (&lse)[2],
@@ -491,7 +531,7 @@ __device__ __forceinline__ void native_scatter_output(unsigned short* shared_out
             int index = row * 2 + (pair >> 1);
             float first = output[Tile][index] * multipliers[row];
             float second = output[Tile][index + 4] * multipliers[row];
-            int offset = packed_row * NativeOutputColumns + (dimension ^ ((packed_row & (NativeOutputColumns / 32 - 1)) * 32));
+            int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
             *reinterpret_cast<unsigned int*>(shared_output + offset) = native_bfloat_pair(first, second);
         }
     }
@@ -503,7 +543,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                                                   int active_splits, unsigned char* shared_keys,
                                                   unsigned char* shared_values, unsigned char* shared_transposed) {
     constexpr int Threads = NativeGeometry<Query, Group>::Threads;
-    constexpr int OutputTiles = Query == 1 ? 8 : NativeOutputColumns / 16;
+    constexpr int OutputTiles = NativeAirColumns ? NativeAirColumnRows * 4 : (Query == 1 ? 8 : 16);
     constexpr int ActiveRows = Query == 1 && Group <= 8 ? 1 : 2;
     int lane = threadIdx.x & 31;
     int warp = native_warp();
@@ -514,12 +554,11 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     int length = __ldg(lengths + request);
     const int* page_table = params.page_table + request * params.page_table_stride;
     const unsigned char* key_source = params.keys + head * params.key_head_stride;
-    int output_base = Query == 1 ? warp * 16 : (NativeHalfOutput ? blockIdx.x * NativeOutputColumns : 0);
-    const unsigned char* value_source = params.values + head * params.value_head_stride
-        + (NativeHalfOutput ? output_base : 0);
+    int output_base = Query == 1 ? warp * 16 : 0;
+    const unsigned char* value_source = params.values + head * params.value_head_stride;
     int row_base = Query == 1 ? 0 : warp * 16;
     int tile_count = (length + NativeKeyRows - 1) / NativeKeyRows;
-    bool single_split = params.splits == 1 || (Query != 1 && params.automatic && active_splits == 1);
+    bool single_split = NativeAirColumns || params.splits == 1 || (Query != 1 && params.automatic && active_splits == 1);
     int begin = tile_count * split / active_splits;
     int end = tile_count * (split + 1) / active_splits;
     unsigned int query_fragments[8][4];
@@ -581,6 +620,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
     };
     unsigned char* current = NativeQ16Dual ? shared_keys : shared_transposed;
     unsigned char* next = NativeQ16Dual ? shared_keys + NativeTileBytes * 2 : shared_keys;
+    auto* next_values = NativeAirColumns ? shared_keys + 3 * NativeTileBytes : nullptr;
     const unsigned char* next_value = nullptr;
     auto stage_pair = [&](int tile, unsigned char* key, auto full_flag) {
         constexpr bool FullTile = decltype(full_flag)::value;
@@ -617,130 +657,134 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             }
         }
         float scores[NativeKeyHalves][8] = {};
-        if constexpr (Query == 1 || (NativeKeyRows > 32 && !NativeQ16Dual)) {
-            native_qk_direct<0>(scores, query_fragments, current);
-        } else {
-            unsigned int ring[NativeKeyWindow][NativeKeyHalves][4];
-            #pragma unroll
-            for (int channel = 0; channel < NativeKeyWindow; ++channel) {
-                #pragma unroll
-                for (int half = 0; half < NativeKeyHalves; ++half) native_load_key(current, channel, half, ring[channel][half]);
-            }
-            native_qk_ring<0>(scores, query_fragments, current, ring);
-        }
-        if constexpr (Masked) {
-            #pragma unroll
-            for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
-                #pragma unroll
-                for (int value = 0; value < 8; ++value) {
-                    int packed_row = row_base + (lane >> 2) + ((value >> 1) & 1) * 8;
-                    int key = tile * NativeKeyRows + key_half * 16 + (lane & 3) * 2 + (value & 1) + (value >> 2) * 8;
-                    if (key >= length - query_count + packed_row / Group + 1) scores[key_half][value] = -INFINITY;
-                }
-            }
-        }
-        constexpr bool GuardedHistory = NativeQ16History && !First && !Masked;
         float alpha[2] = {1.f, 1.f};
-        float tile_maximum[2];
-        float exponent_shift[2] = {};
-        #pragma unroll
-        for (int row = 0; row < ActiveRows; ++row) {
-            float maximum;
-            if constexpr (NativeKeyRows == 64 && (Query == 4 || Query == 16) && Group == 16) {
-                // Reduce each half-tile independently to shorten the softmax dependency chain.
-                float half_max[NativeKeyHalves];
-                #pragma unroll
-                for (int half = 0; half < NativeKeyHalves; ++half) {
-                    const float* lane_scores = scores[half] + row * 2;
-                    half_max[half] = fmaxf(fmaxf(lane_scores[0], lane_scores[1]),
-                                           fmaxf(lane_scores[4], lane_scores[5]));
-                }
-                maximum = fmaxf(fmaxf(half_max[0], half_max[1]), fmaxf(half_max[2], half_max[3]));
+        unsigned int probabilities[NativeKeyRows / 32][4];
+        if (!NativeAirColumns || warp < NativeAirColumnRows) {
+            if constexpr (NativeAirColumns) {
+                native_qk_window(scores, query_fragments, current);
+            } else if constexpr (Query == 1 || (NativeKeyRows > 32 && !NativeQ16Dual)) {
+                native_qk_direct<0>(scores, query_fragments, current);
             } else {
-                maximum = scores[0][row * 2];
+                unsigned int ring[NativeKeyWindow][NativeKeyHalves][4];
+                #pragma unroll
+                for (int channel = 0; channel < NativeKeyWindow; ++channel) {
+                    #pragma unroll
+                    for (int half = 0; half < NativeKeyHalves; ++half) native_load_key(current, channel, half, ring[channel][half]);
+                }
+                native_qk_ring<0>(scores, query_fragments, current, ring);
+            }
+            if constexpr (Masked) {
                 #pragma unroll
                 for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
                     #pragma unroll
-                    for (int column = 0; column < 4; ++column) {
-                        int index = (column & 1) + row * 2 + (column >> 1) * 4;
-                        if (key_half != 0 || column != 0) maximum = fmaxf(maximum, scores[key_half][index]);
+                    for (int value = 0; value < 8; ++value) {
+                        int packed_row = row_base + (lane >> 2) + ((value >> 1) & 1) * 8;
+                        int key = tile * NativeKeyRows + key_half * 16 + (lane & 3) * 2 + (value & 1) + (value >> 2) * 8;
+                        if (key >= length - query_count + packed_row / Group + 1) scores[key_half][value] = -INFINITY;
                     }
                 }
             }
-            if constexpr (GuardedHistory) {
-                tile_maximum[row] = maximum;
-            } else {
-                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
-                maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
-                float next_max = First ? maximum : fmaxf(running_max[row], maximum);
-                float safe_max = Masked && next_max == -INFINITY ? 0.f : next_max;
-                if constexpr (First) alpha[row] = 0.f;
-                else if constexpr (Masked) alpha[row] = running_max[row] == -INFINITY ? 0.f : __exp2f((running_max[row] - safe_max) * log_scale);
-                else alpha[row] = __exp2f((running_max[row] - safe_max) * log_scale);
-                exponent_shift[row] = fmaf(-safe_max, log_scale, 8.f);
-                running_sum[row] *= alpha[row];
-                running_max[row] = next_max;
-                if constexpr (NativeQ16History) refresh_history(row, next_max, exponent_shift[row]);
-            }
-        }
-        if constexpr (GuardedHistory) {
-            // A warp-wide vote on lane-local maxima avoids cross-lane reductions on steady pages.
-            const bool any_exceeds_reference =
-                tile_maximum[0] > history_limit[0] || tile_maximum[1] > history_limit[1];
-            if (__any_sync(0xffffffff, any_exceeds_reference)) {
-                #pragma unroll
-                for (int row = 0; row < ActiveRows; ++row) {
-                    float maximum = tile_maximum[row];
+            constexpr bool GuardedHistory = NativeQ16History && !First && !Masked;
+            float tile_maximum[2];
+            float exponent_shift[2] = {};
+            #pragma unroll
+            for (int row = 0; row < ActiveRows; ++row) {
+                float maximum;
+                if constexpr (NativeKeyRows == 64 && (Query == 4 || Query == 16) && Group == 16) {
+                    // Reduce each half-tile independently to shorten the softmax dependency chain.
+                    float half_max[NativeKeyHalves];
+                    #pragma unroll
+                    for (int half = 0; half < NativeKeyHalves; ++half) {
+                        const float* lane_scores = scores[half] + row * 2;
+                        half_max[half] = fmaxf(fmaxf(lane_scores[0], lane_scores[1]),
+                                               fmaxf(lane_scores[4], lane_scores[5]));
+                    }
+                    maximum = fmaxf(fmaxf(half_max[0], half_max[1]), fmaxf(half_max[2], half_max[3]));
+                } else {
+                    maximum = scores[0][row * 2];
+                    #pragma unroll
+                    for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
+                        #pragma unroll
+                        for (int column = 0; column < 4; ++column) {
+                            int index = (column & 1) + row * 2 + (column >> 1) * 4;
+                            if (key_half != 0 || column != 0) maximum = fmaxf(maximum, scores[key_half][index]);
+                        }
+                    }
+                }
+                if constexpr (GuardedHistory) {
+                    tile_maximum[row] = maximum;
+                } else {
                     maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
                     maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
-                    tile_maximum[row] = maximum;
+                    float next_max = First ? maximum : fmaxf(running_max[row], maximum);
+                    float safe_max = Masked && next_max == -INFINITY ? 0.f : next_max;
+                    if constexpr (First) alpha[row] = 0.f;
+                    else if constexpr (Masked) alpha[row] = running_max[row] == -INFINITY ? 0.f : __exp2f((running_max[row] - safe_max) * log_scale);
+                    else alpha[row] = __exp2f((running_max[row] - safe_max) * log_scale);
+                    exponent_shift[row] = fmaf(-safe_max, log_scale, 8.f);
+                    running_sum[row] *= alpha[row];
+                    running_max[row] = next_max;
+                    if constexpr (NativeQ16History) refresh_history(row, next_max, exponent_shift[row]);
                 }
-                if (tile_maximum[0] > history_limit[0]) {
-                    alpha[0] = __exp2f((running_max[0] - tile_maximum[0]) * log_scale);
-                    running_sum[0] *= alpha[0];
-                    running_max[0] = tile_maximum[0];
-                    refresh_history(0, running_max[0],
-                                    fmaf(-running_max[0], log_scale, 8.f));
-                }
-                if (tile_maximum[1] > history_limit[1]) {
-                    alpha[1] = __exp2f((running_max[1] - tile_maximum[1]) * log_scale);
-                    running_sum[1] *= alpha[1];
-                    running_max[1] = tile_maximum[1];
-                    refresh_history(1, running_max[1],
-                                    fmaf(-running_max[1], log_scale, 8.f));
-                }
-                native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
             }
-            exponent_shift[0] = history_shift[0];
-            exponent_shift[1] = history_shift[1];
-        }
-        #pragma unroll
-        for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
+            if constexpr (GuardedHistory) {
+                // A warp-wide vote on lane-local maxima avoids cross-lane reductions on steady pages.
+                const bool any_exceeds_reference =
+                    tile_maximum[0] > history_limit[0] || tile_maximum[1] > history_limit[1];
+                if (__any_sync(0xffffffff, any_exceeds_reference)) {
+                    #pragma unroll
+                    for (int row = 0; row < ActiveRows; ++row) {
+                        float maximum = tile_maximum[row];
+                        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
+                        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2));
+                        tile_maximum[row] = maximum;
+                    }
+                    if (tile_maximum[0] > history_limit[0]) {
+                        alpha[0] = __exp2f((running_max[0] - tile_maximum[0]) * log_scale);
+                        running_sum[0] *= alpha[0];
+                        running_max[0] = tile_maximum[0];
+                        refresh_history(0, running_max[0],
+                                        fmaf(-running_max[0], log_scale, 8.f));
+                    }
+                    if (tile_maximum[1] > history_limit[1]) {
+                        alpha[1] = __exp2f((running_max[1] - tile_maximum[1]) * log_scale);
+                        running_sum[1] *= alpha[1];
+                        running_max[1] = tile_maximum[1];
+                        refresh_history(1, running_max[1],
+                                        fmaf(-running_max[1], log_scale, 8.f));
+                    }
+                    native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
+                }
+                exponent_shift[0] = history_shift[0];
+                exponent_shift[1] = history_shift[1];
+            }
             #pragma unroll
-            for (int column = 0; column < 4; ++column) {
+            for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
                 #pragma unroll
-                for (int row = 0; row < ActiveRows; ++row) {
-                    int index = (column & 1) + row * 2 + (column >> 1) * 4;
-                    scores[key_half][index] = __exp2f(fmaf(scores[key_half][index], log_scale, exponent_shift[row]));
+                for (int column = 0; column < 4; ++column) {
+                    #pragma unroll
+                    for (int row = 0; row < ActiveRows; ++row) {
+                        int index = (column & 1) + row * 2 + (column >> 1) * 4;
+                        scores[key_half][index] = __exp2f(fmaf(scores[key_half][index], log_scale, exponent_shift[row]));
+                    }
                 }
             }
-        }
-        #pragma unroll
-        for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
             #pragma unroll
-            for (int column = 0; column < 4; ++column) {
+            for (int key_half = 0; key_half < NativeKeyHalves; ++key_half) {
                 #pragma unroll
-                for (int row = 0; row < ActiveRows; ++row) {
-                    int index = (column & 1) + row * 2 + (column >> 1) * 4;
-                    running_sum[row] += scores[key_half][index];
+                for (int column = 0; column < 4; ++column) {
+                    #pragma unroll
+                    for (int row = 0; row < ActiveRows; ++row) {
+                        int index = (column & 1) + row * 2 + (column >> 1) * 4;
+                        running_sum[row] += scores[key_half][index];
+                    }
                 }
             }
+            if constexpr (Query != 1 && !NativeAirColumns && !First && !GuardedHistory) {
+                if (__any_sync(0xffffffff, alpha[0] != 1.f || alpha[1] != 1.f)) native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
+            }
+            if constexpr (Query != 1) native_pack_scores<ActiveRows>(scores, probabilities);
         }
-        if constexpr (Query != 1 && !First && !GuardedHistory) {
-            if (__any_sync(0xffffffff, alpha[0] != 1.f || alpha[1] != 1.f)) native_rescale_row<0, 0, OutputTiles, ActiveRows>(output, alpha);
-        }
-        unsigned int probabilities[NativeKeyRows / 32][4];
-        if constexpr (Query != 1) native_pack_scores<ActiveRows>(scores, probabilities);
         if constexpr (!NativeQ16Dual) {
             asm volatile("ppu.cp.async.wait_group 1;");
             __syncthreads();
@@ -753,14 +797,63 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             }
         }
         if constexpr (Query == 1) __syncthreads();
+        if constexpr (NativeAirColumns) {
+            auto shared_probabilities = reinterpret_cast<uint4*>(current);
+            auto shared_scales = reinterpret_cast<float*>(current + 4096);
+            if (warp < NativeAirColumnRows) {
+                #pragma unroll
+                for (int part = 0; part < 2; ++part) {
+                    shared_probabilities[(warp * 2 + part) * 32 + lane] = make_uint4(
+                        probabilities[part][0], probabilities[part][1], probabilities[part][2], probabilities[part][3]);
+                }
+                if ((lane & 3) == 0) {
+                    shared_scales[warp * 16 + (lane >> 2)] = alpha[0];
+                    shared_scales[warp * 16 + (lane >> 2) + 8] = alpha[1];
+                }
+            }
+            __syncthreads();
+            if constexpr (!First) {
+                float scales[NativeAirColumnRows][2];
+                #pragma unroll
+                for (int row = 0; row < NativeAirColumnRows; ++row) {
+                    scales[row][0] = shared_scales[row * 16 + (lane >> 2)];
+                    scales[row][1] = shared_scales[row * 16 + (lane >> 2) + 8];
+                }
+                __ppu_sched_bound();
+                #pragma unroll
+                for (int row = 0; row < NativeAirColumnRows; ++row) {
+                    if (__any_sync(0xffffffff, scales[row][0] != 1.f || scales[row][1] != 1.f)) {
+                        #pragma unroll
+                        for (int column = 0; column < 4; ++column) {
+                            #pragma unroll
+                            for (int value = 0; value < 8; ++value) output[row * 4 + column][value] *= scales[row][(value >> 1) & 1];
+                        }
+                    }
+                }
+            }
+        }
         if constexpr (!NativeQ16Dual) {
-            unsigned char* value_destination = Query == 1 ? shared_values : current;
+            unsigned char* value_destination = NativeAirColumns ? next_values : (Query == 1 ? shared_values : current);
             if (tile > begin) native_stage<Threads, false, true, true>(params, page_table, next_value, tile - 1, length, current, value_destination);
             else asm volatile("ppu.cp.async.commit_group;");
         }
         #pragma unroll
         for (int part = 0; part < NativeKeyRows / 32; ++part) {
-            if constexpr (Query == 1) native_pv_scoped<0, OutputTiles>(output, probabilities[part], current + part * 32, output_base, lane);
+            if constexpr (NativeAirColumns) {
+                auto shared_probabilities = reinterpret_cast<const uint4*>(current);
+                unsigned int gathered[NativeAirColumnRows][4];
+                #pragma unroll
+                for (int row = 0; row < NativeAirColumnRows; ++row) {
+                    uint4 packed = shared_probabilities[(row * 2 + part) * 32 + lane];
+                    gathered[row][0] = packed.x;
+                    gathered[row][1] = packed.y;
+                    gathered[row][2] = packed.z;
+                    gathered[row][3] = packed.w;
+                }
+                if (part == 0) native_pv_columns<0, 0>(output, gathered, shared_values, warp * 64);
+                else native_pv_columns<0, 1>(output, gathered, shared_values, warp * 64);
+            }
+            else if constexpr (Query == 1) native_pv_scoped<0, OutputTiles>(output, probabilities[part], current + part * 32, output_base, lane);
             else if constexpr (NativeKeyRows > 32 && (Group == 16 || Group == 12)) {
                 if (part == 0) native_pv_atoms<OutputTiles, 0>(output, probabilities[0], shared_values);
                 else native_pv_atoms<OutputTiles, 1>(output, probabilities[1], shared_values);
@@ -770,7 +863,12 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
         }
         unsigned char* previous = current;
         current = next;
-        if constexpr (NativeQ16Dual) {
+        if constexpr (NativeAirColumns) {
+            next = previous;
+            auto* previous_values = shared_values;
+            shared_values = next_values;
+            next_values = previous_values;
+        } else if constexpr (NativeQ16Dual) {
             next = previous;
             shared_values = current + NativeTileBytes;
         } else if constexpr (Query == 1) next = previous;
@@ -803,14 +901,60 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
             if (!single_split) lse[row] = fmaf(running_max[row], log_scale, log2f(sum) - 8.f);
         }
     }
-    if constexpr ((NativeKeyRows > 32 || NativeHalfOutput) && Query != 1
-        && sizeof(unsigned short) * QueryRows * NativeOutputColumns <= NativeGeometry<Query, Group>::SharedBytes) {
+    if constexpr (NativeAirColumns) {
+        __syncthreads();
+        auto factors = reinterpret_cast<float*>(shared_keys);
+        auto shared_output = reinterpret_cast<unsigned short*>(shared_keys + NativeTileBytes);
+        if (warp < NativeAirColumnRows && (lane & 3) == 0) {
+            factors[warp * 16 + (lane >> 2)] = multipliers[0];
+            factors[warp * 16 + (lane >> 2) + 8] = multipliers[1];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int row = 0; row < NativeAirColumnRows; ++row) {
+            #pragma unroll
+            for (int column = 0; column < 4; ++column) {
+                #pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    int packed_row = row * 16 + (lane >> 2) + (pair & 1) * 8;
+                    int query_index = packed_row / Group;
+                    if (query_index < query_count) {
+                        int token = query_begin + query_index;
+                        int query_head = head * Group + packed_row % Group;
+                        int dimension = warp * 64 + column * 16 + (lane & 3) * 4 + (pair >> 1) * 2;
+                        int index = (pair & 1) * 2 + (pair >> 1);
+                        float first = output[row * 4 + column][index] * factors[packed_row];
+                        float second = output[row * 4 + column][index + 4] * factors[packed_row];
+                        int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
+                        *reinterpret_cast<unsigned int*>(shared_output + offset) = native_bfloat_pair(first, second);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int copy = 0; copy < QueryRows * 32 / Threads; ++copy) {
+            int vector = threadIdx.x + copy * Threads;
+            int packed_row = vector >> 5;
+            int dimension = (vector & 31) * 8;
+            int query_index = packed_row / Group;
+            if (query_index < query_count) {
+                int token = query_begin + query_index;
+                int query_head = head * Group + packed_row % Group;
+                int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
+                *reinterpret_cast<uint4*>(params.output + token * params.output_row_stride
+                    + query_head * params.output_head_stride + dimension) = *reinterpret_cast<const uint4*>(shared_output + offset);
+            }
+        }
+    }
+    else if constexpr (NativeKeyRows > 32 && Query != 1
+        && sizeof(unsigned short) * QueryRows * 256 <= NativeGeometry<Query, Group>::SharedBytes) {
         if (single_split) {
             auto shared_output = reinterpret_cast<unsigned short*>(shared_keys);
             __syncthreads();
             native_scatter_output<0, OutputTiles, Group>(shared_output, output, multipliers, query_count, row_base, lane);
             __syncthreads();
-            constexpr int VectorsPerRow = NativeOutputColumns / 8;
+            constexpr int VectorsPerRow = 32;
             #pragma unroll
             for (int copy = 0; copy < QueryRows * VectorsPerRow / Threads; ++copy) {
                 int vector = threadIdx.x + copy * Threads;
@@ -820,7 +964,7 @@ __device__ __forceinline__ void native_decode_task(const DecodeParams& params, i
                 if (query_index < query_count) {
                     int token = query_begin + query_index;
                     int query_head = head * Group + packed_row % Group;
-                    int offset = packed_row * NativeOutputColumns + (dimension ^ ((packed_row & (NativeOutputColumns / 32 - 1)) * 32));
+                    int offset = packed_row * 256 + (dimension ^ ((packed_row & 7) * 32));
                     *reinterpret_cast<uint4*>(params.output + token * params.output_row_stride
                         + query_head * params.output_head_stride + output_base + dimension)
                         = *reinterpret_cast<const uint4*>(shared_output + offset);
@@ -1281,7 +1425,7 @@ void atrex_ppu_native_decode_kernel(DecodeParams params) {
             task = __shfl_sync(0xffffffff, static_cast<int>(*task_mailbox), 0);
         }
     } else {
-        native_decode_task<Query, Group>(params, NativeHalfOutput ? 0 : blockIdx.x, blockIdx.y, blockIdx.z,
+        native_decode_task<Query, Group>(params, blockIdx.x, blockIdx.y, blockIdx.z,
             params.splits, shared_keys, shared_values, shared_transposed);
     }
 }
@@ -1567,17 +1711,13 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     params.page_shift = __builtin_ctz(static_cast<unsigned int>(metadata[5]));
     params.automatic = splits <= 0;
     params.splits = splits > 0 ? splits : 32;
-    if constexpr (NativeHalfOutput) {
+    if constexpr (NativeAirColumns) {
         if (params.max_query != 4 || params.query_heads != 24 || params.kv_heads != 2
-            || params.page_size != 256 || params.max_kv > 4096 || splits != 1) {
+            || params.page_size != 256 || params.max_kv > 8192 || splits != 1) {
             return static_cast<int>(hggcErrorInvalidValue);
         }
-        dim3 grid(2, params.kv_heads, params.batch);
-        auto stream = static_cast<hggcStream_t>(stream_pointer);
-        atrex_ppu_native_decode_kernel<4, 12, false><<<grid, NativeGeometry<4, 12>::Threads, 0, stream>>>(params);
-        return static_cast<int>(hggcGetLastError());
-    }
-    if constexpr (NativeQ16History) {
+        return native_launch<4, 12>(params, static_cast<hggcStream_t>(stream_pointer));
+    } else if constexpr (NativeQ16History) {
         if (scale != 0.0625f || params.query_descales || params.key_descales || params.value_descales) {
             return static_cast<int>(hggcErrorInvalidValue);
         }
@@ -1610,9 +1750,9 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
 extern "C" int atrex_ppu_decode_resources(int* values) {
     hggcFuncAttributes attributes{};
     constexpr int Query = NativeQ1Only ? 1 : (NativeQ16Dual ? 16 : 4);
-    constexpr int Group = NativeHalfOutput ? 12 : 16;
+    constexpr int Group = NativeAirColumns ? 12 : 16;
     constexpr int Threads = NativeGeometry<Query, Group>::Threads;
-    auto function = atrex_ppu_native_decode_kernel<Query, Group, !(NativeQ16Dual || NativeHalfOutput)>;
+    auto function = atrex_ppu_native_decode_kernel<Query, Group, !(NativeQ16Dual || NativeAirColumns)>;
     auto status = hggcFuncGetAttributes(&attributes, function);
     if (status != hggcSuccess) return static_cast<int>(status);
     int blocks = 0;
