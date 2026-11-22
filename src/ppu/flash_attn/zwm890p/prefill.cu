@@ -1436,7 +1436,7 @@ void attn_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8, to
 void attn_air_direct_kv(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                         torch::Tensor block_table, torch::Tensor cu_q, torch::Tensor seq_lens,
                         torch::Tensor out, torch::Tensor partial, int64_t nsplit,
-                        torch::Tensor descales, double softmax_scale, bool compact);
+                        torch::Tensor descales, double softmax_scale, bool compact, bool fold_values);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("launch_plan", &launch_plan);

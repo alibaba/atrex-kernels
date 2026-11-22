@@ -549,6 +549,25 @@ __device__ __forceinline__ void load_raw_prefill_value_pair(
   second[3] = __byte_perm(upper[2], upper[3], 0x7531);
 }
 
+// Each warp transposes one 32-channel group for reuse across the CTA.
+template <int Part>
+__device__ __forceinline__ void write_folded_raw_value(unsigned char* destination,
+    const unsigned char* raw_values, int warp, int lane) {
+  u32 fragments[2][4];
+  load_raw_prefill_value_pair<Part>(fragments[0], fragments[1], raw_values, warp);
+#pragma unroll
+  for (int tile = 0; tile < 2; ++tile) {
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+      const int dimension = warp * 32 + tile * 16 + (lane >> 2) + 8 * (word >> 1);
+      const int row = dimension & 127;
+      const int key = (dimension >> 7) * PAGE + Part * 32 + 4 * (lane & 3) + 16 * (word & 1);
+      const int offset = row * 128 + (key ^ ((row & 7) * 16));
+      *reinterpret_cast<u32*>(destination + offset) = fragments[tile][word];
+    }
+  }
+}
+
 // V^T (E4M3 bytes), split-load form. An earlier layout used one 16 B block
 //   v8_off(DP, KB) = ((DP*8) + (KB ^ ((DP&1)*4))) * 16,   half = ((d>>1)&1)*8
 // and read it with a single b32x4. That is the load profile v53 measured as a TRAP: at IDENTICAL

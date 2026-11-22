@@ -1053,6 +1053,25 @@ def test_air_short_prefill_paged_uneven_prefix_and_value_tail():
     ) == 2
 
 
+def test_air_b72_prefill_graph_with_short_actual_kv():
+    batch, query = 72, 88
+    lengths = [query + (request % 6) * 17 for request in range(batch)]
+    case = build_case(64, [query] * batch, lengths, hq=6, hkv=1)
+    case["max_seqlen_k"] = 64 * 1024 + query
+    width = (case["max_seqlen_k"] + 63) // 64
+    table = case["block_table"]
+    case["block_table"] = torch.nn.functional.pad(table, (0, width - table.shape[1]), value=-1)
+    for request, length in enumerate(lengths):
+        if length % 64:
+            page = table[request, length // 64].item()
+            case["v"][page, length % 64:].view(torch.uint8).fill_(0x7f)
+    q_scales = torch.tensor([.5, -.75, 0., 1.], device="cuda").repeat(batch // 4)
+    case["q_descale"].copy_(q_scales[:, None])
+    case["k_descale"].fill_(1.25)
+    case["v_descale"].fill_(.5)
+    _check(case, graph=True)
+
+
 def test_q16_prefill_preserves_eight_byte_aligned_query():
     case = build_case(64, [16], [16401], hq=32, hkv=2)
     for name in ("q_descale", "k_descale", "v_descale"):

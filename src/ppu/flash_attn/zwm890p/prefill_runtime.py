@@ -315,7 +315,8 @@ def forward(
         _fill_descales(descales, scales)
         out.zero_()
         extension.attn_air_direct_kv(q, k, v, page_table, cu_seqlens_q, seqused_k, out,
-                                     partial, num_splits, descales, softmax_scale, compact_air)
+                                     partial, num_splits, descales, softmax_scale, compact_air,
+                                     requests == 72)
         if num_splits > 1:
             extension.combine(partial, out, num_splits)
         return out, None
