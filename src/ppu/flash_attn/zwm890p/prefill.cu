@@ -332,14 +332,20 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
     if constexpr (!DIRECT_K) {
       const unsigned char* kp = key_cache + ((size_t)pid * PAGE * head_count + kv_head) * HEAD_DIM;
       unsigned char* kdst = k_fp8 + ((size_t)blockIdx.y * max_pages + p) * KPAGE_BYTES;
-      const int kv = tid >> 2, ka = tid & 3;
+      // Four 4-byte words with an 8-byte source stride form one contiguous
+      // vector in the swizzled K tile. The other four words form its companion.
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const uint2 code = *reinterpret_cast<const uint2*>(
-            kp + kv * head_count * HEAD_DIM + ka * 8 + j * 32);
-        const int dimension = 32 * j + 8 * ka;
-        reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension) / 2] = code.x;
-        reinterpret_cast<u32*>(kdst)[k_ldmatrix_page_halfword(kv, dimension + 4) / 2] = code.y;
+      for (int group = tid; group < PAGE * HEAD_DIM / 32; group += NTHREADS) {
+        const int token = group / (HEAD_DIM / 32);
+        const int dimension = (group % (HEAD_DIM / 32)) * 32;
+        const unsigned char* source = kp + (token * head_count) * HEAD_DIM + dimension;
+        const uint4 first = *reinterpret_cast<const uint4*>(source);
+        const uint4 second = *reinterpret_cast<const uint4*>(source + 16);
+        auto* packed = reinterpret_cast<u16*>(kdst);
+        *reinterpret_cast<uint4*>(packed + k_ldmatrix_page_halfword(token, dimension)) =
+            make_uint4(first.x, first.z, second.x, second.z);
+        *reinterpret_cast<uint4*>(packed + k_ldmatrix_page_halfword(token, dimension + 4)) =
+            make_uint4(first.y, first.w, second.y, second.w);
       }
     }
     if ((p + 1) * PAGE <= kv_len) {
