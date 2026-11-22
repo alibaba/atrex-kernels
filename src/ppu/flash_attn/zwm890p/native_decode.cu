@@ -1169,7 +1169,7 @@ __device__ __forceinline__ void native_write_bucketed_plan(const DecodeParams& p
     }
 }
 
-__global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int resident_blocks) {
+__global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int resident_blocks, int unadjusted_average) {
     __shared__ int tiles[1024];
     __shared__ int starts[1025];
     __shared__ int order[1024];
@@ -1180,6 +1180,9 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int residen
     __shared__ int chunk_shared;
     __shared__ int force_average;
     __shared__ bool split_major;
+    __shared__ bool keep_mild_q1;
+    __shared__ int longest_q4;
+    __shared__ int q4_active[32], q4_short[32], q4_long[32];
     int request = threadIdx.x;
     int batch = params.batch;
     int heads = params.kv_heads;
@@ -1260,24 +1263,58 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int residen
             return;
         }
     }
+    const bool wide_q1 = NativeQ1Only && params.splits == 64;
+    const bool air_q4_tail = !NativeQ1Only && params.max_query == 4 && params.query_heads == 24
+        && heads == 2 && params.page_size == 256 && batch == 128;
+    const bool track_longest = wide_q1 || air_q4_tail;
     long long total = static_cast<long long>(count) * heads;
+    int longest = count;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         total += __shfl_down_sync(0xffffffff, total, offset);
+        if (track_longest) longest = max(longest, __shfl_down_sync(0xffffffff, longest, offset));
     }
-    if (lane == 0) sums[warp] = total;
+    if (lane == 0) {
+        sums[warp] = total;
+        if (track_longest) warp_maximum_splits[warp] = longest;
+    }
     __syncthreads();
     int occupancy = params.max_query == 1 ? 16 : (params.query_heads / heads <= 8 ? 8 : 4);
     if (resident_blocks) occupancy = resident_blocks;
     if (request == 0) {
         long long tile_total = 0;
-        for (int index = 0; index < warp_count; ++index) tile_total += sums[index];
-        long long capacity = params.num_cu * occupancy * 5;
+        int longest_request = 0;
+        for (int index = 0; index < warp_count; ++index) {
+            tile_total += sums[index];
+            if (track_longest) longest_request = max(longest_request, warp_maximum_splits[index]);
+        }
+        if (air_q4_tail) longest_q4 = longest_request;
+        // Keep the existing schedule for uneven workloads whose longest
+        // request is less than twice the mean. Uniform batches still use
+        // the physical residency policy.
+        const long long uniform_tiles = static_cast<long long>(longest_request) * batch * heads;
+        keep_mild_q1 = wide_q1 && tile_total < uniform_tiles && 2 * tile_total > uniform_tiles;
+        int planning_occupancy = keep_mild_q1 ? 16 : occupancy;
+        long long capacity = params.num_cu * planning_occupancy * 5;
         chunk_shared = max(1, static_cast<int>((tile_total * 6 + capacity - 1) / capacity));
     }
     __syncthreads();
+    const bool unadjusted = NativeQ1Only && keep_mild_q1;
     int chunk = chunk_shared;
-    int active_splits = request < batch ? (params.splits == 1 ? 1 : min(32, max(1, (count + chunk - 1) / chunk))) : 0;
+    int active_splits = request < batch
+        ? (params.splits == 1 ? 1 : min(unadjusted ? 32 : params.splits, max(1, (count + chunk - 1) / chunk))) : 0;
+    if (air_q4_tail && warp < warp_count) {
+        const bool active = request < batch && count > 0;
+        const int limit = longest_q4;
+        const unsigned int active_mask = __ballot_sync(0xffffffff, active);
+        const unsigned int short_mask = __ballot_sync(0xffffffff, active && count <= limit / 4);
+        const unsigned int long_mask = __ballot_sync(0xffffffff, active && count >= (limit + 1) / 2);
+        if (lane == 0) {
+            q4_active[warp] = __popc(active_mask);
+            q4_short[warp] = __popc(short_mask);
+            q4_long[warp] = __popc(long_mask);
+        }
+    }
     int maximum = active_splits;
     int jobs = active_splits * heads;
     #pragma unroll
@@ -1297,11 +1334,11 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int residen
             maximum_splits = max(maximum_splits, warp_maximum_splits[index]);
             dynamic_blocks += warp_job_counts[index];
         }
-        int average = max(1, params.average_splits);
+        int average = max(1, unadjusted ? unadjusted_average : params.average_splits);
         int resident_capacity = params.num_cu * occupancy;
         int fixed_blocks = batch * heads * average;
         bool balanced_average = false;
-        if (resident_blocks && dynamic_blocks > resident_capacity) {
+        if (!unadjusted && resident_blocks && dynamic_blocks > resident_capacity) {
             int dynamic_waves = (dynamic_blocks + resident_capacity - 1) / resident_capacity;
             int fixed_waves = (fixed_blocks + resident_capacity - 1) / resident_capacity;
             balanced_average = static_cast<long long>(fixed_blocks) * dynamic_waves * 9
@@ -1309,10 +1346,23 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int residen
         }
         force_average = maximum_splits < average || (maximum_splits < average + 3 && dynamic_blocks > resident_capacity
             && (fixed_blocks < dynamic_blocks || balanced_average));
+        if (force_average && air_q4_tail) {
+            // Keep per-request splits when most requests are short and there
+            // are several long requests in the same batch.
+            int active_requests = 0, short_requests = 0, long_requests = 0;
+            for (int index = 0; index < warp_count; ++index) {
+                active_requests += q4_active[index];
+                short_requests += q4_short[index];
+                long_requests += q4_long[index];
+            }
+            if (long_requests >= 2 && short_requests * 4 >= active_requests * 3) {
+                force_average = false;
+            }
+        }
     }
     __syncthreads();
     if (request < batch) {
-        int selected_splits = force_average ? max(1, params.average_splits) : active_splits;
+        int selected_splits = force_average ? max(1, unadjusted ? unadjusted_average : params.average_splits) : active_splits;
         selected_splits = min(selected_splits, max(1, count));
         if (params.max_query == 4 && params.query_heads / heads == 16) {
             int minimum_tiles = params.max_query * (params.query_heads / heads) * 2;
@@ -1381,17 +1431,18 @@ __global__ void atrex_ppu_native_decode_prepare(DecodeParams params, int residen
         plan[0] = 0;
         plan[1] = starts[batch];
         plan[2] = chunk;
-        plan[3] = max(1, params.average_splits);
+        plan[3] = max(1, unadjusted ? unadjusted_average : params.average_splits);
     }
     for (int rank = warp; rank < batch; rank += blockDim.x / 32) {
         int selected_request = __shfl_sync(0xffffffff, order[rank], 0);
         int splits = __shfl_sync(0xffffffff, split_counts[selected_request], 0);
         int start = __shfl_sync(0xffffffff, starts[rank], 0);
+        const bool wide_plan = NativeQ1Only && params.splits == 64;
         for (int head = 0; head < heads; ++head) {
-            if (lane < splits) {
-                int work = start + head * splits + lane;
-                plan[4 + batch + work] = (selected_request * heads + head) * 32 + lane;
-            }
+            const int packed_head = (selected_request * heads + head) * (wide_plan ? 64 : 32);
+            const int work = start + head * splits + lane;
+            if (lane < splits) plan[4 + batch + work] = packed_head + lane;
+            if (wide_plan && lane + 32 < splits) plan[4 + batch + work + 32] = packed_head + lane + 32;
         }
     }
 }
@@ -1407,11 +1458,13 @@ void atrex_ppu_native_decode_kernel(DecodeParams params) {
         int* plan = static_cast<int*>(params.plan);
         volatile int* task_mailbox = reinterpret_cast<volatile int*>(shared_transposed);
         int total_jobs = __ldg(plan + 1);
+        const int packed_bits = Query == 1 && params.splits == 64 ? 6 : 5;
+        const int split_mask = (1 << packed_bits) - 1;
         int task = blockIdx.x;
         while (task < total_jobs) {
             int packed = __ldg(plan + 4 + params.batch + task);
-            int split = packed & 31;
-            int request_head = packed >> 5;
+            int split = packed & split_mask;
+            int request_head = packed >> packed_bits;
             int head = request_head % params.kv_heads;
             int request = request_head / params.kv_heads;
             native_decode_task<Query, Group>(params, split, head, request, __ldg(plan + 4 + request),
@@ -1611,12 +1664,13 @@ int native_launch(DecodeParams params, hggcStream_t stream) {
         if (status != hggcSuccess) return static_cast<int>(status);
         // Plan against the resident CTAs for the tuned high-concurrency Q1 shapes.
         // The fallback counts warps, while each Q1 CTA uses two warps.
-        const bool q1_residency = Query == 1 && Group == 16 && params.kv_heads == 2
-            && params.page_size == 64 && (params.batch == 64 || params.batch == 128)
-            && params.max_kv >= 16 * 1024;
+        const bool q1_residency = Query == 1 && params.kv_heads == 2 && params.max_kv >= 16 * 1024
+            && ((Group == 16 && params.page_size == 64 && (params.batch == 64 || params.batch == 128))
+                || (Group == 12 && params.page_size == 256 && params.batch == 64 && params.splits == 64));
         const int resident_blocks = q1_residency || (Query == 4 && Group == 12) ? blocks_per_cu : 0;
         params.average_splits = native_average_splits(params, resident_blocks);
-        atrex_ppu_native_decode_prepare<<<1, 1024, 0, stream>>>(params, resident_blocks);
+        const int unadjusted_average = Query == 1 && params.splits == 64 ? native_average_splits(params) : 0;
+        atrex_ppu_native_decode_prepare<<<1, 1024, 0, stream>>>(params, resident_blocks, unadjusted_average);
         status = hggcGetLastError();
         if (status != hggcSuccess) return static_cast<int>(status);
         grid = dim3(min(params.num_cu * blocks_per_cu, params.batch * params.kv_heads * params.splits));
@@ -1710,7 +1764,10 @@ extern "C" int atrex_ppu_decode(void** pointers, int64_t* metadata, float scale,
     }
     params.page_shift = __builtin_ctz(static_cast<unsigned int>(metadata[5]));
     params.automatic = splits <= 0;
-    params.splits = splits > 0 ? splits : 32;
+    const bool wide_air_plan = NativeQ1Only && params.max_query == 1
+        && params.query_heads == 24 && params.kv_heads == 2 && params.page_size == 256
+        && params.batch == 64 && params.max_kv >= 16 * 1024 && params.max_kv <= 1024 * 1024;
+    params.splits = splits > 0 ? splits : (wide_air_plan ? 64 : 32);
     if constexpr (NativeAirColumns) {
         if (params.max_query != 4 || params.query_heads != 24 || params.kv_heads != 2
             || params.page_size != 256 || params.max_kv > 8192 || splits != 1) {

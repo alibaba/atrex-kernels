@@ -1005,9 +1005,38 @@ def test_air_decode_auto_split_with_padded_graph_table(batch, query, length, cap
     _check(case, graph=True)
 
 
+def test_air_q1_graph_moves_long_kv_request():
+    from atrex import flash_attn_varlen_func
+
+    batch, page_size = 64, 256
+    case = build_case(page_size, [1] * batch, [65537] + [257] * (batch - 1), hq=24, hkv=2)
+    table = case["block_table"]
+    case["max_seqlen_k"] = 1024 * 1024
+    case["block_table"] = torch.nn.functional.pad(
+        table, (0, case["max_seqlen_k"] // page_size - table.shape[1]), value=-1,
+    )
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name].fill_(1.)
+
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    case["seqused_k"][0].sub_(page_size + 3)
+    case["seqused_k"].copy_(case["seqused_k"].roll(19))
+    case["block_table"].copy_(case["block_table"].roll(19, dims=0))
+    expected, _ = reference(case)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
+
+
 @pytest.mark.parametrize("batch,query,splits", [
     (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 3),
-    (8, 64, 2), (8, 88, 2), (8, 96, 2), (8, 128, 3),
+    (8, 64, 2), (8, 88, 2), (8, 96, 2), (8, 128, 3), (16, 128, 3),
 ])
 def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
     from types import SimpleNamespace
@@ -1030,9 +1059,39 @@ def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
     monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
         attn=attn, attn_air_direct_kv=attn_air_direct_kv, prep_kv=extension.prep_kv,
         combine=extension.combine,
+        combine_active_queries=extension.combine_active_queries,
     ))
     _check(case, graph=True)
     assert dispatched and set(dispatched) == {splits}
+
+
+def test_air_b16_prefill_graph_leaves_query_padding_zero():
+    from atrex import flash_attn_varlen_func
+
+    batch, query, page_size = 16, 128, 64
+    case = build_case(page_size, [query] * batch, [257 + r for r in range(batch)], hq=6, hkv=1)
+    case["max_seqlen_k"] = 16 * 1024 + query
+    table = case["block_table"]
+    case["block_table"] = torch.nn.functional.pad(
+        table, (0, case["max_seqlen_k"] // page_size - table.shape[1]), value=-1,
+    )
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name].fill_(1.)
+
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    case["cu_seqlens_q"].add_(1)
+    case["cu_seqlens_q"][-1].sub_(2)
+    expected, _ = reference(case)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out[[0, -1]].count_nonzero().item() == 0
+    torch.testing.assert_close(out[1:-1].float(), expected[1:-1], atol=.03, rtol=.05)
 
 
 def test_air_short_prefill_paged_uneven_prefix_and_value_tail():

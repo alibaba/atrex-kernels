@@ -298,10 +298,15 @@ def forward(
             # Six shards nearly fill five two-CTA waves for this eight-head batch.
             num_splits = 6
 
+    air_b16_split = (
+        requests == 16 and max_seqlen_q == 128 and prefix >= 16 * 1024
+        and out.data_ptr() % 16 == 0
+    )
     air_short_paged = (
         automatic_splits and heads == (6, 1) and k.shape[1] == 64
         and q.shape[0] == requests * max_seqlen_q
-        and ((requests == 8 and 64 <= max_seqlen_q <= 128 and prefix >= 16 * 1024)
+        and (air_b16_split
+             or (requests == 8 and 64 <= max_seqlen_q <= 128 and prefix >= 16 * 1024)
              or (requests == 72 and max_seqlen_q == 88 and prefix >= 64 * 1024))
         and (k.data_ptr() | v.data_ptr()) % 128 == 0
     )
@@ -309,6 +314,8 @@ def forward(
     if compact_air:
         # Four warps and two buffers keep two splits resident for these short queries.
         num_splits = 2
+    elif air_short_paged and air_b16_split:
+        num_splits = 3
     partial = torch.empty(
         num_splits * q.shape[0] * q.shape[1] * 272 if num_splits > 1 else 0,
         dtype=torch.float32, device=q.device,
@@ -320,7 +327,10 @@ def forward(
         extension.attn_air_direct_kv(q, k, v, page_table, cu_seqlens_q, seqused_k, out,
                                      partial, num_splits, descales, softmax_scale, compact_air,
                                      requests == 72)
-        if num_splits > 1:
+        if air_b16_split:
+            # Replay can leave padding rows without any partial writes.
+            extension.combine_active_queries(partial, out, cu_seqlens_q)
+        elif num_splits > 1:
             extension.combine(partial, out, num_splits)
         return out, None
     packed_pages = requests * kv_heads * max_pages

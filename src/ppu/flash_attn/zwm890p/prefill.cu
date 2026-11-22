@@ -1010,13 +1010,9 @@ __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
 #define TPR (HEAD_DIM / NDPT)   // threads per row: 64 / 32 / 16
 #define CROWS (256 / TPR)       // rows per CTA:    4 / 8 / 16
 template <int SplitCount>
-__global__ __launch_bounds__(256) void atrex_ppu_comb(const float* __restrict__ o_part,
-                                             __nv_bfloat16* __restrict__ out, int nrow,
-                                             int nsplit) {
+__device__ __forceinline__ void combine_prefill_row(const float* __restrict__ o_part,
+    __nv_bfloat16* __restrict__ out, int nrow, int nsplit, int row, int tid) {
   const int split_count = SplitCount > 0 ? SplitCount : nsplit;
-  const int tid = threadIdx.x;
-  const int row = blockIdx.x * CROWS + tid / TPR;
-  if (row >= nrow) return;
   const int d0 = (tid % TPR) * NDPT;
   float acc[NDPT];
 #pragma unroll
@@ -1090,6 +1086,25 @@ __global__ __launch_bounds__(256) void atrex_ppu_comb(const float* __restrict__ 
     *reinterpret_cast<uint4*>(dst + 8 * i) =
         make_uint4(ow[4 * i], ow[4 * i + 1], ow[4 * i + 2], ow[4 * i + 3]);
 #endif
+}
+
+template <int SplitCount>
+__global__ __launch_bounds__(256) void atrex_ppu_comb(const float* __restrict__ o_part,
+    __nv_bfloat16* __restrict__ out, int nrow, int nsplit) {
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x * CROWS + tid / TPR;
+  if (row >= nrow) return;
+  combine_prefill_row<SplitCount>(o_part, out, nrow, nsplit, row, tid);
+}
+
+__global__ __launch_bounds__(256) void atrex_ppu_comb_active_queries(
+    const float* __restrict__ o_part, __nv_bfloat16* __restrict__ out,
+    int nrow, const int* __restrict__ cu_q, int requests, int heads) {
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x * CROWS + tid / TPR;
+  const int token = row / heads;
+  if (row >= nrow || token < cu_q[0] || token >= cu_q[requests]) return;
+  combine_prefill_row<3>(o_part, out, nrow, 3, row, tid);
 }
 
 // ==================================================================================== KERNEL 4
@@ -1296,6 +1311,15 @@ void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torc
   }
 }
 
+void combine_active_queries(torch::Tensor o_part, torch::Tensor out, torch::Tensor cu_q) {
+  const int heads = (int)out.size(1);
+  const int nrow = (int)out.size(0) * heads;
+  dim3 grid((unsigned)((nrow + CROWS - 1) / CROWS));
+  atrex_ppu_comb_active_queries<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      nrow, cu_q.data_ptr<int>(), (int)cu_q.size(0) - 1, heads);
+}
+
 void combine(torch::Tensor o_part, torch::Tensor out, int64_t nsplit) {
   const int nrow = (int)(out.size(0) * out.size(1));  // n_tok * NHEADS
   dim3 grid((unsigned)((nrow + CROWS - 1) / CROWS));
@@ -1452,4 +1476,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_air_direct_kv", &attn_air_direct_kv);
   m.def("attn", &attn);
   m.def("combine", &combine);
+  m.def("combine_active_queries", &combine_active_queries);
 }

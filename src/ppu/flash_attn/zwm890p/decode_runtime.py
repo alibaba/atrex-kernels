@@ -154,7 +154,13 @@ def _forward_validated(
                     num_splits = 48 if max_seqlen_k <= 16 * 1024 else 64
         elif batch == 8 and max_seqlen_q == 1:
             num_splits = 4 if max_seqlen_k <= 2 * 1024 else 12
-    selected_splits = num_splits or 32
+    selected_splits = num_splits
+    if not selected_splits:
+        wide_air_plan = (
+            max_seqlen_q == 1 and (query_heads, kv_heads, page_size) == (24, 2, 256)
+            and batch == 64 and 16 * 1024 <= table_capacity <= 1024 * 1024
+        )
+        selected_splits = 64 if wide_air_plan else 32
     table_width = page_table.shape[1]
     sort_short_history = (
         batch >= 64
