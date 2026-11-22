@@ -254,12 +254,6 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep(
 
 // Raw-FP8 prep performs layout conversion only. Identity K/V scales are folded
 // into the attention math, so no scale metadata is materialised here.
-// AIU K is kept in its native swizzle. The N16 score slots use this
-// token permutation, so prepared V and the causal mask use the same map.
-__device__ __forceinline__ int direct_key_token(int logical) {
-  return 2 * (logical >> 2) + (logical & 1) + 8 * ((logical >> 1) & 1);
-}
-
 template <bool DIRECT_K>
 __device__ __forceinline__ int prep_v_stage_offset(int token, int channel) {
   // Keep each 16-byte vector aligned and distribute token groups across banks.
@@ -384,29 +378,6 @@ __global__ __launch_bounds__(NTHREADS) void atrex_ppu_prep_raw(
 // (q-block, slice) pair, snapped to PAGE granularity because the page loop carries a barrier. Each
 // slice keeps its own reference max and writes fp32 (O_s, m_s, l_s); atrex_ppu_comb merges them. SPLIT=0
 // constant-folds every line of that away.
-// Same one-request, D-major 64 x 256 K tile as native wide decode.
-template <int KV_HEADS>
-__device__ __forceinline__ void direct_stage_key(
-    unsigned char* destination, const unsigned char* source, int valid_rows) {
-  constexpr unsigned long long row_stride = KV_HEADS * HEAD_DIM;
-  constexpr unsigned long long slab_stride = 128;
-  const u32 shared = static_cast<u32>(__cvta_generic_to_shared(destination));
-  asm volatile("ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.LLC::128B.padz.swzl.b8 "
-      "[%0], [%1], {%2,%3,%4}, {%5,%6,%7}, {%8,%9}, {%10,%11,%12}, %13;"
-      :: "r"(shared), "l"(source), "r"(128), "r"(valid_rows), "r"(2),
-         "r"(128), "r"(PAGE), "r"(2), "l"(row_stride), "l"(slab_stride),
-         "r"(0), "r"(0), "r"(0), "r"(0)
-      : "memory");
-}
-
-template <bool DIRECT_K>
-__device__ __forceinline__ void load_prefill_key(u32 (&fragment)[4], u32 key_block,
-                                                 int channel_tile, int key_half) {
-  const int slab = channel_tile >> 2;
-  const int cube = DIRECT_K ? (4 * slab + key_half) : (4 * (key_half >> 1) + 2 * slab + (key_half & 1));
-  load_k_ldmatrix(fragment, key_block + 128 * cube + 2 * (channel_tile & 3));
-}
-
 template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4,
           int QUERY_HEADS = NHEADS, int KV_HEADS = 1, bool LINEAR_AIU = false, bool DIRECT_K = false>
 __global__ __launch_bounds__(NTHREADS, 2) void atrex_ppu_attn(
@@ -1462,11 +1433,17 @@ void attn_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8, to
   }
 }
 
+void attn_air_direct_kv(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                        torch::Tensor block_table, torch::Tensor cu_q, torch::Tensor seq_lens,
+                        torch::Tensor out, torch::Tensor partial, int64_t nsplit,
+                        torch::Tensor descales, double softmax_scale, bool compact);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("launch_plan", &launch_plan);
   m.def("prep_kv", &prep_kv);
   m.def("prep_v_direct_k", &prep_v_direct_k);
   m.def("attn_direct_k", &attn_direct_k);
+  m.def("attn_air_direct_kv", &attn_air_direct_kv);
   m.def("attn", &attn);
   m.def("combine", &combine);
 }

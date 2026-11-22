@@ -493,6 +493,62 @@ __device__ __forceinline__ void load_k_ldmatrix(u32 (&fragment)[4], u32 block_ad
       : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]), "=r"(fragment[3])
       : "l"(address), "r"(lbo), "r"(sbo), "r"(mode));
 }
+// AIU K is kept in its native swizzle. The N16 score slots use this
+// token permutation, so prepared V and the causal mask use the same map.
+__device__ __forceinline__ int direct_key_token(int logical) {
+  return 2 * (logical >> 2) + (logical & 1) + 8 * ((logical >> 1) & 1);
+}
+
+// Same one-request, D-major 64 x 256 K tile as native wide decode.
+template <int KV_HEADS>
+__device__ __forceinline__ void direct_stage_key(
+    unsigned char* destination, const unsigned char* source, int valid_rows) {
+  constexpr unsigned long long row_stride = KV_HEADS * HEAD_DIM;
+  constexpr unsigned long long slab_stride = 128;
+  const u32 shared = static_cast<u32>(__cvta_generic_to_shared(destination));
+  asm volatile("ppu.cp.async.aiu.bulk.tensor.shared.global.cg.2d.tile.LLC::128B.padz.swzl.b8 "
+      "[%0], [%1], {%2,%3,%4}, {%5,%6,%7}, {%8,%9}, {%10,%11,%12}, %13;"
+      :: "r"(shared), "l"(source), "r"(128), "r"(valid_rows), "r"(2),
+         "r"(128), "r"(PAGE), "r"(2), "l"(row_stride), "l"(slab_stride),
+         "r"(0), "r"(0), "r"(0), "r"(0)
+      : "memory");
+}
+
+template <bool DIRECT_K>
+__device__ __forceinline__ void load_prefill_key(u32 (&fragment)[4], u32 key_block,
+                                                 int channel_tile, int key_half) {
+  const int slab = channel_tile >> 2;
+  const int cube = DIRECT_K ? (4 * slab + key_half) : (4 * (key_half >> 1) + 2 * slab + (key_half & 1));
+  load_k_ldmatrix(fragment, key_block + 128 * cube + 2 * (channel_tile & 3));
+}
+
+// Raw V uses the same AIU layout as K. A transposed 16-bit load from each
+// 16-token slab and byte interleaves form two adjacent FP8 PV fragments.
+template <int Part>
+__device__ __forceinline__ void load_raw_prefill_value_pair(
+    u32 (&first)[4], u32 (&second)[4], const unsigned char* values, int pair) {
+  const u32 shared = static_cast<u32>(__cvta_generic_to_shared(values));
+  const unsigned long long address =
+      (shared >> 4) + (pair >> 2) * (PAGE * 8) + Part * 256 + (pair & 3) * 2;
+  u32 lower[4], upper[4];
+  asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+      "{%0,%1,%2,%3}, [%4], %5, %6, %7;"
+      : "=r"(lower[0]), "=r"(lower[1]), "=r"(lower[2]), "=r"(lower[3])
+      : "l"(address), "r"(1), "r"(64), "r"(0));
+  asm volatile("ppu.tc02.ldmatrix.swzl.sync.bulk.tensor.m8n8.x4.b16.trans "
+      "{%0,%1,%2,%3}, [%4], %5, %6, %7;"
+      : "=r"(upper[0]), "=r"(upper[1]), "=r"(upper[2]), "=r"(upper[3])
+      : "l"(address + 128), "r"(1), "r"(64), "r"(0));
+  first[0] = __byte_perm(lower[0], lower[1], 0x6420);
+  first[1] = __byte_perm(upper[0], upper[1], 0x6420);
+  first[2] = __byte_perm(lower[0], lower[1], 0x7531);
+  first[3] = __byte_perm(upper[0], upper[1], 0x7531);
+  second[0] = __byte_perm(lower[2], lower[3], 0x6420);
+  second[1] = __byte_perm(upper[2], upper[3], 0x6420);
+  second[2] = __byte_perm(lower[2], lower[3], 0x7531);
+  second[3] = __byte_perm(upper[2], upper[3], 0x7531);
+}
+
 // V^T (E4M3 bytes), split-load form. An earlier layout used one 16 B block
 //   v8_off(DP, KB) = ((DP*8) + (KB ^ ((DP&1)*4))) * 16,   half = ((d>>1)&1)*8
 // and read it with a single b32x4. That is the load profile v53 measured as a TRAP: at IDENTICAL

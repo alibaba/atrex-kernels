@@ -1007,7 +1007,7 @@ def test_air_decode_auto_split_with_padded_graph_table(batch, query, length, cap
 
 @pytest.mark.parametrize("batch,query,splits", [
     (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 4),
-    (8, 64, 2), (8, 88, 3),
+    (8, 64, 2), (8, 88, 2), (8, 96, 2), (8, 128, 3),
 ])
 def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
     from types import SimpleNamespace
@@ -1023,11 +1023,34 @@ def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
         dispatched.append(args[-4])
         return extension.attn(*args)
 
+    def attn_air_direct_kv(*args):
+        dispatched.append(args[8])
+        return extension.attn_air_direct_kv(*args)
+
     monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
-        attn=attn, prep_kv=extension.prep_kv, combine=extension.combine,
+        attn=attn, attn_air_direct_kv=attn_air_direct_kv, prep_kv=extension.prep_kv,
+        combine=extension.combine,
     ))
     _check(case, graph=True)
     assert dispatched and set(dispatched) == {splits}
+
+
+def test_air_short_prefill_paged_uneven_prefix_and_value_tail():
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, [88] * 8, [16472, 16393, 8193, 245, 128, 111, 88, 4209], hq=6, hkv=1)
+    for request, length in enumerate(case["seqused_k"].tolist()):
+        tail = length % 64
+        if tail:
+            page = case["block_table"][request, length // 64].item()
+            case["v"][page, tail:].view(torch.uint8).fill_(0x7f)
+    case["q_descale"].copy_(torch.linspace(-.5, .5, 8, device="cuda")[:, None])
+    case["k_descale"].fill_(1.25)
+    case["v_descale"].fill_(.5)
+    _check(case, graph=True)
+    assert prefill_runtime._default_splits(
+        8 * 512, 8, 512, 64 * 1024 + 512, query_heads=6, kv_heads=1, page_size=64
+    ) == 2
 
 
 def test_q16_prefill_preserves_eight_byte_aligned_query():
