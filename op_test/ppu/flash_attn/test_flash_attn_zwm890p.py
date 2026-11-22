@@ -944,6 +944,43 @@ def test_q512_short_prefix_prefill_paged_keys():
     _check(case, graph=True)
 
 
+@pytest.mark.parametrize("q_lens,heads,splits", [
+    ([128], (8, 1), 10),
+    ([512], (8, 1), 3),
+    ([128], (32, 2), 12),
+    ([128] * 8, (8, 1), 6),
+    ([512, 73, 73, 73, 73, 73, 73, 74], (8, 1), 1),
+])
+def test_short_prefill_direct_key_split_policy(q_lens, heads, splits, monkeypatch):
+    from types import SimpleNamespace
+
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, q_lens, [length + 1 for length in q_lens],
+                      hq=heads[0], hkv=heads[1])
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    # Use a long static bound and short actual KV lengths to exercise graph dispatch.
+    case["max_seqlen_k"] = 64 * 1024 + max(q_lens)
+    table = case["block_table"]
+    pages = (case["max_seqlen_k"] + 63) // 64
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]))
+    extension = prefill_runtime._extension(case["q"].device)
+    dispatched = []
+
+    def attn_direct_k(*args):
+        dispatched.append(args[-1])
+        return extension.attn_direct_k(*args)
+
+    monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
+        attn_direct_k=attn_direct_k,
+        prep_v_direct_k=extension.prep_v_direct_k,
+        combine=extension.combine,
+    ))
+    _check(case, graph=True)
+    assert dispatched and set(dispatched) == {splits}
+
+
 @pytest.mark.parametrize("query", [1, 4])
 def test_single_request_long_decode_graph(query):
     case = build_case(64, [query], [16401], hq=32, hkv=2)

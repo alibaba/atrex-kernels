@@ -257,19 +257,28 @@ def forward(
     descale_shape = (3, requests, kv_heads) if scaled else (0,)
     query_blocks = (q.shape[0] + 31) // 32 + requests
     heads = (q.shape[1], kv_heads)
+    prefix = max_seqlen_k - max_seqlen_q
+    single_auto = automatic_splits and requests == 1 and q.shape[0] == max_seqlen_q
     direct_q128 = max_seqlen_q == 128 and (
-        (heads == (32, 2) and requests in (8, 64, 128)) or (heads == (8, 1) and requests == 8)
+        (heads == (32, 2) and (requests in (8, 64, 128) or single_auto))
+        or (heads == (8, 1) and (requests == 8 or (single_auto and prefix >= 64 * 1024)))
     )
-    direct_q512 = (max_seqlen_q == 512 and heads == (32, 2) and requests == 8
-                   and max_seqlen_k - max_seqlen_q <= 32 * 1024)
+    direct_q512 = max_seqlen_q == 512 and (
+        (heads == (32, 2) and requests == 8)
+        or (heads == (8, 1) and prefix >= 64 * 1024 and (requests == 8 or single_auto))
+    )
     direct_k = (
-        (direct_q128 or direct_q512) and num_splits == 1 and k.shape[1] == 64
+        (direct_q128 or direct_q512) and (num_splits == 1 or single_auto) and k.shape[1] == 64
         and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
         and softmax_scale in (None, 0.0625) and not scaled
     )
     if direct_k:
-        if (automatic_splits and heads == (8, 1) and q.shape[0] == 128 * requests
-                and max_seqlen_k - max_seqlen_q >= 64 * 1024):
+        if single_auto and heads == (8, 1):
+            # Fill at least 78 CTA slots instead of launching only 8 or 32 CTAs.
+            num_splits = 10 if direct_q128 else 3
+        elif (direct_q128 and automatic_splits and heads == (8, 1) and requests == 8
+              and q.shape[0] == 128 * requests and prefix >= 64 * 1024):
+            # Six shards nearly fill five two-CTA waves for this eight-head batch.
             num_splits = 6
 
     partial = torch.empty(

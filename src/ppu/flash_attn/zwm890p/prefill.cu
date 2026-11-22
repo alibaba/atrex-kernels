@@ -1449,14 +1449,16 @@ void attn_direct_k(torch::Tensor q, torch::Tensor raw_k, torch::Tensor v_fp8, to
   TORCH_CHECK((reinterpret_cast<uintptr_t>(raw_k.data_ptr()) & 127) == 0,
               "direct-K requires 128-byte-aligned key pages");
   if (q.size(1) == 8 && raw_k.size(2) == 1) {
-    TORCH_CHECK(nsplit == 1 || nsplit == 6, "unsupported direct-K split count");
-    if (nsplit == 6)
+    if (nsplit > 1)
       launch_prefill_direct_k<8, 1, true>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, nsplit);
     else
       launch_prefill_direct_k<8, 1, false>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, 1);
   } else {
-    TORCH_CHECK(q.size(1) == 32 && raw_k.size(2) == 2 && nsplit == 1, "unsupported direct-K shape");
-    launch_prefill_direct_k<32, 2, false>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, 1);
+    TORCH_CHECK(q.size(1) == 32 && raw_k.size(2) == 2, "unsupported direct-K shape");
+    if (nsplit > 1)
+      launch_prefill_direct_k<32, 2, true>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, nsplit);
+    else
+      launch_prefill_direct_k<32, 2, false>(q, raw_k, v_fp8, table, cu_q, seq_lens, out, partial, max_pages, nblk, 1);
   }
 }
 
