@@ -1006,7 +1006,7 @@ def test_air_decode_auto_split_with_padded_graph_table(batch, query, length, cap
 
 
 @pytest.mark.parametrize("batch,query,splits", [
-    (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 4),
+    (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 3),
     (8, 64, 2), (8, 88, 2), (8, 96, 2), (8, 128, 3),
 ])
 def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):

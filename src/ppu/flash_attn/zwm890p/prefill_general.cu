@@ -11,7 +11,32 @@ struct RawPrefillCache {
   int64_t page_stride = 0;
   int table_stride = 0;
   unsigned int page_count = 0;
+  const int* request_order = nullptr;
 };
+
+constexpr int AirOrderBatch = 72;
+constexpr int AirOrderQuery = 88;
+constexpr int AirOrderHeads = 6;
+constexpr int AirOrderTiles = (AirOrderQuery * AirOrderHeads + 4 * MQ - 1) / (4 * MQ);
+
+__global__ void atrex_ppu_order_prefill_requests(const int* cu_q, const int* lengths, int* order) {
+  __shared__ int used_lengths[AirOrderBatch];
+  const int request = threadIdx.x;
+  const bool expected = request > AirOrderBatch || cu_q[request] == request * AirOrderQuery;
+  const bool dense = __syncthreads_and(expected);
+  if (request == 0) order[AirOrderBatch] = dense;
+  if (!dense) return;
+  if (request < AirOrderBatch) used_lengths[request] = lengths[request];
+  __syncthreads();
+  if (request >= AirOrderBatch) return;
+  const int length = used_lengths[request];
+  int rank = 0;
+  for (int i = 0; i < AirOrderBatch; ++i) {
+    const int other = used_lengths[i];
+    rank += other > length || (other == length && i < request);
+  }
+  order[rank] = request;
+}
 
 template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4,
           int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false, bool FOLD_VALUE = false>
@@ -42,12 +67,20 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   constexpr int query_tile = PACKED ? MQ * HEAD_GROUP : MQ;
   int bx = GROUPED ? blockIdx.x / head_groups : blockIdx.x;
   int req = -1, qbi = 0, nb_req = 0;
-  for (int r = 0; r < n_req; ++r) {
-    const int nb = ((cu_q[r + 1] - cu_q[r]) * (PACKED ? FIXED_HEADS : 1) + query_tile - 1) / query_tile;
-    if (bx < nb) { req = r; qbi = bx; nb_req = nb; break; }
-    bx -= nb;
+  if (FOLD_VALUE && raw.request_order && raw.request_order[AirOrderBatch]) {
+    // The device plan verified exactly 88 query tokens at every request offset.
+    if (bx >= AirOrderBatch * AirOrderTiles) return;
+    req = raw.request_order[bx / AirOrderTiles];
+    qbi = bx % AirOrderTiles;
+    nb_req = AirOrderTiles;
+  } else {
+    for (int r = 0; r < n_req; ++r) {
+      const int nb = ((cu_q[r + 1] - cu_q[r]) * (PACKED ? FIXED_HEADS : 1) + query_tile - 1) / query_tile;
+      if (bx < nb) { req = r; qbi = bx; nb_req = nb; break; }
+      bx -= nb;
+    }
+    if (req < 0) return;
   }
-  if (req < 0) return;
 
   const int q_start = cu_q[req], q_len = cu_q[req + 1] - q_start;
   const int kv_len = seq_lens[req];
@@ -799,8 +832,16 @@ void attn_air_direct_kv(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                         torch::Tensor block_table, torch::Tensor cu_q, torch::Tensor seq_lens,
                         torch::Tensor out, torch::Tensor partial, int64_t nsplit,
                         torch::Tensor descales, double softmax_scale, bool compact, bool fold_values) {
+  torch::Tensor order;
+  if (fold_values && nsplit == 1 && seq_lens.numel() == AirOrderBatch &&
+      q.size(0) == AirOrderBatch * AirOrderQuery) {
+    order = torch::empty({AirOrderBatch + 1}, seq_lens.options());
+    atrex_ppu_order_prefill_requests<<<1, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        cu_q.data_ptr<int>(), seq_lens.data_ptr<int>(), order.data_ptr<int>());
+  }
   const RawPrefillCache raw{block_table.data_ptr<int>(), k.stride(0),
-      static_cast<int>(block_table.stride(0)), static_cast<unsigned int>(k.size(0))};
+      static_cast<int>(block_table.stride(0)), static_cast<unsigned int>(k.size(0)),
+      order.defined() ? order.data_ptr<int>() : nullptr};
   const auto launch = fold_values ? launch_attn_head_group<4, 6, true, false, true, true> :
       compact ? launch_attn_head_group<2, 6, true, false, true> :
                 launch_attn_head_group<4, 6, true, false, true>;

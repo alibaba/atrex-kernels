@@ -131,6 +131,9 @@ def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k, *, query_heads
     if (requests == 1 and (query_heads, kv_heads, page_size) == (6, 1, 64)
             and 32 <= max_seqlen_q <= 512 and tokens == max_seqlen_q
             and max_seqlen_k - max_seqlen_q >= 16 * 1024):
+        if max_seqlen_q == 512 and max_seqlen_k - max_seqlen_q <= 32 * 1024:
+            # Three splits fit 72 CTAs into one two-CTA wave on 39 CUs.
+            return 3
         # The packed Air kernel puts 128 token-head rows in each CTA.
         ctas = (tokens * query_heads + 127) // 128
         return min(12, (78 + ctas - 1) // ctas)
