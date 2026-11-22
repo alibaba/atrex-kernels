@@ -128,6 +128,17 @@ def _default_splits(tokens, requests, max_seqlen_q, max_seqlen_k, *, query_heads
         if max_seqlen_q == 512:
             # Three splits place 384 CTAs into five two-CTA waves on 39 CUs.
             return 3
+    if (requests == 1 and (query_heads, kv_heads, page_size) == (6, 1, 64)
+            and 32 <= max_seqlen_q <= 512 and tokens == max_seqlen_q
+            and max_seqlen_k - max_seqlen_q >= 16 * 1024):
+        # The packed Air kernel puts 128 token-head rows in each CTA.
+        ctas = (tokens * query_heads + 127) // 128
+        return min(12, (78 + ctas - 1) // ctas)
+    if (requests == 8 and (query_heads, kv_heads, page_size) == (6, 1, 64)
+            and 64 <= max_seqlen_q <= 128 and tokens == requests * max_seqlen_q
+            and max_seqlen_k - max_seqlen_q >= 16 * 1024):
+        # Q64 has three packed tiles per request and benefits from the two-split kernel.
+        return 2 if max_seqlen_q == 64 else 3
     if requests == 1 or max_seqlen_q > 16:
         return 1
     query_blocks = (tokens + 31) // 32 + requests

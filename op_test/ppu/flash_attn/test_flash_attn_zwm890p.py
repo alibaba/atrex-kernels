@@ -659,7 +659,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q16_dual", "q16_history"}
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q4_halves", "q16_dual", "q16_history"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
@@ -702,7 +702,7 @@ def test_decode_selects_compiled_query_variant(query, heads, capacity, splits, m
 
 @pytest.mark.parametrize("heads", [24, 32])
 @pytest.mark.parametrize("batch", [3, 64, 128])
-@pytest.mark.parametrize("maximum", [4096, 32768])
+@pytest.mark.parametrize("maximum", [2048, 4096, 32768])
 def test_decode_graph_switches_single_and_multiple_splits(heads, batch, maximum):
     from atrex import flash_attn_varlen_func
     from op_test.utils.flash_attn_contract import error_metrics
@@ -985,6 +985,41 @@ def test_short_prefill_direct_key_split_policy(q_lens, heads, splits, monkeypatc
 def test_single_request_long_decode_graph(query):
     case = build_case(64, [query], [16401], hq=32, hkv=2)
     _check(case, graph=True)
+
+
+@pytest.mark.parametrize("batch,query,length", [(1, 1, 1024), (1, 4, 16385), (8, 1, 2049)])
+def test_air_decode_auto_split_with_padded_graph_table(batch, query, length):
+    case = build_case(256, [query] * batch, [length - request for request in range(batch)], hq=24, hkv=2)
+    table = case["block_table"].new_full((batch, 4096), -1)
+    table[:, :case["block_table"].shape[1]] = case["block_table"]
+    case["block_table"] = table
+    case["max_seqlen_k"] = 1048576
+    _check(case, graph=True)
+
+
+@pytest.mark.parametrize("batch,query,splits", [
+    (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 4),
+    (8, 64, 2), (8, 88, 3),
+])
+def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
+    from types import SimpleNamespace
+
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    length = 16 * 1024 + query
+    case = build_case(64, [query] * batch, [length] * batch, hq=6, hkv=1)
+    extension = prefill_runtime._extension(case["q"].device)
+    dispatched = []
+
+    def attn(*args):
+        dispatched.append(args[-4])
+        return extension.attn(*args)
+
+    monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
+        attn=attn, prep_kv=extension.prep_kv, combine=extension.combine,
+    ))
+    _check(case, graph=True)
+    assert dispatched and set(dispatched) == {splits}
 
 
 def test_q16_prefill_preserves_eight_byte_aligned_query():

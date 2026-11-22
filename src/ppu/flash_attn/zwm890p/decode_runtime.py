@@ -19,6 +19,17 @@ def _compute_units(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+@lru_cache(maxsize=None)
+def _q4_half_occupancy(device):
+    from .decode_build import load_library
+
+    library = load_library("q4_halves", device)
+    resources = (ctypes.c_int * 4)()
+    if (status := library.atrex_ppu_decode_resources(resources)):
+        raise RuntimeError(f"PPU decode occupancy query failed: {status}")
+    return library, resources[3]
+
+
 def validate(call):
     q, k, v = (call[name] for name in ("q", "k", "v"))
     table = call["block_table"]
@@ -109,7 +120,20 @@ def _forward_validated(
     elif max_seqlen_q == 4 and query_heads // kv_heads == 16:
         variant = "q4_wide"
     compute_units = _compute_units(device)
-    library = load_library(variant, device)
+    table_capacity = page_table.shape[1] * page_size
+    if (max_seqlen_q == 4 and (query_heads, kv_heads, page_size) == (24, 2, 256)
+            and batch in (64, 128) and total == 4 * batch
+            and num_splits == 0 and table_capacity <= 4096):
+        half_library, resident_blocks = _q4_half_occupancy(device)
+        # Shorter histories can amortize the duplicated QK over two waves.
+        waves = 2 if table_capacity <= 2048 else 1
+        if batch * kv_heads * 2 <= waves * compute_units * resident_blocks:
+            library = half_library
+            num_splits = 1
+        else:
+            library = load_library("q4_wide", device)
+    else:
+        library = load_library(variant, device)
     if out is None:
         out = torch.empty(q.shape, device=device, dtype=torch.bfloat16)
     if num_splits == 0 and (query_heads, kv_heads, page_size) == (32, 2, 64) and max_seqlen_k >= 16 * 1024:
@@ -123,6 +147,17 @@ def _forward_validated(
                 num_splits = 48 if short_history else 64
         elif max_seqlen_q == 1 and batch in (8, 16):
             num_splits = 96 // batch
+    if num_splits == 0 and (query_heads, kv_heads, page_size) == (24, 2, 256) and max_seqlen_k >= 1024:
+        if batch == 1 and total == max_seqlen_q:
+            if max_seqlen_q == 1:
+                num_splits = 32 if max_seqlen_k <= 8 * 1024 else (64 if max_seqlen_k <= 32 * 1024 else 96)
+            elif max_seqlen_q == 4:
+                if max_seqlen_k <= 8 * 1024:
+                    num_splits = 32
+                else:
+                    num_splits = 48 if max_seqlen_k <= 16 * 1024 else 64
+        elif batch == 8 and max_seqlen_q == 1:
+            num_splits = 4 if max_seqlen_k <= 2 * 1024 else 12
     selected_splits = num_splits or 32
     table_width = page_table.shape[1]
     sort_short_history = (
