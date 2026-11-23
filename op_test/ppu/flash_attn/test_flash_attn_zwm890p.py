@@ -56,6 +56,20 @@ def test_public_eligibility_and_fail_fast():
             flash_attn_varlen_func(**kwargs)
 
 
+@pytest.mark.parametrize("name,dtype", [("q", torch.float8_e4m3fn), ("out", torch.bfloat16)])
+def test_prefill_rejects_unaligned_contiguous_views(name, dtype):
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+
+    case = _case(64, [65, 3], [257, 513])
+    q = case["q"]
+    view = torch.empty(q.numel() + 1, dtype=dtype, device=q.device)[1:].view(q.shape)
+    assert view.is_contiguous()
+    case[name] = view
+    assert not can_use_flash_attn_varlen_func(**case)
+    with pytest.raises(ValueError, match=f"(?i)aligned {name} pointer"):
+        flash_attn_varlen_func(**case)
+
+
 def _check(case, splits=0, graph=False):
     from atrex import flash_attn_varlen_func
 
@@ -1099,13 +1113,15 @@ def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
     assert dispatched and set(dispatched) == {splits}
 
 
-@pytest.mark.parametrize("batch,query,heads,bounded", [
-    (16, 128, (6, 1), False),
-    (8, 128, (8, 1), True),
-    (8, 128, (32, 2), False),
-    (2, 512, (32, 2), False),
+@pytest.mark.parametrize("batch,query,heads,bounded,prefix_k", [
+    (16, 128, (6, 1), False, 64),
+    (8, 128, (8, 1), True, 64),
+    (8, 128, (32, 2), False, 64),
+    (2, 512, (32, 2), False, 64),
+    (1, 16, (32, 2), False, 64),
+    (64, 16, (32, 2), False, 16),
 ])
-def test_prefill_graph_leaves_query_padding_zero(batch, query, heads, bounded, monkeypatch):
+def test_prefill_graph_leaves_query_padding_zero(batch, query, heads, bounded, prefix_k, monkeypatch):
     from atrex import flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
 
@@ -1113,8 +1129,8 @@ def test_prefill_graph_leaves_query_padding_zero(batch, query, heads, bounded, m
     hq, hkv = heads
     case = build_case(page_size, [query] * batch, [query + 129 + r for r in range(batch)],
                       hq=hq, hkv=hkv)
-    case["max_seqlen_k"] = 64 * 1024 + query
-    pages = case["max_seqlen_k"] // page_size
+    case["max_seqlen_k"] = prefix_k * 1024 + query
+    pages = (case["max_seqlen_k"] + page_size - 1) // page_size
     table = case["block_table"]
     case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]), value=-1)
     for name in ("q_descale", "k_descale", "v_descale"):
@@ -1155,25 +1171,6 @@ def test_air_short_prefill_paged_uneven_prefix_and_value_tail():
     assert prefill_runtime._default_splits(
         8 * 512, 8, 512, 64 * 1024 + 512, query_heads=6, kv_heads=1, page_size=64
     ) == 2
-
-
-def test_air_b72_prefill_graph_with_short_actual_kv():
-    batch, query = 72, 88
-    lengths = [query + (request % 6) * 17 for request in range(batch)]
-    case = build_case(64, [query] * batch, lengths, hq=6, hkv=1)
-    case["max_seqlen_k"] = 64 * 1024 + query
-    width = (case["max_seqlen_k"] + 63) // 64
-    table = case["block_table"]
-    case["block_table"] = torch.nn.functional.pad(table, (0, width - table.shape[1]), value=-1)
-    for request, length in enumerate(lengths):
-        if length % 64:
-            page = table[request, length // 64].item()
-            case["v"][page, length % 64:].view(torch.uint8).fill_(0x7f)
-    q_scales = torch.tensor([.5, -.75, 0., 1.], device="cuda").repeat(batch // 4)
-    case["q_descale"].copy_(q_scales[:, None])
-    case["k_descale"].fill_(1.25)
-    case["v_descale"].fill_(.5)
-    _check(case, graph=True)
 
 
 def test_q16_prefill_preserves_eight_byte_aligned_query():

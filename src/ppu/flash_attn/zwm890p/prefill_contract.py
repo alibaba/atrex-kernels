@@ -13,6 +13,11 @@ def validate(call):
         raise NotImplementedError("PPU attention requires FP8 E4M3 Q/K/V")
     if q.ndim != 3 or q.shape[-1] != 256 or not q.is_contiguous():
         raise NotImplementedError("PPU prefill requires contiguous Q [tokens,heads,256]")
+    if q.numel() and q.data_ptr() % 8:
+        raise ValueError("PPU prefill requires an 8-byte aligned Q pointer")
+    out = call["out"]
+    if out is not None and out.numel() and out.data_ptr() % 16:
+        raise ValueError("PPU prefill requires a 16-byte aligned out pointer")
     if table is None or k.ndim != 4 or k.shape[-1] != 256 or v.shape != k.shape:
         raise NotImplementedError("PPU prefill requires paged K/V [blocks,page_size,KV heads,256]")
     kv_heads = k.shape[2]

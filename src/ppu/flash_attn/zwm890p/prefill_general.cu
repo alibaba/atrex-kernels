@@ -11,35 +11,10 @@ struct RawPrefillCache {
   int64_t page_stride = 0;
   int table_stride = 0;
   unsigned int page_count = 0;
-  const int* request_order = nullptr;
 };
 
-constexpr int AirOrderBatch = 72;
-constexpr int AirOrderQuery = 88;
-constexpr int AirOrderHeads = 6;
-constexpr int AirOrderTiles = (AirOrderQuery * AirOrderHeads + 4 * MQ - 1) / (4 * MQ);
-
-__global__ void atrex_ppu_order_prefill_requests(const int* cu_q, const int* lengths, int* order) {
-  __shared__ int used_lengths[AirOrderBatch];
-  const int request = threadIdx.x;
-  const bool expected = request > AirOrderBatch || cu_q[request] == request * AirOrderQuery;
-  const bool dense = __syncthreads_and(expected);
-  if (request == 0) order[AirOrderBatch] = dense;
-  if (!dense) return;
-  if (request < AirOrderBatch) used_lengths[request] = lengths[request];
-  __syncthreads();
-  if (request >= AirOrderBatch) return;
-  const int length = used_lengths[request];
-  int rank = 0;
-  for (int i = 0; i < AirOrderBatch; ++i) {
-    const int other = used_lengths[i];
-    rank += other > length || (other == length && i < request);
-  }
-  order[rank] = request;
-}
-
 template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4,
-          int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false, bool FOLD_VALUE = false>
+          int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false>
 __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex_ppu_attn_general(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
@@ -52,13 +27,10 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   constexpr bool GENERAL = FIXED_HEADS == 0 || SCALED;
   constexpr bool PACKED = FIXED_HEADS != 0;
   constexpr bool compact_raw = RAW_KV && HEAD_GROUP == 2;
-  static_assert(!FOLD_VALUE || (RAW_KV && HEAD_GROUP == 4));
-  constexpr bool double_buffer = compact_raw || FOLD_VALUE;
-  constexpr int buffers = double_buffer ? 2 : NBUF;
+  constexpr int buffers = compact_raw ? 2 : NBUF;
   extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + buffers * KPAGE_BYTES;
-  unsigned char* folded_v = FOLD_VALUE ? Vs + buffers * VPAGE_BYTES : nullptr;
 
   const int n_heads = PACKED ? FIXED_HEADS : query_heads;
   const int n_kv_heads = PACKED ? 1 : kv_heads;
@@ -67,20 +39,12 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   constexpr int query_tile = PACKED ? MQ * HEAD_GROUP : MQ;
   int bx = GROUPED ? blockIdx.x / head_groups : blockIdx.x;
   int req = -1, qbi = 0, nb_req = 0;
-  if (FOLD_VALUE && raw.request_order && raw.request_order[AirOrderBatch]) {
-    // The device plan verified exactly 88 query tokens at every request offset.
-    if (bx >= AirOrderBatch * AirOrderTiles) return;
-    req = raw.request_order[bx / AirOrderTiles];
-    qbi = bx % AirOrderTiles;
-    nb_req = AirOrderTiles;
-  } else {
-    for (int r = 0; r < n_req; ++r) {
-      const int nb = ((cu_q[r + 1] - cu_q[r]) * (PACKED ? FIXED_HEADS : 1) + query_tile - 1) / query_tile;
-      if (bx < nb) { req = r; qbi = bx; nb_req = nb; break; }
-      bx -= nb;
-    }
-    if (req < 0) return;
+  for (int r = 0; r < n_req; ++r) {
+    const int nb = ((cu_q[r + 1] - cu_q[r]) * (PACKED ? FIXED_HEADS : 1) + query_tile - 1) / query_tile;
+    if (bx < nb) { req = r; qbi = bx; nb_req = nb; break; }
+    bx -= nb;
   }
+  if (req < 0) return;
 
   const int q_start = cu_q[req], q_len = cu_q[req + 1] - q_start;
   const int kv_len = seq_lens[req];
@@ -237,7 +201,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     ll[1] *= (f1);                                                                      \
   } while (0)
 
-  if constexpr (double_buffer) {
+  if constexpr (compact_raw) {
     if (npg >= 0) STAGE(0, 0);
   } else {
 #if SP2E
@@ -262,10 +226,10 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   if (npg >= 0) STAGE(0, 0);
 #endif
   }
-  constexpr int page_step = PGSTEP2 && !double_buffer ? 2 : 1;
-  constexpr int split_step = PGU2 && !double_buffer ? 2 : 1;
+  constexpr int page_step = PGSTEP2 && !compact_raw ? 2 : 1;
+  constexpr int split_step = PGU2 && !compact_raw ? 2 : 1;
   for (int pp = 0; pp <= npg; pp += page_step) {
-    if constexpr (double_buffer) {
+    if constexpr (compact_raw) {
       cp_wait<0>();
       __syncthreads();
       if (pp < npg) STAGE((pp + 1) & 1, pp + 1);
@@ -321,92 +285,14 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
       const int pg = pp + _sp;
       if (pg > npg || skip_warp) continue;
     const unsigned char* Kb = Ks + (pg & (buffers - 1)) * KPAGE_BYTES;
-    const unsigned char* Vb = FOLD_VALUE ? folded_v : Vs + (pg & (buffers - 1)) * VPAGE_BYTES;
+    const unsigned char* Vb = Vs + (pg & (buffers - 1)) * VPAGE_BYTES;
     const u32 key_block = RAW_KV ? static_cast<u32>(__cvta_generic_to_shared(Kb) >> 4) :
         static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
-    const u32 value_block = FOLD_VALUE ? static_cast<u32>(__cvta_generic_to_shared(Vb) >> 4) :
-        static_cast<u32>(reinterpret_cast<uintptr_t>(Vb) / 16);
+    const u32 value_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Vb) / 16);
 #if !SPG4
     const float aa = PACKED && SCALED ? (zero_query ? 1.f : fabsf(logit_scale)) :
         (GENERAL ? 1.f : 0.0625f * 1.4426950408889634f);
 #endif
-    if constexpr (FOLD_VALUE) {
-      float scores[4][8] = {};
-#pragma unroll
-      for (int step = 0; step < KSTEPS; ++step) {
-#pragma unroll
-        for (int tile = 0; tile < 4; ++tile) {
-          u32 key[4];
-          load_prefill_key<true>(key, key_block, step, tile);
-          MMA_E4M3(scores[tile], qf[step], key);
-        }
-      }
-      const int physical_page = npg - pg;
-      if (physical_page >= first_mask_page) {
-#pragma unroll
-        for (int tile = 0; tile < 4; ++tile) {
-#pragma unroll
-          for (int element = 0; element < 8; ++element) {
-            const int logical = 4 * la + 2 * (element >> 2) + (element & 1);
-            const int key = physical_page * PAGE + tile * 16 + direct_key_token(logical);
-            const int query_pos = (q0 + warp_row + 2 * lq + ((element >> 1) & 1)) / FIXED_HEADS
-                                + kv_len - q_len - kv_lo;
-            if (key > query_pos || key >= kv_len - kv_lo) scores[tile][element] = -INFINITY;
-          }
-        }
-      }
-      float maxima[2] = {-INFINITY, -INFINITY};
-#pragma unroll
-      for (int row = 0; row < 2; ++row) {
-#pragma unroll
-        for (int tile = 0; tile < 4; ++tile) {
-          const int offset = 2 * row;
-          const float lo = fmaxf(scores[tile][offset], scores[tile][offset + 1]);
-          const float hi = fmaxf(scores[tile][offset + 4], scores[tile][offset + 5]);
-          maxima[row] = fmaxf(maxima[row], fmaxf(lo, hi));
-        }
-        maxima[row] = fmaxf(maxima[row], __shfl_xor_sync(0xffffffffu, maxima[row], 1));
-        maxima[row] = fmaxf(maxima[row], __shfl_xor_sync(0xffffffffu, maxima[row], 2));
-        maxima[row] = fmaxf(mq[row], maxima[row] * aa);
-      }
-      if (maxima[0] > mq[0] || maxima[1] > mq[1]) {
-        const float a0 = maxima[0] > mq[0] ? ex2(mq[0] - maxima[0]) : 1.f;
-        const float a1 = maxima[1] > mq[1] ? ex2(mq[1] - maxima[1]) : 1.f;
-        RESCALE(a0, a1);
-        mq[0] = maxima[0];
-        mq[1] = maxima[1];
-      }
-      u32 p[2][4];
-#pragma unroll
-      for (int tile = 3; tile >= 0; --tile) {
-#pragma unroll
-        for (int row = 0; row < 2; ++row) {
-          const int lo = 2 * row;
-          const float shift = L255 - (mq[row] == -INFINITY ? 0.f : mq[row]);
-          const float a = ex2(fmaf(scores[tile][lo], aa, shift));
-          const float b = ex2(fmaf(scores[tile][lo + 1], aa, shift));
-          const float c = ex2(fmaf(scores[tile][lo + 4], aa, shift));
-          const float d = ex2(fmaf(scores[tile][lo + 5], aa, shift));
-          ll[row] += (a + b) + (c + d);
-          p[tile / 2][(tile % 2) * 2 + row] =
-              (u32)cvt_e4m3x2(b, a) | ((u32)cvt_e4m3x2(d, c) << 16);
-        }
-      }
-      const unsigned char* raw_v = Vs + (pg & 1) * VPAGE_BYTES;
-      write_folded_raw_value<0>(folded_v, raw_v, copy_warp, lane);
-      write_folded_raw_value<1>(folded_v, raw_v, copy_warp, lane);
-      __syncthreads();
-#pragma unroll
-      for (int part = 1; part >= 0; --part) {
-#pragma unroll
-        for (int dt = 0; dt < NDT; ++dt) {
-          u32 fragment[4];
-          load_k_ldmatrix(fragment, value_block + (dt & 7) * 128 + (dt >> 3) * 4 + 2 * part);
-          MMA_PV(acc[dt], p[part], fragment);
-        }
-      }
-      continue;
-    }
     float page_scores[4][8];
 #pragma unroll
     for (int tile = 0; tile < 4; ++tile) {
@@ -635,7 +521,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     }
     }
 #if !ONEB
-    if constexpr (!double_buffer) __syncthreads();
+    if constexpr (!compact_raw) __syncthreads();
 #endif
   }
 #undef STAGE
@@ -748,7 +634,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   }
 }
 
-template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false, bool FOLD_VALUE = false>
+template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false>
 void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
@@ -762,13 +648,13 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   const int launch_nblk = FIXED_HEADS ? (n_tok * FIXED_HEADS + MQ * HEAD_GROUP - 1) / (MQ * HEAD_GROUP) + (n_req > 1 ? n_req : 0) :
       (n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk);
   const int head_groups = FIXED_HEADS ? 1 : query_heads / HEAD_GROUP;
-  constexpr int buffers = (FOLD_VALUE || (RAW_KV && HEAD_GROUP == 2)) ? 2 : NBUF;
-  constexpr int smem = buffers * (KPAGE_BYTES + VPAGE_BYTES) + (FOLD_VALUE ? VPAGE_BYTES : 0);
+  constexpr int buffers = RAW_KV && HEAD_GROUP == 2 ? 2 : NBUF;
+  constexpr int smem = buffers * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
-    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    if constexpr (!RAW_KV) cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if constexpr (!RAW_KV) cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     once = true;
   }
   const auto qp = reinterpret_cast<const unsigned char*>(q.data_ptr());
@@ -778,19 +664,19 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   auto stream = at::cuda::getCurrentCUDAStream();
   if (nsplit <= 1) {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups) : dim3((unsigned)launch_nblk, head_groups);
-    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE><<<grid, threads, smem, stream>>>(
+    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1,
         query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
   } else {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups, 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, head_groups, (unsigned)nsplit);
     if (!RAW_KV && nsplit == 2)
-      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE><<<grid, threads, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
     else
-      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV, FOLD_VALUE><<<grid, threads, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
           (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
@@ -831,20 +717,11 @@ void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_f
 void attn_air_direct_kv(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                         torch::Tensor block_table, torch::Tensor cu_q, torch::Tensor seq_lens,
                         torch::Tensor out, torch::Tensor partial, int64_t nsplit,
-                        torch::Tensor descales, double softmax_scale, bool compact, bool fold_values) {
-  torch::Tensor order;
-  if (fold_values && nsplit == 1 && seq_lens.numel() == AirOrderBatch &&
-      q.size(0) == AirOrderBatch * AirOrderQuery) {
-    order = torch::empty({AirOrderBatch + 1}, seq_lens.options());
-    atrex_ppu_order_prefill_requests<<<1, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        cu_q.data_ptr<int>(), seq_lens.data_ptr<int>(), order.data_ptr<int>());
-  }
+                        torch::Tensor descales, double softmax_scale, bool compact) {
   const RawPrefillCache raw{block_table.data_ptr<int>(), k.stride(0),
-      static_cast<int>(block_table.stride(0)), static_cast<unsigned int>(k.size(0)),
-      order.defined() ? order.data_ptr<int>() : nullptr};
-  const auto launch = fold_values ? launch_attn_head_group<4, 6, true, false, true, true> :
-      compact ? launch_attn_head_group<2, 6, true, false, true> :
-                launch_attn_head_group<4, 6, true, false, true>;
+      static_cast<int>(block_table.stride(0)), static_cast<unsigned int>(k.size(0))};
+  const auto launch = compact ? launch_attn_head_group<2, 6, true, false, true> :
+                                launch_attn_head_group<4, 6, true, false, true>;
   launch(q, k, v, descales, descales, cu_q, seq_lens, out, partial,
          0, 0, nsplit, 1, descales, softmax_scale, raw);
 }

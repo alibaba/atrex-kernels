@@ -250,6 +250,8 @@ def forward(
             splits = 2 if max_seqlen_k <= 32 * 1024 + 16 else 12
         else:
             splits = 1 if max_seqlen_k <= 32 * 1024 + 16 else 3
+        if splits == 1:
+            out.zero_()
         out = _forward_validated(
             q, k, v, cu_seqlens_q, seqused_k, max_seqlen_q, max_seqlen_k,
             page_table, 0.0625, out, q_descale, k_descale, v_descale, splits,
@@ -304,9 +306,7 @@ def forward(
     air_short_paged = (
         automatic_splits and heads == (6, 1) and k.shape[1] == 64
         and q.shape[0] == requests * max_seqlen_q
-        and (air_b16_split
-             or (requests == 8 and 64 <= max_seqlen_q <= 128 and prefix >= 16 * 1024)
-             or (requests == 72 and max_seqlen_q == 88 and prefix >= 64 * 1024))
+        and (air_b16_split or (requests == 8 and 64 <= max_seqlen_q <= 128 and prefix >= 16 * 1024))
         and (k.data_ptr() | v.data_ptr()) % 128 == 0
     )
     compact_air = air_short_paged and requests == 8 and 64 < max_seqlen_q <= 96
@@ -325,8 +325,7 @@ def forward(
         if num_splits == 1:
             out.zero_()
         extension.attn_air_direct_kv(q, k, v, page_table, cu_seqlens_q, seqused_k, out,
-                                     partial, num_splits, descales, softmax_scale, compact_air,
-                                     requests == 72)
+                                     partial, num_splits, descales, softmax_scale, compact_air)
         if num_splits > 1:
             extension.combine(partial, out, num_splits, cu_seqlens_q)
         return out, None

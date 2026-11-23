@@ -1490,6 +1490,19 @@ __global__ void atrex_ppu_native_decode_combine(DecodeParams params) {
     int head = blockIdx.y;
     int lane = threadIdx.x & (Width - 1);
     if (token >= params.total_q) return;
+    if constexpr (NativeQ16Dual) {
+        // Q16 is called by prefill and must zero its inactive output rows.
+        if (token < __ldg(params.offsets) || token >= __ldg(params.offsets + params.batch)) {
+            unsigned short* out = params.output + token * params.output_row_stride
+                + head * params.output_head_stride;
+            #pragma unroll
+            for (int part = 0; part < Parts; ++part) {
+                int dimension = lane * 4 + part * Width * 4;
+                *reinterpret_cast<uint2*>(out + dimension) = make_uint2(0, 0);
+            }
+            return;
+        }
+    }
     unsigned int active_mask = NativeQ1Only ? 0xffffffff : __activemask();
     const float* partial = params.partial_output;
     const float* partial_lse = params.partial_lse;
