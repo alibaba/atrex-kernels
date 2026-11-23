@@ -1090,21 +1090,20 @@ __device__ __forceinline__ void combine_prefill_row(const float* __restrict__ o_
 
 template <int SplitCount>
 __global__ __launch_bounds__(256) void atrex_ppu_comb(const float* __restrict__ o_part,
-    __nv_bfloat16* __restrict__ out, int nrow, int nsplit) {
+    __nv_bfloat16* __restrict__ out, int nrow, int nsplit,
+    const int* __restrict__ cu_q, int requests, int heads) {
   const int tid = threadIdx.x;
   const int row = blockIdx.x * CROWS + tid / TPR;
   if (row >= nrow) return;
+  // Graph replay can leave rows outside the live query range unwritten.
+  if (row < cu_q[0] * heads || row >= cu_q[requests] * heads) {
+    auto* dst = reinterpret_cast<uint2*>(
+        out + (size_t)row * HEAD_DIM + (tid % TPR) * NDPT);
+#pragma unroll
+    for (int i = 0; i < NDPT / 4; ++i) dst[i] = make_uint2(0, 0);
+    return;
+  }
   combine_prefill_row<SplitCount>(o_part, out, nrow, nsplit, row, tid);
-}
-
-__global__ __launch_bounds__(256) void atrex_ppu_comb_active_queries(
-    const float* __restrict__ o_part, __nv_bfloat16* __restrict__ out,
-    int nrow, const int* __restrict__ cu_q, int requests, int heads) {
-  const int tid = threadIdx.x;
-  const int row = blockIdx.x * CROWS + tid / TPR;
-  const int token = row / heads;
-  if (row >= nrow || token < cu_q[0] || token >= cu_q[requests]) return;
-  combine_prefill_row<3>(o_part, out, nrow, 3, row, tid);
 }
 
 // ==================================================================================== KERNEL 4
@@ -1311,42 +1310,39 @@ void launch_attn(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torc
   }
 }
 
-void combine_active_queries(torch::Tensor o_part, torch::Tensor out, torch::Tensor cu_q) {
+void combine(torch::Tensor o_part, torch::Tensor out, int64_t nsplit, torch::Tensor cu_q) {
   const int heads = (int)out.size(1);
   const int nrow = (int)out.size(0) * heads;
+  const int requests = (int)cu_q.size(0) - 1;
   dim3 grid((unsigned)((nrow + CROWS - 1) / CROWS));
-  atrex_ppu_comb_active_queries<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-      o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      nrow, cu_q.data_ptr<int>(), (int)cu_q.size(0) - 1, heads);
-}
-
-void combine(torch::Tensor o_part, torch::Tensor out, int64_t nsplit) {
-  const int nrow = (int)(out.size(0) * out.size(1));  // n_tok * NHEADS
-  dim3 grid((unsigned)((nrow + CROWS - 1) / CROWS));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto partial = o_part.data_ptr<float>();
+  const auto output = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  const auto offsets = cu_q.data_ptr<int>();
   switch (nsplit) {
     case 2:
-      atrex_ppu_comb<2><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<2><<<grid, 256, 0, stream>>>(partial, output, nrow, 2, offsets, requests, heads);
       break;
     case 3:
-      atrex_ppu_comb<3><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<3><<<grid, 256, 0, stream>>>(partial, output, nrow, 3, offsets, requests, heads);
       break;
     case 4:
-      atrex_ppu_comb<4><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<4><<<grid, 256, 0, stream>>>(partial, output, nrow, 4, offsets, requests, heads);
       break;
     case 5:
-      atrex_ppu_comb<5><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<5><<<grid, 256, 0, stream>>>(partial, output, nrow, 5, offsets, requests, heads);
       break;
     case 6:
-      atrex_ppu_comb<6><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<6><<<grid, 256, 0, stream>>>(partial, output, nrow, 6, offsets, requests, heads);
       break;
     case 7:
-      atrex_ppu_comb<7><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<7><<<grid, 256, 0, stream>>>(partial, output, nrow, 7, offsets, requests, heads);
       break;
     case 8:
-      atrex_ppu_comb<8><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<8><<<grid, 256, 0, stream>>>(partial, output, nrow, 8, offsets, requests, heads);
       break;
     default:
-      atrex_ppu_comb<0><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(o_part.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nrow, (int)nsplit);
+      atrex_ppu_comb<0><<<grid, 256, 0, stream>>>(partial, output, nrow, (int)nsplit, offsets, requests, heads);
   }
 }
 
@@ -1476,5 +1472,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_air_direct_kv", &attn_air_direct_kv);
   m.def("attn", &attn);
   m.def("combine", &combine);
-  m.def("combine_active_queries", &combine_active_queries);
 }

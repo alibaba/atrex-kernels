@@ -289,13 +289,12 @@ def forward(
         and max_seqlen_k >= 16 * 1024 and key_view.data_ptr() % 128 == 0
         and softmax_scale in (None, 0.0625) and not scaled
     )
-    if direct_k:
-        if single_auto and heads == (8, 1):
-            # Fill at least 78 CTA slots instead of launching only 8 or 32 CTAs.
+    if direct_k and heads == (8, 1):
+        if single_auto:
+            # Fill the device with shards for these eight-head cases.
             num_splits = 10 if direct_q128 else 3
-        elif (direct_q128 and automatic_splits and heads == (8, 1) and requests == 8
+        elif (direct_q128 and automatic_splits and requests == 8
               and q.shape[0] == 128 * requests and prefix >= 64 * 1024):
-            # Six shards nearly fill five two-CTA waves for this eight-head batch.
             num_splits = 6
 
     air_b16_split = (
@@ -323,15 +322,13 @@ def forward(
     if air_short_paged:
         descales = torch.empty(descale_shape, dtype=torch.float32, device=q.device)
         _fill_descales(descales, scales)
-        out.zero_()
+        if num_splits == 1:
+            out.zero_()
         extension.attn_air_direct_kv(q, k, v, page_table, cu_seqlens_q, seqused_k, out,
                                      partial, num_splits, descales, softmax_scale, compact_air,
                                      requests == 72)
-        if air_b16_split:
-            # Replay can leave padding rows without any partial writes.
-            extension.combine_active_queries(partial, out, cu_seqlens_q)
-        elif num_splits > 1:
-            extension.combine(partial, out, num_splits)
+        if num_splits > 1:
+            extension.combine(partial, out, num_splits, cu_seqlens_q)
         return out, None
     packed_pages = requests * kv_heads * max_pages
     packed_bytes = packed_pages * 16384
@@ -370,7 +367,7 @@ def forward(
     )
     if workspace is None and full_q_tiles:
         query_blocks = q.shape[0] // 32
-    else:
+    if num_splits == 1:
         out.zero_()
 
     group_cu, group_lengths, group_scales = cu_seqlens_q, seqused_k, descales
@@ -411,5 +408,5 @@ def forward(
                 kv_heads, group_scales, softmax_scale,
             )
     if num_splits > 1:
-        extension.combine(partial, out, num_splits)
+        extension.combine(partial, out, num_splits, cu_seqlens_q)
     return out, None

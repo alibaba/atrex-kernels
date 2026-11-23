@@ -289,6 +289,41 @@ def test_prefill_bounded_workspace_groups(heads, scaled, splits, monkeypatch):
         assert any("atrex_ppu_prefill_group_metadata" in name for name in names)
 
 
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_prefill_direct_key_bounds_value_workspace(heads, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    batch, page, query = 8, 64, 128
+    hq, hkv = heads
+    case = build_case(page, [query] * batch, [257 + 9 * i for i in range(batch)], hq=hq, hkv=hkv)
+    case["max_seqlen_k"] = 64 * 1024 + query
+    pages = case["max_seqlen_k"] // page
+    table = case["block_table"]
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]), value=-1)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    expected = flash_attn_varlen_func(**case)
+
+    budget = runtime._group_layout(batch, 2, hkv, pages, False, direct_k=True)[1]
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", budget)
+    allocate = runtime._group_workspace
+    allocations = []
+
+    def checked_workspace(*args):
+        views, capacity, _, slots = result = allocate(*args)
+        assert capacity == 2 and slots > 1
+        assert views["k"].numel() == 0
+        allocations.append(views["v"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case)
+    assert allocations and max(allocations) <= budget
+    assert torch.equal(actual, expected)
+    _check(case, graph=True)
+
+
 def test_prefill_single_request_exceeds_workspace_target(monkeypatch):
     from atrex import flash_attn_varlen_func
     from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
@@ -1059,24 +1094,34 @@ def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
     monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
         attn=attn, attn_air_direct_kv=attn_air_direct_kv, prep_kv=extension.prep_kv,
         combine=extension.combine,
-        combine_active_queries=extension.combine_active_queries,
     ))
     _check(case, graph=True)
     assert dispatched and set(dispatched) == {splits}
 
 
-def test_air_b16_prefill_graph_leaves_query_padding_zero():
+@pytest.mark.parametrize("batch,query,heads,bounded", [
+    (16, 128, (6, 1), False),
+    (8, 128, (8, 1), True),
+    (8, 128, (32, 2), False),
+    (2, 512, (32, 2), False),
+])
+def test_prefill_graph_leaves_query_padding_zero(batch, query, heads, bounded, monkeypatch):
     from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
 
-    batch, query, page_size = 16, 128, 64
-    case = build_case(page_size, [query] * batch, [257 + r for r in range(batch)], hq=6, hkv=1)
-    case["max_seqlen_k"] = 16 * 1024 + query
+    page_size = 64
+    hq, hkv = heads
+    case = build_case(page_size, [query] * batch, [query + 129 + r for r in range(batch)],
+                      hq=hq, hkv=hkv)
+    case["max_seqlen_k"] = 64 * 1024 + query
+    pages = case["max_seqlen_k"] // page_size
     table = case["block_table"]
-    case["block_table"] = torch.nn.functional.pad(
-        table, (0, case["max_seqlen_k"] // page_size - table.shape[1]), value=-1,
-    )
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]), value=-1)
     for name in ("q_descale", "k_descale", "v_descale"):
-        case[name].fill_(1.)
+        case[name] = None
+    if bounded:
+        budget = prefill_runtime._group_layout(batch, 2, hkv, pages, False, direct_k=True)[1]
+        monkeypatch.setattr(prefill_runtime, "_PREP_WORKSPACE_BYTES", budget)
 
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
     flash_attn_varlen_func(**case, out=out)
