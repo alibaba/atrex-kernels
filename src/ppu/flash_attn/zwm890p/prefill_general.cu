@@ -6,18 +6,29 @@ __device__ __forceinline__ u32 scaled_query_bits(u32 bits, bool zero, u32 sign) 
   return (zero ? bits & nan_mask : bits) ^ sign;
 }
 
-template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4, int FIXED_HEADS = 0, bool SCALED = false>
+struct RawPrefillCache {
+  const int* table = nullptr;
+  int64_t page_stride = 0;
+  int table_stride = 0;
+  unsigned int page_count = 0;
+};
+
+template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4, int HEAD_GROUP = 4,
+          int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false>
 __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex_ppu_attn_general(
     const unsigned char* __restrict__ q, const unsigned char* __restrict__ k_fp8,
     const unsigned char* __restrict__ v_fp8, const float* __restrict__ kscale,
     const float* __restrict__ vamax, const int* __restrict__ cu_q,
     const int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ out,
     float* __restrict__ o_part, int n_req, int max_pages, int n_tok, int nsplit,
-    int query_heads, int kv_heads, const float* __restrict__ descales, float softmax_scale) {
+    int query_heads, int kv_heads, const float* __restrict__ descales, float softmax_scale,
+    RawPrefillCache raw) {
+  static_assert(!RAW_KV || (FIXED_HEADS == 6 && SCALED && !LINEAR_AIU));
   constexpr bool GENERAL = FIXED_HEADS == 0 || SCALED;
   constexpr bool PACKED = FIXED_HEADS != 0;
-  constexpr int buffers = NBUF;
-  extern __shared__ unsigned char sm[];
+  constexpr bool compact_raw = RAW_KV && HEAD_GROUP == 2;
+  constexpr int buffers = compact_raw ? 2 : NBUF;
+  extern __shared__ __align__(128) unsigned char sm[];
   unsigned char* Ks = sm;
   unsigned char* Vs = sm + buffers * KPAGE_BYTES;
 
@@ -60,6 +71,7 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   const int lp = lane >> 3, lb = (lane >> 2) & 1;
 
   const int warp_row = PACKED ? warp * MW : wq * MW;
+  const bool skip_warp = compact_raw && __shfl_sync(0xffffffffu, q0 + warp_row, 0) >= q_rows;
   const int bp_abs = PACKED ? (q0 + warp_row) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len : base_pos + wq * MW;
   const int hi_abs = min(PACKED ? (q0 + warp_row + MW - 1) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len : bp_abs + MW - 1, kv_len - 1);
 
@@ -90,15 +102,28 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   u32 qf[KSTEPS][4];
 #pragma unroll
   for (int ks = 0; ks < KSTEPS; ++ks) {
-    const int d0 = ks * 32 + la * 8;
-    const uint2 a = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowa * row_stride * HEAD_DIM + d0);
-    const uint2 b = *reinterpret_cast<const uint2*>(
-        qbase + (size_t)rowb * row_stride * HEAD_DIM + d0);
-    qf[ks][0] = scaled_query_bits(a.x, zero_query, query_sign);
-    qf[ks][1] = scaled_query_bits(b.x, zero_query, query_sign);
-    qf[ks][2] = scaled_query_bits(a.y, zero_query, query_sign);
-    qf[ks][3] = scaled_query_bits(b.y, zero_query, query_sign);
+    if constexpr (RAW_KV) {
+      // Native AIU K pairs with Q groups from the two 16-channel slabs.
+      const int channel = ks * 32 + 4 * la;
+      const auto* a = reinterpret_cast<const u32*>(
+          qbase + (size_t)rowa * row_stride * HEAD_DIM + channel);
+      const auto* b = reinterpret_cast<const u32*>(
+          qbase + (size_t)rowb * row_stride * HEAD_DIM + channel);
+      qf[ks][0] = scaled_query_bits(a[0], zero_query, query_sign);
+      qf[ks][1] = scaled_query_bits(b[0], zero_query, query_sign);
+      qf[ks][2] = scaled_query_bits(a[4], zero_query, query_sign);
+      qf[ks][3] = scaled_query_bits(b[4], zero_query, query_sign);
+    } else {
+      const int d0 = ks * 32 + la * 8;
+      const uint2 a = *reinterpret_cast<const uint2*>(
+          qbase + (size_t)rowa * row_stride * HEAD_DIM + d0);
+      const uint2 b = *reinterpret_cast<const uint2*>(
+          qbase + (size_t)rowb * row_stride * HEAD_DIM + d0);
+      qf[ks][0] = scaled_query_bits(a.x, zero_query, query_sign);
+      qf[ks][1] = scaled_query_bits(b.x, zero_query, query_sign);
+      qf[ks][2] = scaled_query_bits(a.y, zero_query, query_sign);
+      qf[ks][3] = scaled_query_bits(b.y, zero_query, query_sign);
+    }
   }
 
   float acc[NDT][8];
@@ -113,22 +138,49 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
   u32 Aprev[4] = {0u, 0u, 0u, 0u};
 #endif
 
-  const unsigned char* kg = k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
-  const unsigned char* vg = v_fp8 + ((size_t)packed_request * max_pages + p_lo) * VPAGE_BYTES;
-#define STAGE_NC(buf, page)                                                            \
-  do {                                                                                 \
-    const unsigned char* _ks = kg + (size_t)(npg - (page))*KPAGE_BYTES;                 \
-    const unsigned char* _vs = vg + (size_t)(npg - (page))*VPAGE_BYTES;                 \
-    unsigned char* _kd = Ks + (buf)*KPAGE_BYTES;                                       \
-    unsigned char* _vd = Vs + (buf)*VPAGE_BYTES;                                       \
-    _Pragma("unroll") for (int c = 0; c < (KPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
-      const int _o = (c * threads + tid) * 16;                                         \
-      if (_o < KPAGE_BYTES) cp_async16(_kd + _o, _ks + _o);                             \
-    }                                                                                  \
-    _Pragma("unroll") for (int c = 0; c < (VPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) { \
-      const int _o = (c * threads + tid) * 16;                                         \
-      if (_o < VPAGE_BYTES) cp_async16(_vd + _o, _vs + _o);                             \
-    }                                                                                  \
+  const unsigned char* kg = RAW_KV ? k_fp8 : k_fp8 + ((size_t)packed_request * max_pages + p_lo) * KPAGE_BYTES;
+  const unsigned char* vg = RAW_KV ? v_fp8 : v_fp8 + ((size_t)packed_request * max_pages + p_lo) * VPAGE_BYTES;
+  const int* pages = RAW_KV ? raw.table + (size_t)req * raw.table_stride : nullptr;
+  const int copy_warp = (LINEAR_AIU || RAW_KV) ? __shfl_sync(0xffffffffu, warp, 0) : -1;
+#define STAGE_NC(buf, page)                                                                            \
+  do {                                                                                                 \
+    const int _page = npg - (page);                                                                    \
+    unsigned char* _kd = Ks + (buf) * KPAGE_BYTES;                                                     \
+    unsigned char* _vd = Vs + (buf) * VPAGE_BYTES;                                                     \
+    if constexpr (RAW_KV) {                                                                            \
+      if (copy_warp == 0) {                                                                            \
+        const int _logical = p_lo + _page;                                                             \
+        const int _pid = __ldg(pages + _logical);                                                      \
+        if (static_cast<unsigned int>(_pid) < raw.page_count) {                                        \
+          const size_t _offset = (size_t)_pid * raw.page_stride;                                       \
+          const int _valid = min(PAGE, kv_len - _logical * PAGE);                                      \
+          direct_stage_key<1>(_kd, kg + _offset, _valid);                                              \
+          direct_stage_key<1>(_vd, vg + _offset, _valid);                                              \
+        } else {                                                                                       \
+          _Pragma("unroll") for (int c = 0; c < KPAGE_BYTES / (32 * 16); ++c) {                        \
+            const int _offset = (32 * c + lane) * 16;                                                  \
+            *reinterpret_cast<uint4*>(_kd + _offset) = make_uint4(0, 0, 0, 0);                         \
+            *reinterpret_cast<uint4*>(_vd + _offset) = make_uint4(0, 0, 0, 0);                         \
+          }                                                                                            \
+        }                                                                                              \
+      }                                                                                                \
+    } else if constexpr (LINEAR_AIU) {                                                                 \
+      if (copy_warp == 0) {                                                                            \
+        aiu_stage_packed_page(_kd, kg + (size_t)_page * KPAGE_BYTES);                                  \
+        aiu_stage_packed_page(_vd, vg + (size_t)_page * VPAGE_BYTES);                                  \
+      }                                                                                                \
+    } else {                                                                                           \
+      const unsigned char* _ks = kg + (size_t)_page * KPAGE_BYTES;                                     \
+      const unsigned char* _vs = vg + (size_t)_page * VPAGE_BYTES;                                     \
+      _Pragma("unroll") for (int c = 0; c < (KPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) {  \
+        const int _o = (c * threads + tid) * 16;                                                       \
+        if (_o < KPAGE_BYTES) cp_async16(_kd + _o, _ks + _o);                                          \
+      }                                                                                                \
+      _Pragma("unroll") for (int c = 0; c < (VPAGE_BYTES + threads * 16 - 1) / (threads * 16); ++c) {  \
+        const int _o = (c * threads + tid) * 16;                                                       \
+        if (_o < VPAGE_BYTES) cp_async16(_vd + _o, _vs + _o);                                          \
+      }                                                                                                \
+    }                                                                                                  \
   } while (0)
 
 #define STAGE(buf, page)                                                               \
@@ -149,6 +201,9 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     ll[1] *= (f1);                                                                      \
   } while (0)
 
+  if constexpr (compact_raw) {
+    if (npg >= 0) STAGE(0, 0);
+  } else {
 #if SP2E
 
   if (npg >= 0) {
@@ -170,9 +225,15 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 #else
   if (npg >= 0) STAGE(0, 0);
 #endif
-  constexpr int page_step = PGSTEP2 ? 2 : 1;
-  constexpr int split_step = PGU2 ? 2 : 1;
+  }
+  constexpr int page_step = PGSTEP2 && !compact_raw ? 2 : 1;
+  constexpr int split_step = PGU2 && !compact_raw ? 2 : 1;
   for (int pp = 0; pp <= npg; pp += page_step) {
+    if constexpr (compact_raw) {
+      cp_wait<0>();
+      __syncthreads();
+      if (pp < npg) STAGE((pp + 1) & 1, pp + 1);
+    } else {
 #if SP2E
     if ((pp & 1) == 0) {
       cp_wait<0>();
@@ -217,14 +278,16 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     }
     __syncthreads();
 #endif
+    }
 
 #pragma unroll
     for (int _sp = 0; _sp < split_step; ++_sp) {
       const int pg = pp + _sp;
-      if (pg > npg) continue;
+      if (pg > npg || skip_warp) continue;
     const unsigned char* Kb = Ks + (pg & (buffers - 1)) * KPAGE_BYTES;
     const unsigned char* Vb = Vs + (pg & (buffers - 1)) * VPAGE_BYTES;
-    const u32 key_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
+    const u32 key_block = RAW_KV ? static_cast<u32>(__cvta_generic_to_shared(Kb) >> 4) :
+        static_cast<u32>(reinterpret_cast<uintptr_t>(Kb) / 16);
     const u32 value_block = static_cast<u32>(reinterpret_cast<uintptr_t>(Vb) / 16);
 #if !SPG4
     const float aa = PACKED && SCALED ? (zero_query ? 1.f : fabsf(logit_scale)) :
@@ -238,11 +301,10 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     }
 #pragma unroll
     for (int step = 0; step < KSTEPS; ++step) {
-      const int base_offset = 8192 + 4096 * (step >> 2) + 32 * (step & 3);
       u32 first_key[4];
       u32 second_key[4];
-      load_k_ldmatrix(first_key, key_block + base_offset / 16);
-      load_k_ldmatrix(second_key, key_block + base_offset / 16 + 128);
+      load_prefill_key<RAW_KV>(first_key, key_block, step, 2);
+      load_prefill_key<RAW_KV>(second_key, key_block, step, 3);
       MMA_E4M3(page_scores[2], qf[step], first_key);
       MMA_E4M3(page_scores[3], qf[step], second_key);
     }
@@ -260,20 +322,23 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
       for (int tile = 2; tile < 4; ++tile) {
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
-        for (int element = 0; element < 8; ++element)
+        for (int element = 0; element < 8; ++element) {
+          const int logical = 4 * la + 2 * (element >> 2) + (element & 1);
+          const int key = RAW_KV ? direct_key_token(logical) : logical;
           if ((PACKED ?
-                physical_page * PAGE + tile * 16 + 4 * la + 2 * (element >> 2) + (element & 1) >
+                physical_page * PAGE + tile * 16 + key >
                     (q0 + warp_row + 2 * lq + ((element >> 1) & 1)) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len - kv_lo :
                 2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit) ||
-              4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
+              key >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
             page_scores[tile][element] = -INFINITY;
+        }
       }
     }
 
     u32 future_first_key[4];
     u32 future_second_key[4];
-    load_k_ldmatrix(future_first_key, key_block);
-    load_k_ldmatrix(future_second_key, key_block + 128);
+    load_prefill_key<RAW_KV>(future_first_key, key_block, 0, 0);
+    load_prefill_key<RAW_KV>(future_second_key, key_block, 0, 1);
     u32 first_probability[4];
     {
       constexpr int group = 1;
@@ -321,7 +386,6 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
 #pragma unroll
             for (int substep = 0; substep < 2; ++substep) {
               const int step = 2 * (2 * tile_half + row_half) + substep;
-              const int base_offset = 4096 * (step >> 2) + 32 * (step & 3);
               u32 first_key[4];
               u32 second_key[4];
               if (step == 0) {
@@ -331,8 +395,8 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
                   second_key[word] = future_second_key[word];
                 }
               } else {
-                load_k_ldmatrix(first_key, key_block + base_offset / 16);
-                load_k_ldmatrix(second_key, key_block + base_offset / 16 + 128);
+                load_prefill_key<RAW_KV>(first_key, key_block, step, 0);
+                load_prefill_key<RAW_KV>(second_key, key_block, step, 1);
               }
               MMA_E4M3(page_scores[0], qf[step], first_key);
               MMA_E4M3(page_scores[1], qf[step], second_key);
@@ -354,13 +418,16 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
       for (int tile = 0; tile < 2; ++tile) {
         const int mask_limit = page_mask_limit - tile * 16;
 #pragma unroll
-        for (int element = 0; element < 8; ++element)
+        for (int element = 0; element < 8; ++element) {
+          const int logical = 4 * la + 2 * (element >> 2) + (element & 1);
+          const int key = RAW_KV ? direct_key_token(logical) : logical;
           if ((PACKED ?
-                physical_page * PAGE + tile * 16 + 4 * la + 2 * (element >> 2) + (element & 1) >
+                physical_page * PAGE + tile * 16 + key >
                     (q0 + warp_row + 2 * lq + ((element >> 1) & 1)) / (PACKED ? FIXED_HEADS : 1) + kv_len - q_len - kv_lo :
                 2 * (element >> 2) + (element & 1) - ((element >> 1) & 1) > mask_limit) ||
-              4 * la + 2 * (element >> 2) + (element & 1) >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
+              key >= kv_len - kv_lo - physical_page * PAGE - tile * 16)
             page_scores[tile][element] = -INFINITY;
+        }
       }
     }
     float future_scale[2] = {1.f, 1.f};
@@ -396,9 +463,18 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     }
 #pragma unroll
       for (int dimension_tile = 0; dimension_tile < NDT; ++dimension_tile) {
-        u32 value_fragment[4];
-        load_v_ldmatrix(value_fragment, value_block + 128 * (dimension_tile >> 1) + 32 * (dimension_tile & 1) + 2);
-        MMA_PV(acc[dimension_tile], first_probability, value_fragment);
+        if constexpr (RAW_KV) {
+          if ((dimension_tile & 1) == 0) {
+            u32 first[4], second[4];
+            load_raw_prefill_value_pair<1>(first, second, Vb, dimension_tile >> 1);
+            MMA_PV(acc[dimension_tile], first_probability, first);
+            MMA_PV(acc[dimension_tile + 1], first_probability, second);
+          }
+        } else {
+          u32 value_fragment[4];
+          load_v_ldmatrix(value_fragment, value_block + 128 * (dimension_tile >> 1) + 32 * (dimension_tile & 1) + 2);
+          MMA_PV(acc[dimension_tile], first_probability, value_fragment);
+        }
         if ((dimension_tile & 3) == 3) {
           const int tile_half = dimension_tile >> 3;
           const int row_half = (dimension_tile >> 2) & 1;
@@ -430,13 +506,22 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     }
 #pragma unroll
     for (int dimension_tile = 0; dimension_tile < NDT; ++dimension_tile) {
-      u32 value_fragment[4];
-      load_v_ldmatrix(value_fragment, value_block + 128 * (dimension_tile >> 1) + 32 * (dimension_tile & 1));
-      MMA_PV(acc[dimension_tile], second_probability, value_fragment);
+      if constexpr (RAW_KV) {
+        if ((dimension_tile & 1) == 0) {
+          u32 first[4], second[4];
+          load_raw_prefill_value_pair<0>(first, second, Vb, dimension_tile >> 1);
+          MMA_PV(acc[dimension_tile], second_probability, first);
+          MMA_PV(acc[dimension_tile + 1], second_probability, second);
+        }
+      } else {
+        u32 value_fragment[4];
+        load_v_ldmatrix(value_fragment, value_block + 128 * (dimension_tile >> 1) + 32 * (dimension_tile & 1));
+        MMA_PV(acc[dimension_tile], second_probability, value_fragment);
+      }
     }
     }
 #if !ONEB
-    __syncthreads();
+    if constexpr (!compact_raw) __syncthreads();
 #endif
   }
 #undef STAGE
@@ -450,6 +535,19 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
     s += __shfl_xor_sync(0xFFFFFFFFu, s, 1);
     s += __shfl_xor_sync(0xFFFFFFFFu, s, 2);
     ls[pr] = s;
+  }
+  if constexpr (RAW_KV) {
+    // Direct V fragments interleave adjacent output channel pairs. Restore the
+    // prepared layout used by the output and split-KV partial epilogues.
+#pragma unroll
+    for (int dt = 0; dt < NDT; ++dt) {
+      const float first = acc[dt][1];
+      const float second = acc[dt][3];
+      acc[dt][1] = acc[dt][4];
+      acc[dt][3] = acc[dt][6];
+      acc[dt][4] = first;
+      acc[dt][6] = second;
+    }
   }
   const float output_scale = PACKED && SCALED && descales ? descales[2 * scale_count + packed_request] : value_scale;
   if (SPLIT) {
@@ -516,25 +614,31 @@ __global__ __launch_bounds__(HEAD_GROUP * 64, HEAD_GROUP > 4 ? 1 : 2) void atrex
       if (q0 + rr >= q_rows) continue;
       __nv_bfloat16* row = obase + (size_t)(q0 + rr) * row_stride * HEAD_DIM;
       const float sc = inv[pr];
+      const bool vector_output = FIXED_HEADS == 6 && !RAW_KV
+          && (reinterpret_cast<uintptr_t>(row) & 7) == 0;
 #pragma unroll
       for (int dt = 0; dt < NDT; ++dt) {
         const int dbase = dt * 16 + 4 * la;
-        *reinterpret_cast<u32*>(row + dbase) =
-            cvt_bf16x2(ACCF(acc[dt][2 * pr + 1]) * sc,
-                       ACCF(acc[dt][2 * pr]) * sc);
-        *reinterpret_cast<u32*>(row + dbase + 2) =
-            cvt_bf16x2(ACCF(acc[dt][5 + 2 * pr]) * sc,
-                       ACCF(acc[dt][4 + 2 * pr]) * sc);
+        const u32 low = cvt_bf16x2(ACCF(acc[dt][2 * pr + 1]) * sc,
+                                   ACCF(acc[dt][2 * pr]) * sc);
+        const u32 high = cvt_bf16x2(ACCF(acc[dt][5 + 2 * pr]) * sc,
+                                    ACCF(acc[dt][4 + 2 * pr]) * sc);
+        if (vector_output) {
+          *reinterpret_cast<uint2*>(row + dbase) = make_uint2(low, high);
+        } else {
+          *reinterpret_cast<u32*>(row + dbase) = low;
+          *reinterpret_cast<u32*>(row + dbase + 2) = high;
+        }
       }
     }
   }
 }
 
-template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false>
+template <int HEAD_GROUP, int FIXED_HEADS = 0, bool SCALED = false, bool LINEAR_AIU = false, bool RAW_KV = false>
 void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_fp8, torch::Tensor kscale,
           torch::Tensor vamax, torch::Tensor cu_q, torch::Tensor seq_lens, torch::Tensor out,
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
-          int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
+          int64_t kv_heads, torch::Tensor descales, double softmax_scale, RawPrefillCache raw = {}) {
   constexpr bool GROUPED = true;
   constexpr int threads = HEAD_GROUP * 64;
   const int n_req = (int)cu_q.size(0) - 1;
@@ -544,12 +648,13 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   const int launch_nblk = FIXED_HEADS ? (n_tok * FIXED_HEADS + MQ * HEAD_GROUP - 1) / (MQ * HEAD_GROUP) + (n_req > 1 ? n_req : 0) :
       (n_req == 1 ? (n_tok + MQ - 1) / MQ : (int)nblk);
   const int head_groups = FIXED_HEADS ? 1 : query_heads / HEAD_GROUP;
-  constexpr int smem = NBUF * (KPAGE_BYTES + VPAGE_BYTES);
+  constexpr int buffers = RAW_KV && HEAD_GROUP == 2 ? 2 : NBUF;
+  constexpr int smem = buffers * (KPAGE_BYTES + VPAGE_BYTES);
   static bool once = false;
   if (!once) {
-    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if constexpr (!RAW_KV) cudaFuncSetAttribute(atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     once = true;
   }
   const auto qp = reinterpret_cast<const unsigned char*>(q.data_ptr());
@@ -559,22 +664,22 @@ void launch_attn_head_group(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor 
   auto stream = at::cuda::getCurrentCUDAStream();
   if (nsplit <= 1) {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups) : dim3((unsigned)launch_nblk, head_groups);
-    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+    atrex_ppu_attn_general<0, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
         qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), op, nullptr, n_req, (int)max_pages, n_tok, 1,
-        query_heads, (int)kv_heads, scales, (float)softmax_scale);
+        query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
   } else {
     dim3 grid = GROUPED ? dim3((unsigned)launch_nblk * head_groups, 1, (unsigned)nsplit) : dim3((unsigned)launch_nblk, head_groups, (unsigned)nsplit);
-    if (nsplit == 2)
-      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+    if (!RAW_KV && nsplit == 2)
+      atrex_ppu_attn_general<1, GROUPED, 2, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
-          (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
+          (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
     else
-      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED><<<grid, threads, smem, stream>>>(
+      atrex_ppu_attn_general<1, GROUPED, 4, HEAD_GROUP, FIXED_HEADS, SCALED, LINEAR_AIU, RAW_KV><<<grid, threads, smem, stream>>>(
           qp, kp, vp, kscale.data_ptr<float>(), vamax.data_ptr<float>(), cu_q.data_ptr<int>(),
           seq_lens.data_ptr<int>(), op, o_part.data_ptr<float>(), n_req, (int)max_pages, n_tok,
-          (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale);
+          (int)nsplit, query_heads, (int)kv_heads, scales, (float)softmax_scale, raw);
   }
 }
 
@@ -583,6 +688,15 @@ void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_f
           torch::Tensor o_part, int64_t max_pages, int64_t nblk, int64_t nsplit,
           int64_t kv_heads, torch::Tensor descales, double softmax_scale) {
   const int group = q.size(1) / kv_heads;
+  // A complete packed page can be staged by one warp without changing its MMA layout.
+  const bool use_linear_aiu = q.size(1) == 32 && kv_heads == 2 &&
+      ((reinterpret_cast<uintptr_t>(k_fp8.data_ptr()) |
+        reinterpret_cast<uintptr_t>(v_fp8.data_ptr())) & 127) == 0;
+  if (use_linear_aiu) {
+    launch_attn_head_group<4, 0, false, true>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens,
+        out, o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+    return;
+  }
   if (q.size(1) == 6 && kv_heads == 1 && descales.numel() == 0 && softmax_scale == 0.0625)
     launch_attn_head_group<4, 6>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
         o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
@@ -598,4 +712,16 @@ void launch_attn_general(torch::Tensor q, torch::Tensor k_fp8, torch::Tensor v_f
   else
     launch_attn_head_group<2>(q, k_fp8, v_fp8, kscale, vamax, cu_q, seq_lens, out,
         o_part, max_pages, nblk, nsplit, kv_heads, descales, softmax_scale);
+}
+
+void attn_air_direct_kv(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                        torch::Tensor block_table, torch::Tensor cu_q, torch::Tensor seq_lens,
+                        torch::Tensor out, torch::Tensor partial, int64_t nsplit,
+                        torch::Tensor descales, double softmax_scale, bool compact) {
+  const RawPrefillCache raw{block_table.data_ptr<int>(), k.stride(0),
+      static_cast<int>(block_table.stride(0)), static_cast<unsigned int>(k.size(0))};
+  const auto launch = compact ? launch_attn_head_group<2, 6, true, false, true> :
+                                launch_attn_head_group<4, 6, true, false, true>;
+  launch(q, k, v, descales, descales, cu_q, seq_lens, out, partial,
+         0, 0, nsplit, 1, descales, softmax_scale, raw);
 }

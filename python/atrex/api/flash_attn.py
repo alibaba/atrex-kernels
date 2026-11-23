@@ -1,5 +1,7 @@
 """vLLM-compatible paged/varlen attention with hardware dispatch."""
 
+from functools import lru_cache
+
 from atrex.utils.device_target import detect_device_target
 
 
@@ -7,7 +9,20 @@ _TARGET_FA_VERSIONS = {
     ("nvidia", "sm103"): frozenset({4}),
     ("nvidia", "sm120"): frozenset({3}),
     ("alibaba_ppu", "zwm890p"): frozenset({2, 3}),
+    ("alibaba_ppu", "zwm890l"): frozenset({2, 3}),
 }
+
+
+@lru_cache(maxsize=None)
+def _attention_target(device, detector):
+    return detector(device)
+
+
+@lru_cache(maxsize=1)
+def _ppu_launch():
+    from atrex.src.ppu.flash_attn.zwm890p import launch
+
+    return launch
 
 
 def _validate_out(call, torch, *, require_contiguous=False):
@@ -89,17 +104,19 @@ def _validate_nvidia_call(call, torch, target_key, batch_size, window):
 
 
 def _validate_ppu_call(call, torch, window, softcap):
-    from atrex.src.ppu.flash_attn.zwm890p.launch import validate
-
-    validate(dict(call, window_size=window, softcap=softcap))
+    # Native PPU validation also accepts the default None window.
+    if (call["window_size"] is not None and window is not call["window_size"]) or softcap != call["softcap"]:
+        call = dict(call, window_size=window, softcap=softcap)
+    selection = _ppu_launch()._select(call, common_validated=True)
     _validate_out(call, torch, require_contiguous=True)
+    return selection
 
 
 def _validate_flash_attn_call(call):
     """Validate the public contract without compiling or allocating buffers."""
     import torch
 
-    q, k, v = (call[name] for name in ("q", "k", "v"))
+    q, k, v = call["q"], call["k"], call["v"]
     cu_seqlens_q = call["cu_seqlens_q"]
     cu_seqlens_k = call["cu_seqlens_k"]
     seqused_k = call["seqused_k"]
@@ -157,57 +174,57 @@ def _validate_flash_attn_call(call):
         raise ValueError("Expected packed Q and packed or paged K/V")
     if v.ndim != k.ndim:
         raise ValueError("K/V must have the same rank")
-    if q.device != k.device or q.device != v.device:
+    device, dtype = q.device, q.dtype
+    q_shape, k_shape, v_shape = q.shape, k.shape, v.shape
+    if device != k.device or device != v.device:
         raise ValueError("Q/K/V must share one device")
-    if q.dtype != k.dtype or k.dtype != v.dtype:
+    if dtype != k.dtype or dtype != v.dtype:
         raise NotImplementedError("Atrex attention requires matching Q/K/V dtypes")
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
-        raise NotImplementedError(f"Unsupported attention dtype {q.dtype}")
-    target = detect_device_target(q.device)
-    head_dim = q.shape[-1]
+    fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if dtype != torch.bfloat16 and not fp8:
+        raise NotImplementedError(f"Unsupported attention dtype {dtype}")
+    target = _attention_target(device, detect_device_target)
+    target_key = (target.family, target.arch)
+    head_dim = q_shape[-1]
     supported_head_dims = (
         (128, 256)
-        if (target.family, target.arch) == ("nvidia", "sm120")
-        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        if target_key == ("nvidia", "sm120")
+        and dtype in (torch.bfloat16, torch.float8_e4m3fn)
         else (256,)
     )
     if (
         head_dim not in supported_head_dims
-        or k.shape[-1] != head_dim
-        or v.shape[-1] != head_dim
+        or k_shape[-1] != head_dim
+        or v_shape[-1] != head_dim
     ):
         raise NotImplementedError(
             f"Atrex {target.family}/{target.arch} attention requires matching "
             f"head dimensions in {supported_head_dims}"
         )
-    if k.shape[:-1] != v.shape[:-1]:
+    if k_shape[:-1] != v_shape[:-1]:
         raise ValueError("Incompatible K/V dimensions")
-    if k.shape[-2] <= 0 or q.shape[-2] % k.shape[-2]:
+    if k_shape[-2] <= 0 or q_shape[-2] % k_shape[-2]:
         raise ValueError("Q heads must be divisible by KV heads")
-    if q.shape[-2] <= 0:
+    if q_shape[-2] <= 0:
         raise ValueError("Q must contain at least one attention head")
-    if any(tensor.stride(-1) != 1 for tensor in (q, k, v)):
-        raise ValueError("Q/K/V head dimensions must be contiguous")
-    if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and any(
-        tensor.requires_grad for tensor in (q, k, v)
-    ):
+    if fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("Atrex FP8 attention is forward-only")
     if call["num_splits"] < 0:
         raise ValueError("num_splits must be nonnegative")
     if cu_seqlens_q is None:
         raise ValueError("Atrex varlen attention requires cu_seqlens_q")
 
-    for tensor, name in (
-        (cu_seqlens_q, "cu_seqlens_q"),
-        (cu_seqlens_k, "cu_seqlens_k"),
-        (seqused_k, "seqused_k"),
-        (block_table, "block_table"),
+    for tensor, name, rank in (
+        (cu_seqlens_q, "cu_seqlens_q", 1),
+        (cu_seqlens_k, "cu_seqlens_k", 1),
+        (seqused_k, "seqused_k", 1),
+        (block_table, "block_table", 2),
     ):
         if tensor is None:
             continue
-        if tensor.device != q.device or tensor.dtype != torch.int32:
+        if tensor.device != device or tensor.dtype != torch.int32:
             raise ValueError(f"{name} must be int32 on the Q device")
-        if tensor.ndim not in (1, 2) or tensor.stride(-1) != 1:
+        if tensor.ndim != rank or tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have contiguous rows")
 
     window = (-1, -1) if call["window_size"] is None else tuple(call["window_size"])
@@ -219,16 +236,15 @@ def _validate_flash_attn_call(call):
         if softcap not in (0, 0.0, logits_soft_cap):
             raise ValueError("softcap and logits_soft_cap disagree")
         softcap = logits_soft_cap
-    target_key = (target.family, target.arch)
     if (
         target_key == ("nvidia", "sm120")
         and head_dim == 128
-        and q.dtype == torch.float8_e4m3fn
+        and dtype == torch.float8_e4m3fn
         and (
             call["causal"] or block_table is None
             or not isinstance(call["max_seqlen_q"], int)
             or call["max_seqlen_q"] <= 0
-            or k.shape[1] not in (64, 128, 1664, 3328)
+            or k_shape[1] not in (64, 128, 1664, 3328)
             or softcap or call["s_aux"] is not None
         )
     ):
@@ -240,7 +256,8 @@ def _validate_flash_attn_call(call):
     if supported_versions is None:
         raise NotImplementedError(
             "Atrex attention supports only nvidia/sm103, nvidia/sm120, and "
-            f"alibaba_ppu/zwm890p; detected {target.family}/{target.arch}"
+            f"alibaba_ppu/zwm890p, alibaba_ppu/zwm890l; "
+            f"detected {target.family}/{target.arch}"
         )
     if fa_version is not None and fa_version not in supported_versions:
         versions = ", ".join(str(version) for version in sorted(supported_versions))
@@ -249,32 +266,33 @@ def _validate_flash_attn_call(call):
             f"received {fa_version}"
         )
 
-    if cu_seqlens_q.ndim != 1:
-        raise ValueError("cu_seqlens_q must be one-dimensional")
     batch_size = cu_seqlens_q.shape[0] - 1
     if batch_size < 0:
         raise ValueError("Invalid cu_seqlens_q")
-    if q.shape[0] and batch_size == 0:
+    if q_shape[0] and batch_size == 0:
         raise ValueError("Nonempty Q requires sequence metadata")
     if cu_seqlens_k is not None and cu_seqlens_k.shape != (batch_size + 1,):
         raise ValueError("cu_seqlens_k must have shape [batch+1]")
     if seqused_k is not None and seqused_k.shape != (batch_size,):
         raise ValueError("seqused_k must have shape [batch]")
-    if block_table is not None and (
-        block_table.ndim != 2 or block_table.shape[0] != batch_size
-    ):
+    if block_table is not None and block_table.shape[0] != batch_size:
         raise ValueError("block_table must have shape [batch,max_pages]")
-    if block_table is not None and k.shape[1] <= 0:
+    if block_table is not None and k_shape[1] <= 0:
         raise ValueError("Paged K/V requires a positive page size")
     if call["max_seqlen_q"] < 0 or call["max_seqlen_k"] < 0:
         raise ValueError("maximum sequence lengths must be nonnegative")
 
+    ppu_selection = None
     if target_key in (("nvidia", "sm103"), ("nvidia", "sm120")):
+        if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+            raise ValueError("Q/K/V head dimensions must be contiguous")
         _validate_nvidia_call(call, torch, target_key, batch_size, window)
     else:
-        _validate_ppu_call(call, torch, window, softcap)
+        ppu_selection = _validate_ppu_call(call, torch, window, softcap)
+        if ppu_selection != "decode" and (q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1):
+            raise ValueError("Q/K/V head dimensions must be contiguous")
 
-    return target, window, softcap
+    return target, window, softcap, ppu_selection
 
 
 def can_use_flash_attn_varlen_func(
@@ -379,12 +397,25 @@ def flash_attn_varlen_func(
     """Run attention and return ``out`` or ``(out, lse)`` when requested."""
     import torch
 
-    target, window, softcap = _validate_flash_attn_call(locals())
+    target, window, softcap, ppu_selection = _validate_flash_attn_call(locals())
+    if ppu_selection == "decode":
+        runtime = _ppu_launch()._decode_runtime()
+        args = (
+            q, k, v, cu_seqlens_q, seqused_k, max_seqlen_q, max_seqlen_k,
+            block_table, q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale,
+            out, q_descale, k_descale, v_descale, num_splits,
+        )
+        if torch.cuda.current_device() == target.device_index:
+            return runtime._forward_validated(*args)
+        with torch.cuda.device(target.device_index):
+            return runtime._forward_validated(*args)
+
     if target.family == "nvidia" and target.arch == "sm103":
         from atrex.src.nvidia.flash_attn.sm103.launch import forward
     elif target.family == "nvidia" and target.arch == "sm120":
         from atrex.src.nvidia.flash_attn.sm120.launch import forward
-    elif target.family == "alibaba_ppu" and target.arch == "zwm890p":
+    elif target.family == "alibaba_ppu" and target.arch in ("zwm890p", "zwm890l"):
+        # Reuse the PPU implementation without changing its workspace policy.
         from functools import partial
         from atrex.src.ppu.flash_attn.zwm890p.launch import forward as ppu_forward
 

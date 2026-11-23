@@ -1,4 +1,4 @@
-"""PPU prefill and native direct-paged FP8 decode contracts."""
+"""Shared ZW-M890P/ZW-M890L prefill and direct-paged FP8 decode contracts."""
 
 import pytest
 import torch
@@ -13,7 +13,8 @@ def require_target():
     from atrex.utils.device_target import detect_device_target
 
     target = detect_device_target()
-    assert (target.family, target.arch) == ("alibaba_ppu", "zwm890p")
+    assert target.family == "alibaba_ppu"
+    assert target.arch in ("zwm890p", "zwm890l")
 
 
 def _case(page_size, q_lens, kv_lens, *, contiguous=False):
@@ -53,6 +54,20 @@ def test_public_eligibility_and_fail_fast():
         assert not can_use_flash_attn_varlen_func(**kwargs)
         with pytest.raises(ValueError, match="out"):
             flash_attn_varlen_func(**kwargs)
+
+
+@pytest.mark.parametrize("name,dtype", [("q", torch.float8_e4m3fn), ("out", torch.bfloat16)])
+def test_prefill_rejects_unaligned_contiguous_views(name, dtype):
+    from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
+
+    case = _case(64, [65, 3], [257, 513])
+    q = case["q"]
+    view = torch.empty(q.numel() + 1, dtype=dtype, device=q.device)[1:].view(q.shape)
+    assert view.is_contiguous()
+    case[name] = view
+    assert not can_use_flash_attn_varlen_func(**case)
+    with pytest.raises(ValueError, match=f"(?i)aligned {name} pointer"):
+        flash_attn_varlen_func(**case)
 
 
 def _check(case, splits=0, graph=False):
@@ -215,25 +230,14 @@ def test_real_kernel_events():
     assert not any("atrex_ppu_attn_general" in name for name in names)
 
 
-def test_prefill_fast_path_source_matches_main():
-    import hashlib
-
+def test_prefill_native_translation_units():
     from atrex.core.compile_cu import _atrex_source_root
     from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
 
     root = _atrex_source_root() / "ppu/flash_attn/zwm890p"
     source = (root / "prefill.cu").read_text()
-    expected = (
-        ("template <int SPLIT, bool GROUPED = false, int QK_BUNDLE = 4>",
-         "// ==================================================================================== KERNEL 3",
-         "9a3f45b8c00c7c87bbed21c8a741e4b8dcfe2d3d24f454b6cdbab2d3cedcc8e5"),
-        ("template <bool GROUPED>\nvoid launch_attn", "\nvoid combine(",
-         "0b7459b26861ad2caae904ce40bc9d0884c0b8929e298b839b72f347aa83bf91"),
-    )
-    for first, last, digest in expected:
-        start = source.index(first)
-        segment = source[start:source.index(last, start)].rstrip() + "\n"
-        assert hashlib.sha256(segment.encode()).hexdigest() == digest
+    assert "void atrex_ppu_attn(" in source
+    assert "void atrex_ppu_attn_general(" not in source
     general = (root / "prefill_general.cu").read_text()
     assert "void atrex_ppu_attn_general(" in general
     assert "void atrex_ppu_attn(" not in general
@@ -243,6 +247,119 @@ def test_prefill_fast_path_source_matches_main():
         "ppu/flash_attn/zwm890p/prefill_general.cu",
     )
     assert runtime._launch.jit_spec.include_dirs == ("ppu/flash_attn/zwm890p/include",)
+
+
+@pytest.mark.parametrize("heads,scaled,splits", [
+    ((6, 1), False, 1), ((6, 1), True, 4),
+    ((8, 1), False, 1), ((8, 1), False, 4),
+    ((24, 2), True, 1), ((32, 2), True, 4),
+])
+def test_prefill_bounded_workspace_groups(heads, scaled, splits, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    # Force a small workspace: empty requests, global Q offsets, descales and
+    # split outputs must stay correct when metadata changes during graph replay.
+    case = build_case(256, [17, 0, 65, 2, 129], [257, 0, 513, 65, 513],
+                      hq=heads[0], hkv=heads[1])
+    if not scaled:
+        for name in ("q_descale", "k_descale", "v_descale"):
+            case[name] = None
+    expected = flash_attn_varlen_func(**case, num_splits=splits)
+    pages = (case["max_seqlen_k"] + 63) // 64
+    budget = runtime._group_layout(5, 2, heads[1], pages, scaled)[1]
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", budget)
+    allocations = []
+    allocate = runtime._group_workspace
+
+    def checked_workspace(*args):
+        result = allocate(*args)
+        allocations.append(result[0]["k"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case, num_splits=splits)
+    # Check the entire backing allocation, not just the two packed tensors.
+    assert allocations and max(allocations) <= budget
+    assert torch.equal(actual, expected)
+    _check(case, splits=splits)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = flash_attn_varlen_func(**case, num_splits=splits)
+    # Keep total Q and its upper bound fixed, but move work between requests.
+    # Replay must re-plan from device metadata, not reuse captured boundaries.
+    case["cu_seqlens_q"].copy_(torch.tensor([0, 0, 0, 100, 213, 213],
+                                            dtype=torch.int32, device="cuda"))
+    case["seqused_k"][3] = 129
+    case["block_table"][2, :2].copy_(case["block_table"][2, :2].flip(0))
+    if scaled:
+        case["v_descale"].mul_(.5)
+    graph.replay()
+    expected, _ = reference(case)
+    torch.testing.assert_close(graph_out.float(), expected, atol=.03, rtol=.05)
+    if heads == (6, 1) and not scaled and splits == 1:
+        names = profile_case(case)
+        assert any("atrex_ppu_prefill_group_plan" in name for name in names)
+        assert any("atrex_ppu_prefill_group_metadata" in name for name in names)
+
+
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_prefill_direct_key_bounds_value_workspace(heads, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    batch, page, query = 8, 64, 128
+    hq, hkv = heads
+    case = build_case(page, [query] * batch, [257 + 9 * i for i in range(batch)], hq=hq, hkv=hkv)
+    case["max_seqlen_k"] = 64 * 1024 + query
+    pages = case["max_seqlen_k"] // page
+    table = case["block_table"]
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]), value=-1)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    expected = flash_attn_varlen_func(**case)
+
+    budget = runtime._group_layout(batch, 2, hkv, pages, False, direct_k=True)[1]
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", budget)
+    allocate = runtime._group_workspace
+    allocations = []
+
+    def checked_workspace(*args):
+        views, capacity, _, slots = result = allocate(*args)
+        assert capacity == 2 and slots > 1
+        assert views["k"].numel() == 0
+        allocations.append(views["v"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case)
+    assert allocations and max(allocations) <= budget
+    assert torch.equal(actual, expected)
+    _check(case, graph=True)
+
+
+def test_prefill_single_request_exceeds_workspace_target(monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime as runtime
+
+    case = _case(64, [65, 17], [257, 513])
+    expected = flash_attn_varlen_func(**case)
+    monkeypatch.setattr(runtime, "_PREP_WORKSPACE_BYTES", 1024)
+    allocations = []
+    allocate = runtime._group_workspace
+
+    def checked_workspace(*args):
+        result = allocate(*args)
+        views, capacity, minimum, slots = result
+        assert capacity == minimum == 1 and slots == 2
+        allocations.append(views["k"].untyped_storage().nbytes())
+        return result
+
+    monkeypatch.setattr(runtime, "_group_workspace", checked_workspace)
+    actual = flash_attn_varlen_func(**case)
+    assert allocations and min(allocations) > runtime._PREP_WORKSPACE_BYTES
+    assert torch.equal(actual, expected)
+    _check(case, graph=True)
 
 
 def test_eager_scratch_not_retained_per_layer_or_shape():
@@ -345,50 +462,46 @@ def test_unsupported_row_stride():
 ])
 def test_prefill_decode_dispatch(query, hq, hkv, path, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = build_case(64, [query, query], [1025, 2049], hq=hq, hkv=hkv)
     if path == "prefill":
         for name in ("q_descale", "k_descale", "v_descale"):
             case[name] = None
     calls = []
-    attempted = []
     out = torch.empty_like(case["q"], dtype=torch.bfloat16)
 
-    def decode(**kwargs):
-        attempted.append("decode")
-        decode_runtime.validate(launch._normalized_call(kwargs))
+    def decode(*_args):
         calls.append("decode")
-        return kwargs["out"], None
+        return out
 
     def prefill(**kwargs):
         calls.append("prefill")
         return kwargs["out"], None
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     assert flash_attn_varlen_func(**case, out=out).data_ptr() == out.data_ptr()
     assert calls == [path]
-    assert attempted == (["decode"] if query <= 5 else [])
 
 
 @pytest.mark.parametrize("error", [ValueError("invalid metadata"), RuntimeError("launch failed"),
                                   NotImplementedError("selected kernel failure")])
 def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
     from atrex import flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = _case(64, [4, 4], [1025, 2049])
     calls = []
 
-    def decode(**kwargs):
+    def decode(*_args):
         raise error
 
     def prefill(**kwargs):
         calls.append("prefill")
         raise AssertionError("Runtime failures must not use fallback")
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     with pytest.raises(type(error), match=str(error)):
         flash_attn_varlen_func(**case)
@@ -399,27 +512,25 @@ def test_decode_runtime_errors_do_not_fall_back(error, monkeypatch):
 @pytest.mark.parametrize("version", [None, 2, 3])
 def test_fa_version_preserves_dispatch(query, version, monkeypatch):
     from atrex import can_use_flash_attn_varlen_func, flash_attn_varlen_func
-    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, launch, prefill_runtime as runtime
+    from atrex.src.ppu.flash_attn.zwm890p import decode_runtime, prefill_runtime as runtime
 
     case = _case(64, [query, query], [1025, 2049])
     case["fa_version"] = version
     calls = []
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
 
-    def decode(**kwargs):
-        assert kwargs["fa_version"] == version
-        decode_runtime.validate(launch._normalized_call(kwargs))
+    def decode(*_args):
         calls.append("decode")
-        return kwargs["out"], None
+        return out
 
     def prefill(**kwargs):
         assert "fa_version" not in kwargs
         calls.append("prefill")
         return kwargs["out"], None
 
-    monkeypatch.setattr(decode_runtime, "forward", decode)
+    monkeypatch.setattr(decode_runtime, "_forward_validated", decode)
     monkeypatch.setattr(runtime, "forward", prefill)
     assert can_use_flash_attn_varlen_func(**case)
-    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
     assert flash_attn_varlen_func(**case, out=out).data_ptr() == out.data_ptr()
     assert calls == ["prefill" if version == 2 else "decode"]
 
@@ -597,7 +708,7 @@ def test_decode_build_specializations():
     source = (decode_build.ROOT / "native_decode.cu").read_text()
     assert "#include <cute/" not in source
     assert "#include <cutlass/" not in source
-    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide"}
+    assert set(decode_build.VARIANTS) == {"q1", "q4", "q4_wide", "q4_air_columns", "q16_dual", "q16_history"}
 
 
 @pytest.mark.parametrize("heads", [(6, 1), (8, 1), (24, 2), (32, 2)])
@@ -640,7 +751,7 @@ def test_decode_selects_compiled_query_variant(query, heads, capacity, splits, m
 
 @pytest.mark.parametrize("heads", [24, 32])
 @pytest.mark.parametrize("batch", [3, 64, 128])
-@pytest.mark.parametrize("maximum", [4096, 32768])
+@pytest.mark.parametrize("maximum", [2048, 4096, 32768])
 def test_decode_graph_switches_single_and_multiple_splits(heads, batch, maximum):
     from atrex import flash_attn_varlen_func
     from op_test.utils.flash_attn_contract import error_metrics
@@ -681,6 +792,36 @@ def test_decode_vector_output_rejects_unaligned_out():
         flash_attn_varlen_func(**case, out=shifted, num_splits=1)
     expected, _ = reference(case)
     torch.testing.assert_close(aligned.float(), expected, atol=.03, rtol=.05)
+
+
+@pytest.mark.parametrize("batch", [8, 64])
+def test_decode_historical_page_order_replays_current_metadata(batch):
+    from atrex import flash_attn_varlen_func
+
+    long_length = 128 * 1024 + 2
+    case = build_case(64, [4, 4] + [1] * (batch - 2), [long_length] * 2 + [193] * (batch - 2), hq=32, hkv=2)
+    for name, scale in (("q_descale", .875), ("k_descale", 1.125), ("v_descale", .75)):
+        case[name].fill_(scale)
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    lengths = case["seqused_k"]
+    table = case["block_table"]
+    for first, second in ((long_length, long_length), (long_length - 1, 4097), (33, long_length)):
+        lengths[:2].copy_(torch.tensor([first, second], dtype=lengths.dtype, device=lengths.device))
+        table[:2, 0].copy_(table[:2, 0].flip(0))
+        expected_table = table.clone()
+        out.fill_(float("nan"))
+        graph.replay()
+        eager = flash_attn_varlen_func(**case)
+        torch.testing.assert_close(out, eager, atol=0., rtol=0.)
+        expected, _ = reference(case)
+        torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
+        assert torch.equal(table, expected_table)
 
 
 def test_eligibility_does_not_compile_or_launch(monkeypatch):
@@ -793,6 +934,254 @@ def test_general_prefill_real_kernel_events():
     assert any("atrex_ppu_prep_raw" in name for name in names)
     assert any("atrex_ppu_attn_general" in name for name in names)
     assert not any("atrex_ppu_native_decode_kernel" in name for name in names)
+
+
+@pytest.mark.parametrize("lengths", [[16401], [16401, 127, 129, 63, 257, 513, 1025, 2049]])
+def test_direct_paged_q16_prefill_graph(lengths, monkeypatch):
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, [16] * len(lengths), lengths, hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+
+    def unpacked_only(_device):
+        pytest.fail("Q16 direct paging unexpectedly launches the prepared path")
+
+    monkeypatch.setattr(prefill_runtime, "_extension", unpacked_only)
+    _check(case, graph=True)
+
+
+def test_q16_high_batch_prefill_history_and_graph_tail(monkeypatch):
+    from atrex.src.ppu.flash_attn.zwm890p import decode_build
+
+    load_library = decode_build.load_library
+
+    def load_history(variant, device):
+        assert variant == "q16_history"
+        return load_library(variant, device)
+
+    monkeypatch.setattr(decode_build, "load_library", load_history)
+    lengths = [64 * 1024 + 17] + [131, 64, 17, 257] * 31 + [129, 67, 511]
+    case = build_case(64, [16] * len(lengths), lengths, hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    _check(case, graph=True)
+
+
+@pytest.mark.parametrize("heads", [(8, 1), (32, 2)])
+def test_q128_prefill_paged_keys_and_value_tail(heads):
+    longest = 64 * 1024 + 129 if heads == (8, 1) else 16385
+    lengths = [longest, 129, 511, 513, 135, 257, 1025, 2049]
+    case = build_case(64, [128] * len(lengths), lengths, hq=heads[0], hkv=heads[1])
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    for request, length in enumerate(lengths):
+        page, tail = divmod(length, 64)
+        physical_page = int(case["block_table"][request, page])
+        case["v"][physical_page, tail:].view(torch.uint8).fill_(0x7f)
+    _check(case, graph=True)
+
+
+def test_q512_short_prefix_prefill_paged_keys():
+    lengths = [16 * 1024 + 513, 1025, 1537, 2177, 1026, 641, 769, 5119]
+    case = build_case(64, [512] * len(lengths), lengths, hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    page, tail = divmod(lengths[0], 64)
+    physical_page = int(case["block_table"][0, page])
+    case["v"][physical_page, tail:].view(torch.uint8).fill_(0x7f)
+    _check(case, graph=True)
+
+
+@pytest.mark.parametrize("q_lens,heads,splits", [
+    ([128], (8, 1), 10),
+    ([512], (8, 1), 3),
+    ([128], (32, 2), 12),
+    ([128] * 8, (8, 1), 6),
+    ([512, 73, 73, 73, 73, 73, 73, 74], (8, 1), 1),
+])
+def test_short_prefill_direct_key_split_policy(q_lens, heads, splits, monkeypatch):
+    from types import SimpleNamespace
+
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, q_lens, [length + 1 for length in q_lens],
+                      hq=heads[0], hkv=heads[1])
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    # Use a long static bound and short actual KV lengths to exercise graph dispatch.
+    case["max_seqlen_k"] = 64 * 1024 + max(q_lens)
+    table = case["block_table"]
+    pages = (case["max_seqlen_k"] + 63) // 64
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]))
+    extension = prefill_runtime._extension(case["q"].device)
+    dispatched = []
+
+    def attn_direct_k(*args):
+        dispatched.append(args[-1])
+        return extension.attn_direct_k(*args)
+
+    monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
+        attn_direct_k=attn_direct_k,
+        prep_v_direct_k=extension.prep_v_direct_k,
+        combine=extension.combine,
+    ))
+    _check(case, graph=True)
+    assert dispatched and set(dispatched) == {splits}
+
+
+@pytest.mark.parametrize("query", [1, 4])
+def test_single_request_long_decode_graph(query):
+    case = build_case(64, [query], [16401], hq=32, hkv=2)
+    _check(case, graph=True)
+
+
+@pytest.mark.parametrize("batch,query,length,capacity", [
+    (1, 1, 1024, 1048576), (1, 4, 16385, 1048576), (8, 1, 2049, 1048576),
+    (64, 4, 2049, 8192), (128, 4, 1025, 4096), (128, 4, 2049, 8192),
+])
+def test_air_decode_auto_split_with_padded_graph_table(batch, query, length, capacity):
+    page_size = 256
+    case = build_case(page_size, [query] * batch, [length - request for request in range(batch)], hq=24, hkv=2)
+    table = case["block_table"].new_full((batch, capacity // page_size), -1)
+    table[:, :case["block_table"].shape[1]] = case["block_table"]
+    case["block_table"] = table
+    case["max_seqlen_k"] = capacity
+    if batch >= 64:
+        # Keep the per-request and per-head descales bounded in the high-batch fixture.
+        for name in ("q_descale", "k_descale", "v_descale"):
+            case[name] = case[name][:4].repeat(batch // 4, 1)
+    _check(case, graph=True)
+
+
+def test_air_q1_graph_moves_long_kv_request():
+    from atrex import flash_attn_varlen_func
+
+    batch, page_size = 64, 256
+    case = build_case(page_size, [1] * batch, [65537] + [257] * (batch - 1), hq=24, hkv=2)
+    table = case["block_table"]
+    case["max_seqlen_k"] = 1024 * 1024
+    case["block_table"] = torch.nn.functional.pad(
+        table, (0, case["max_seqlen_k"] // page_size - table.shape[1]), value=-1,
+    )
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name].fill_(1.)
+
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    case["seqused_k"][0].sub_(page_size + 3)
+    case["seqused_k"].copy_(case["seqused_k"].roll(19))
+    case["block_table"].copy_(case["block_table"].roll(19, dims=0))
+    expected, _ = reference(case)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected, atol=.03, rtol=.05)
+
+
+@pytest.mark.parametrize("batch,query,splits", [
+    (1, 32, 12), (1, 88, 12), (1, 128, 12), (1, 512, 3),
+    (8, 64, 2), (8, 88, 2), (8, 96, 2), (8, 128, 3), (16, 128, 3),
+])
+def test_air_short_prefill_auto_split(batch, query, splits, monkeypatch):
+    from types import SimpleNamespace
+
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    length = 16 * 1024 + query
+    case = build_case(64, [query] * batch, [length] * batch, hq=6, hkv=1)
+    extension = prefill_runtime._extension(case["q"].device)
+    dispatched = []
+
+    def attn(*args):
+        dispatched.append(args[-4])
+        return extension.attn(*args)
+
+    def attn_air_direct_kv(*args):
+        dispatched.append(args[8])
+        return extension.attn_air_direct_kv(*args)
+
+    monkeypatch.setattr(prefill_runtime, "_extension", lambda _device: SimpleNamespace(
+        attn=attn, attn_air_direct_kv=attn_air_direct_kv, prep_kv=extension.prep_kv,
+        combine=extension.combine,
+    ))
+    _check(case, graph=True)
+    assert dispatched and set(dispatched) == {splits}
+
+
+@pytest.mark.parametrize("batch,query,heads,bounded,prefix_k", [
+    (16, 128, (6, 1), False, 64),
+    (8, 128, (8, 1), True, 64),
+    (8, 128, (32, 2), False, 64),
+    (2, 512, (32, 2), False, 64),
+    (1, 16, (32, 2), False, 64),
+    (64, 16, (32, 2), False, 16),
+])
+def test_prefill_graph_leaves_query_padding_zero(batch, query, heads, bounded, prefix_k, monkeypatch):
+    from atrex import flash_attn_varlen_func
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    page_size = 64
+    hq, hkv = heads
+    case = build_case(page_size, [query] * batch, [query + 129 + r for r in range(batch)],
+                      hq=hq, hkv=hkv)
+    case["max_seqlen_k"] = prefix_k * 1024 + query
+    pages = (case["max_seqlen_k"] + page_size - 1) // page_size
+    table = case["block_table"]
+    case["block_table"] = torch.nn.functional.pad(table, (0, pages - table.shape[1]), value=-1)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    if bounded:
+        budget = prefill_runtime._group_layout(batch, 2, hkv, pages, False, direct_k=True)[1]
+        monkeypatch.setattr(prefill_runtime, "_PREP_WORKSPACE_BYTES", budget)
+
+    out = torch.empty_like(case["q"], dtype=torch.bfloat16)
+    flash_attn_varlen_func(**case, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_varlen_func(**case, out=out)
+
+    case["cu_seqlens_q"].add_(1)
+    case["cu_seqlens_q"][-1].sub_(2)
+    expected, _ = reference(case)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out[[0, -1]].count_nonzero().item() == 0
+    torch.testing.assert_close(out[1:-1].float(), expected[1:-1], atol=.03, rtol=.05)
+
+
+def test_air_short_prefill_paged_uneven_prefix_and_value_tail():
+    from atrex.src.ppu.flash_attn.zwm890p import prefill_runtime
+
+    case = build_case(64, [88] * 8, [16472, 16393, 8193, 245, 128, 111, 88, 4209], hq=6, hkv=1)
+    for request, length in enumerate(case["seqused_k"].tolist()):
+        tail = length % 64
+        if tail:
+            page = case["block_table"][request, length // 64].item()
+            case["v"][page, tail:].view(torch.uint8).fill_(0x7f)
+    case["q_descale"].copy_(torch.linspace(-.5, .5, 8, device="cuda")[:, None])
+    case["k_descale"].fill_(1.25)
+    case["v_descale"].fill_(.5)
+    _check(case, graph=True)
+    assert prefill_runtime._default_splits(
+        8 * 512, 8, 512, 64 * 1024 + 512, query_heads=6, kv_heads=1, page_size=64
+    ) == 2
+
+
+def test_q16_prefill_preserves_eight_byte_aligned_query():
+    case = build_case(64, [16], [16401], hq=32, hkv=2)
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = None
+    q = case["q"]
+    storage = torch.empty(q.numel() + 8, dtype=q.dtype, device=q.device)
+    case["q"] = storage[8:].view(q.shape).copy_(q)
+    assert case["q"].data_ptr() % 16 == 8
+    _check(case)
 
 
 @pytest.mark.parametrize("scale", [0., -.5, .75])

@@ -17,7 +17,7 @@ from atrex.core.compile_cu import _jit_cache_root, _process_lock
 ROOT = Path(__file__).resolve().parent
 LOCK = threading.Lock()
 LIBRARIES = {}
-VARIANTS = ("q1", "q4", "q4_wide")
+VARIANTS = ("q1", "q4", "q4_wide", "q4_air_columns", "q16_dual", "q16_history")
 BACKEND_FLAGS = (
     "-ppu-max-vreg-count=256", "-ppu-sink-matrix-addr=true",
     "-ppu-max-alloca-byte-size=1024", "-ppu-sink-async-addr=true",
@@ -81,10 +81,13 @@ def _build(variant, device_index):
 def load_library(variant, device):
     if variant not in VARIANTS:
         raise ValueError(f"Unknown PPU decode variant: {variant}")
-    device_index = torch.device(device).index
+    device_index = device.index if isinstance(device, torch.device) else torch.device(device).index
     if device_index is None:
         device_index = torch.cuda.current_device()
     key = (variant, device_index)
+    library = LIBRARIES.get(key)
+    if library is not None:
+        return library
     with LOCK:
         if key not in LIBRARIES:
             if torch.cuda.is_current_stream_capturing():

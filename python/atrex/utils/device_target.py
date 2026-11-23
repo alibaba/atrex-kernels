@@ -17,8 +17,9 @@ class DeviceTarget:
 
 
 _PPU_PRODUCT_ARCH = {
-    # Verified on Agate ZW-M890P. Extend only with exact observed product names.
+    # Exact product names; retain the product identity for operator dispatch.
     "ZW-M890P": "zwm890p",
+    "ZW-M890L": "zwm890l",
 }
 
 

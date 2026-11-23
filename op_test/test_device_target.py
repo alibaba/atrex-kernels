@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from atrex.utils.device_target import detect_device_target
 
 
@@ -36,12 +38,24 @@ def test_rocm_is_classified_before_cuda_compatibility(monkeypatch):
     assert (target.family, target.arch) == ("amd", "gfx942")
 
 
-def test_ppu_sm89_compatibility_is_not_classified_as_nvidia(monkeypatch):
-    install_fake_torch(monkeypatch, name="ZW-M890P", cuda="13.0")
+@pytest.mark.parametrize("name,arch", [
+    ("ZW-M890P", "zwm890p"),
+    ("ZW-M890L", "zwm890l"),
+])
+def test_ppu_sm89_compatibility_is_not_classified_as_nvidia(monkeypatch, name, arch):
+    install_fake_torch(monkeypatch, name=name, cuda="13.0")
 
     target = detect_device_target(0)
 
-    assert (target.family, target.arch) == ("alibaba_ppu", "zwm890p")
+    assert (target.family, target.arch) == ("alibaba_ppu", arch)
+
+
+def test_unrecognized_ppu_product_remains_unknown(monkeypatch):
+    install_fake_torch(monkeypatch, name="ZW-M890X", cuda="13.0")
+
+    target = detect_device_target(0)
+
+    assert (target.family, target.arch) == ("unknown", "unknown")
 
 
 def test_real_nvidia_sm89_remains_nvidia(monkeypatch):
